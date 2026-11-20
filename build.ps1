@@ -6,6 +6,7 @@ param([switch]$Test)
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $cmake = "D:\BuildTools\VS2022\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+if (-not (Test-Path $cmake)) { $cmake = "cmake" }  # any CMake on PATH
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 Push-Location $root
