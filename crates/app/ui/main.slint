@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { Button, LineEdit, ListView } from "std-widgets.slint";
+
+export struct GameRow {
+    name: string,
+    store: string,
+    engine: string,
+    api: string,
+    exe: string,
+    root: string,
+    hash: string,
+    anticheat: string,
+    status: string,
+    installed: bool,
+    blocked: bool,
+    can-install: bool,
+}
+
+global Theme {
+    out property <color> bg: #111318;
+    out property <color> side: #171a20;
+    out property <color> card: #1c2028;
+    out property <color> line: #272c36;
+    out property <color> text: #e8eaee;
+    out property <color> dim: #9aa1ad;
+    out property <color> accent: #6d8cff;
+    out property <color> ok: #34d399;
+    out property <color> bad: #f87171;
+}
+
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <color> tint: Theme.accent;
+    height: 24px;
+    width: label.preferred-width + 20px;
+    border-radius: 12px;
+    background: tint.with-alpha(0.16);
+    label := Text {
+        text: root.text;
+        color: tint.brighter(0.35);
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}
+
+component GameItem inherits Rectangle {
+    in property <GameRow> game;
+    in property <bool> selected;
+    callback clicked;
+    height: 58px;
+    border-radius: 8px;
+    background: selected ? Theme.card : ta.has-hover ? #1d2129 : transparent;
+    animate background { duration: 120ms; }
+    // Accent bar on the selected row.
+    Rectangle {
+        x: 0; width: 3px; height: 26px;
+        border-radius: 2px;
+        background: selected ? Theme.accent : transparent;
+    }
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 12px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 9px; height: 9px; border-radius: 4.5px;
+                background: game.blocked ? Theme.bad : game.installed ? Theme.ok : #4b5260;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+            Text { text: game.name; color: Theme.text; font-size: 14px; overflow: elide; }
+            Text { text: game.store + "  ·  " + game.api; color: Theme.dim; font-size: 11px; overflow: elide; }
+        }
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+component InfoRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    spacing: 16px;
+    Text { text: label; width: 110px; color: Theme.dim; font-size: 12px; }
+    Text { text: value; color: Theme.text; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+}
+
+component Detail inherits VerticalLayout {
+    in property <GameRow> game;
+    in property <bool> busy;
+    callback install();
+    callback uninstall();
+    callback open-folder();
+    padding: 32px;
+    spacing: 20px;
+    alignment: start;
+
+    Text { text: game.name; font-size: 28px; font-weight: 700; color: Theme.text; wrap: word-wrap; }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        Chip { text: game.store; tint: #a78bfa; }
+        Chip { text: game.engine; tint: #60a5fa; }
+        Chip { text: game.api; tint: #2dd4bf; }
+        if game.blocked: Chip { text: "Anti-cheat: " + game.anticheat; tint: Theme.bad; }
+    }
+    Rectangle {
+        background: Theme.card;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.line;
+        VerticalLayout {
+            padding: 18px;
+            spacing: 12px;
+            InfoRow { label: "Executável"; value: game.exe; }
+            InfoRow { label: "Pasta"; value: game.root; }
+            InfoRow { label: "Hash (xxh3)"; value: game.hash; }
+            InfoRow { label: "Camada"; value: game.status; }
+        }
+    }
+    if game.blocked: Text {
+        text: "Este jogo tem anti-cheat. O Tessera só lê os ficheiros e nunca instala a camada.";
+        color: #fca5a5; font-size: 13px; wrap: word-wrap;
+    }
+    HorizontalLayout {
+        spacing: 10px;
+        alignment: start;
+        Button {
+            text: game.installed ? "Reinstalar camada" : "Instalar camada";
+            primary: true;
+            enabled: game.can-install && !busy;
+            clicked => { root.install(); }
+        }
+        Button { text: "Desinstalar"; enabled: game.installed && !busy; clicked => { root.uninstall(); } }
+        Button { text: "Abrir pasta"; clicked => { root.open-folder(); } }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Tessera";
+    preferred-width: 1120px;
+    preferred-height: 700px;
+    min-width: 860px;
+    min-height: 520px;
+    background: Theme.bg;
+    default-font-family: "Segoe UI Variable Text";
+
+    in property <[GameRow]> games;
+    in-out property <int> selected: -1;
+    in property <string> status-text;
+    in property <bool> busy;
+    callback refresh();
+    callback add-folder();
+    callback filter-changed(string);
+    callback install(int);
+    callback uninstall(int);
+    callback open-folder(int);
+
+    HorizontalLayout {
+        Rectangle {
+            width: 340px;
+            background: Theme.side;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Tessera";
+                        font-size: 22px;
+                        font-weight: 700;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Button { text: "Atualizar"; enabled: !root.busy; clicked => { root.refresh(); } }
+                }
+                LineEdit {
+                    placeholder-text: "Procurar jogos…";
+                    edited(t) => { root.filter-changed(t); }
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for g[i] in root.games: GameItem {
+                        game: g;
+                        selected: i == root.selected;
+                        clicked => { root.selected = i; }
+                    }
+                }
+                Button { text: "Adicionar pasta…"; clicked => { root.add-folder(); } }
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            if root.selected >= 0 && root.selected < root.games.length: Detail {
+                vertical-stretch: 1;
+                game: root.games[root.selected];
+                busy: root.busy;
+                install => { root.install(root.selected); }
+                uninstall => { root.uninstall(root.selected); }
+                open-folder => { root.open-folder(root.selected); }
+            }
+            if root.selected < 0 || root.selected >= root.games.length: Text {
+                vertical-stretch: 1;
+                text: root.busy ? "A procurar jogos…" : "Escolhe um jogo à esquerda.";
+                color: Theme.dim;
+                font-size: 15px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                height: 30px;
+                background: Theme.side;
+                border-width: 0px;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    Text { text: root.status-text; color: Theme.dim; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                }
+            }
+        }
+    }
+}

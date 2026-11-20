@@ -1,0 +1,17 @@
+[package]
+name = "tessera-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"
+
+[dependencies]
+rfd = "0.18.0"
+slint = { version = "1.19.0", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "accessibility"] }
+tessera-core = { version = "0.1.0", path = "../core" }
+
+[build-dependencies]
+slint-build = "1.19.0"
