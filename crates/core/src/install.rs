@@ -8,6 +8,11 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Every tessera.ini writer (UI thread and the settings loader) goes through
+/// this, so a read-modify-write never drops another's change.
+static INI_LOCK: Mutex<()> = Mutex::new(());
 
 pub const PROXY_D3D11: &str = "d3d11.dll";
 pub const INI: &str = "tessera.ini";
@@ -97,17 +102,51 @@ pub fn install(dir: &Path, payload: &Path, proxy: &str) -> io::Result<InstallSta
 /// Writes `next=` into tessera.ini and keeps the other settings (the
 /// per-optimization switches) across reinstalls.
 fn write_ini(dir: &Path, next: &str) -> io::Result<()> {
+    let _g = INI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_key(dir, "next", Some(next))
+}
+
+/// Sets (or with None removes) one key in tessera.ini, keeping every other
+/// line. Caller holds INI_LOCK.
+fn set_key(dir: &Path, name: &str, value: Option<&str>) -> io::Result<()> {
     let old = fs::read_to_string(dir.join(INI)).unwrap_or_default();
-    let mut out = format!("[tessera]\nnext={next}\n");
+    let mut out = String::from("[tessera]\n");
+    if let Some(v) = value {
+        out.push_str(&format!("{name}={v}\n"));
+    }
     for line in old.lines().map(str::trim) {
         let key = line.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
-        if line.is_empty() || line.starts_with('[') || key == "next" {
+        if line.is_empty() || line.starts_with('[') || key == name {
             continue;
         }
         out.push_str(line);
         out.push('\n');
     }
     fs::write(dir.join(INI), out)
+}
+
+/// P1: records the lowest frame limit another tool (RTSS, NVIDIA control
+/// panel) applies to this game as `ext_fps_limit`, so the layer runs just
+/// under it. Rewrites tessera.ini only when the value changed.
+pub fn note_external_limit(dir: &Path, exe_name: &str) -> io::Result<Option<crate::limits::ExternalLimit>> {
+    let found = crate::limits::external_fps_limit(exe_name);
+    let _g = INI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Uninstalled while the limits were read: leave no ini behind.
+    if read_marker(dir).is_none() {
+        return Ok(found);
+    }
+    let text = fs::read_to_string(dir.join(INI)).unwrap_or_default();
+    let cur = text
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("ext_fps_limit"))
+        .and_then(|(_, v)| v.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let want = found.map_or(0, |l| l.fps);
+    if want != cur {
+        set_key(dir, "ext_fps_limit", (want > 0).then(|| want.to_string()).as_deref())?;
+    }
+    Ok(found)
 }
 
 /// Per-game switches the layer reads from tessera.ini (src/dll/config.cpp).
@@ -151,6 +190,7 @@ pub fn settings(dir: &Path) -> Settings {
 
 /// Rewrites our keys in tessera.ini and keeps every other line (`next=`, manual keys).
 pub fn save_settings(dir: &Path, s: &Settings) -> io::Result<()> {
+    let _g = INI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let old = fs::read_to_string(dir.join(INI)).unwrap_or_default();
     let mut out = String::from("[tessera]\n");
     for line in old.lines().map(str::trim) {
@@ -170,6 +210,7 @@ pub fn save_settings(dir: &Path, s: &Settings) -> io::Result<()> {
 
 /// Removes our layer and restores a chained DLL to its original name.
 pub fn uninstall(dir: &Path) -> io::Result<InstallState> {
+    let _g = INI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = read_marker(dir) else {
         return Err(io::Error::new(io::ErrorKind::NotFound, "Tessera is not installed here"));
     };

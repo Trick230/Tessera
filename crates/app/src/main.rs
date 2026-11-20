@@ -521,6 +521,10 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
     let prepare = game.is_some_and(can_prepare);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
+        // P1: before the settings card reads tessera.ini (NVAPI DRS takes tens of ms).
+        if let (Some(d), Some(name)) = (&dir, exe.file_name().and_then(|n| n.to_str())) {
+            let _ = install::note_external_limit(d, name);
+        }
         let (info, budget, run) = session_info(&exe);
         // GameSettings holds models (not Send); tessera.ini is tiny, read it on the UI thread.
         let _ = weak.upgrade_in_event_loop(move |ui| {
