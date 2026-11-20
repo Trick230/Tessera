@@ -267,8 +267,29 @@ pub fn latest(exe: &Path) -> Option<PathBuf> {
     latest_in(&sessions_dir(), exe)
 }
 
+/// FNV-1a 64 over the exe path as UTF-16 code units, with a leading `\\?\`
+/// dropped, '/' read as '\' and ASCII A-Z lowercased. Must match path_key()
+/// in src/dll/session.cpp.
+fn safe_mode_key(exe: &std::ffi::OsStr) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = exe.encode_wide().collect();
+    let prefix: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let p = wide.strip_prefix(&prefix[..]).unwrap_or(&wide);
+    p.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| {
+        let c = match c {
+            0x2f => 0x5c,
+            0x41..=0x5a => c + 32,
+            _ => c,
+        };
+        (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
+/// `<exe name>-<path key>.count`: keyed by the full path so games that share
+/// an exe name keep separate counters.
 fn safe_mode_file(exe: &Path) -> Option<PathBuf> {
-    Some(crate::paths::data_dir().join("safemode").join(format!("{}.count", exe_file_name(exe)?)))
+    let name = format!("{}-{:016x}.count", exe_file_name(exe)?, safe_mode_key(exe.as_os_str()));
+    Some(crate::paths::data_dir().join("safemode").join(name))
 }
 
 /// Unclean starts in a row recorded by the layer for this executable.
@@ -398,5 +419,14 @@ mod tests {
         let p = latest_in(d.path(), Path::new("D:\\other\\game.exe")).unwrap();
         assert_eq!(p.file_name().unwrap(), "game.exe_20261120-030000_3.tsess");
         assert!(latest_in(d.path(), Path::new("none.exe")).is_none());
+    }
+
+    #[test]
+    fn safe_mode_key_normalizes_and_separates() {
+        let k = safe_mode_key(std::ffi::OsStr::new(r"C:\Games\A\game.exe"));
+        assert_eq!(k, safe_mode_key(std::ffi::OsStr::new("c:/games/a/GAME.EXE")));
+        assert_eq!(k, safe_mode_key(std::ffi::OsStr::new(r"\\?\C:\Games\A\game.exe")));
+        assert_ne!(k, safe_mode_key(std::ffi::OsStr::new(r"C:\Games\B\game.exe")));
+        assert_eq!(safe_mode_key(std::ffi::OsStr::new("")), 0xcbf2_9ce4_8422_2325);
     }
 }

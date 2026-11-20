@@ -17,12 +17,17 @@ function Check($name, $ok) {
 Check "clean run" ($LASTEXITCODE -eq 0)
 & $exe --verify "$data\sessions" | Write-Host
 Check "session contents" ($LASTEXITCODE -eq 0)
-$counter = Join-Path $data "safemode\d3d11_smoke.exe.count"
+$counter = @(Get-ChildItem "$data\safemode\d3d11_smoke.exe-*.count")
+Check "one counter keyed by path" ($counter.Count -eq 1)
+$counter = $counter[0].FullName
 Check "counter cleared on clean exit" ((Get-Content $counter) -eq "0")
 
 & $exe --crash | Out-Null
 & $exe --crash | Out-Null
 Check "counter after two crashes" ((Get-Content $counter) -eq "2")
+# The app computes the same path key (crates/core/src/session.rs).
+$layer = Join-Path $root "target\release\examples\layer.exe"
+Check "app reads the same counter" ((& $layer crashes $exe) -eq "2")
 $before = (Get-ChildItem "$data\sessions\*.tsess").Count
 & $exe | Write-Host
 Check "game still runs in safe mode" ($LASTEXITCODE -eq 0)

@@ -91,6 +91,17 @@ int run(bool crash) {
     render(dev, ctx, sc1, 60, false);
     render(dev, ctx, sc1, 60, true);
 
+    // Composition swap chain (no window, as used by UWP/XAML/DirectComposition hosts).
+    DXGI_SWAP_CHAIN_DESC1 dc = d1;
+    dc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    dc.Scaling = DXGI_SCALING_STRETCH;
+    dc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+    IDXGISwapChain1* sc_comp = nullptr;
+    hr = factory->CreateSwapChainForComposition(dev, &dc, nullptr, &sc_comp);
+    if (FAILED(hr)) return fail("CreateSwapChainForComposition", hr);
+    render(dev, ctx, sc_comp, 30, false);
+    sc_comp->Release();
+
     // 10 BC7 1024^2 textures with full mip chains, 5 buffers, one SRV.
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = td.Height = 1024;
@@ -157,7 +168,7 @@ int run(bool crash) {
     ctx->Release();
     dev->Release();
     DestroyWindow(wnd);
-    std::printf("OK: rendered 180 frames\n");
+    std::printf("OK: rendered 210 frames\n");
     return 0;
 }
 
@@ -183,7 +194,8 @@ int verify(const wchar_t* dir) {
     if (fread(&hdr, sizeof hdr, 1, f) != 1 || memcmp(hdr.magic, TESSERA_SESSION_MAGIC, 8) != 0 ||
         hdr.version != TESSERA_SESSION_VERSION || hdr.record_size != sizeof(TesseraRecord))
         return fail("bad header");
-    int frames = 0, tex = 0, bc7_full = 0, buffers = 0, srvs = 0, devices = 0, swapchains = 0, end = 0;
+    int frames = 0, tex = 0, bc7_full = 0, buffers = 0, srvs = 0, devices = 0, swapchains = 0, sc_comp = 0,
+        end = 0;
     uint32_t dropped = 0, max_frame_us = 0;
     TesseraRecord r;
     while (fread(&r, sizeof r, 1, f) == 1) {
@@ -193,16 +205,19 @@ int verify(const wchar_t* dir) {
             case TESSERA_REC_BUFFER: ++buffers; break;
             case TESSERA_REC_SRV: ++srvs; break;
             case TESSERA_REC_DEVICE: ++devices; break;
-            case TESSERA_REC_SWAPCHAIN: ++swapchains; break;
+            case TESSERA_REC_SWAPCHAIN:
+                ++swapchains;
+                if (r.d == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) ++sc_comp;
+                break;
             case TESSERA_REC_END: ++end; dropped = r.a; break;
         }
     }
     fclose(f);
     std::printf("%ls\nframes %d (max %u us) tex2d %d (bc7 1024 full-mip %d) buffers %d srv %d devices %d "
-                "swapchains %d end %d dropped %u\n",
-                path, frames, max_frame_us, tex, bc7_full, buffers, srvs, devices, swapchains, end, dropped);
-    const bool ok = frames >= 180 && bc7_full == 10 && buffers >= 5 && srvs >= 1 && devices == 2 &&
-                    swapchains >= 1 && end == 1 && dropped == 0;
+                "swapchains %d (composition %d) end %d dropped %u\n",
+                path, frames, max_frame_us, tex, bc7_full, buffers, srvs, devices, swapchains, sc_comp, end, dropped);
+    const bool ok = frames >= 210 && bc7_full == 10 && buffers >= 5 && srvs >= 1 && devices == 2 &&
+                    swapchains >= 2 && sc_comp == 1 && end == 1 && dropped == 0;
     if (!ok) return fail("unexpected counts");
     std::printf("OK: session verified\n");
     return 0;

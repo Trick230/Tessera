@@ -16,6 +16,8 @@ constexpr int kDevCreateTexture2D = 5;
 constexpr int kDevCreateSRV = 7;
 constexpr int kFactoryCreateSwapChain = 10;
 constexpr int kFactory2CreateSwapChainForHwnd = 15;
+constexpr int kFactory2CreateSwapChainForCoreWindow = 16;
+constexpr int kFactory2CreateSwapChainForComposition = 24;
 constexpr int kSwapPresent = 8;
 constexpr int kSwap1Present1 = 22;
 
@@ -44,6 +46,11 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChain(IDXGIFactory*, IUnknown*, DXGI_SWAP
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForHwnd(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*,
                                                     IDXGISwapChain1**);
+HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForCoreWindow(IDXGIFactory2*, IUnknown*, IUnknown*,
+                                                          const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*,
+                                                          IDXGISwapChain1**);
+HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForComposition(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*,
+                                                           IDXGIOutput*, IDXGISwapChain1**);
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain*, UINT, UINT);
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 
@@ -52,6 +59,10 @@ VtHook g_create_tex2d = {kDevCreateTexture2D, reinterpret_cast<void*>(&hk_Create
 VtHook g_create_srv = {kDevCreateSRV, reinterpret_cast<void*>(&hk_CreateSRV)};
 VtHook g_create_sc = {kFactoryCreateSwapChain, reinterpret_cast<void*>(&hk_CreateSwapChain)};
 VtHook g_create_sc_hwnd = {kFactory2CreateSwapChainForHwnd, reinterpret_cast<void*>(&hk_CreateSwapChainForHwnd)};
+VtHook g_create_sc_core = {kFactory2CreateSwapChainForCoreWindow,
+                           reinterpret_cast<void*>(&hk_CreateSwapChainForCoreWindow)};
+VtHook g_create_sc_comp = {kFactory2CreateSwapChainForComposition,
+                           reinterpret_cast<void*>(&hk_CreateSwapChainForComposition)};
 VtHook g_present = {kSwapPresent, reinterpret_cast<void*>(&hk_Present)};
 VtHook g_present1 = {kSwap1Present1, reinterpret_cast<void*>(&hk_Present1)};
 
@@ -160,6 +171,34 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForHwnd(IDXGIFactory2* self, IUnknow
     return hr;
 }
 
+HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForCoreWindow(IDXGIFactory2* self, IUnknown* dev, IUnknown* window,
+                                                          const DXGI_SWAP_CHAIN_DESC1* d, IDXGIOutput* output,
+                                                          IDXGISwapChain1** out) {
+    Depth depth;
+    using F = decltype(&hk_CreateSwapChainForCoreWindow);
+    const HRESULT hr = orig<F>(g_create_sc_core, self)(self, dev, window, d, output, out);
+    if (SUCCEEDED(hr) && out && *out) {
+        if (d && depth.outer())
+            record_swapchain(d->Width, d->Height, d->Format, d->BufferCount, d->SwapEffect, d->Flags);
+        on_swapchain(*out);
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForComposition(IDXGIFactory2* self, IUnknown* dev,
+                                                           const DXGI_SWAP_CHAIN_DESC1* d, IDXGIOutput* output,
+                                                           IDXGISwapChain1** out) {
+    Depth depth;
+    using F = decltype(&hk_CreateSwapChainForComposition);
+    const HRESULT hr = orig<F>(g_create_sc_comp, self)(self, dev, d, output, out);
+    if (SUCCEEDED(hr) && out && *out) {
+        if (d && depth.outer())
+            record_swapchain(d->Width, d->Height, d->Format, d->BufferCount, d->SwapEffect, d->Flags);
+        on_swapchain(*out);
+    }
+    return hr;
+}
+
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
     Depth depth;
     if (depth.outer() && !(flags & DXGI_PRESENT_TEST)) session_frame();
@@ -180,6 +219,8 @@ void hook_factory(IDXGIFactory* f) {
     IDXGIFactory2* f2 = nullptr;
     if (SUCCEEDED(f->QueryInterface(IID_PPV_ARGS(&f2)))) {
         ok = vt_hook(g_create_sc_hwnd, f2) && ok;
+        ok = vt_hook(g_create_sc_core, f2) && ok;
+        ok = vt_hook(g_create_sc_comp, f2) && ok;
         f2->Release();
     }
     if (!ok) logf("factory hook failed");

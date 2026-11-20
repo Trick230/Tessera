@@ -66,6 +66,21 @@ bool resolve_data_dir() {
     return GetFileAttributesW(g_dir) != INVALID_FILE_ATTRIBUTES;
 }
 
+// FNV-1a 64 over the exe path as UTF-16 code units, with a leading "\\?\"
+// dropped, '/' read as '\' and ASCII A-Z lowercased. Keys the safe-mode
+// counter so games sharing an exe name stay apart. Must match
+// safe_mode_key() in crates/core/src/session.rs.
+uint64_t path_key(const wchar_t* p) {
+    if (wcsncmp(p, L"\\\\?\\", 4) == 0) p += 4;
+    uint64_t h = 14695981039346656037ull;
+    for (; *p; ++p) {
+        wchar_t c = *p == L'/' ? L'\\' : *p;
+        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c + 32);
+        h = (h ^ static_cast<uint16_t>(c)) * 1099511628211ull;
+    }
+    return h;
+}
+
 int read_counter() {
     HANDLE f = CreateFileW(g_safe_path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return 0;
@@ -200,7 +215,12 @@ BOOL CALLBACK init_once(PINIT_ONCE, void*, void**) {
     log_open(p);
     logf("tessera d3d11 layer, exe %ls", g_exe_path);
 
-    swprintf_s(g_safe_path, L"%s\\safemode\\%s.count", g_dir, g_exe_name);
+    // _snwprintf_s: swprintf_s would kill the game on an over-long path.
+    if (_snwprintf_s(g_safe_path, _TRUNCATE, L"%s\\safemode\\%s-%016llx.count", g_dir, g_exe_name,
+                     path_key(g_exe_path)) < 0) {
+        logf("data path too long, layer disabled");
+        return TRUE;
+    }
     const int crashes = read_counter();
     if (crashes >= kSafeModeCrashes) {
         logf("safe mode: %d unclean exits in a row, layer disabled (delete %ls to re-enable)", crashes,

@@ -23,6 +23,8 @@ try {
     if ($Test) {
         cargo test -q -p tessera-core
         if ($LASTEXITCODE) { throw "core tests failed" }
+        cargo build -q --release -p tessera-core --example layer  # used by the smoke test
+        if ($LASTEXITCODE) { throw "layer example build failed" }
         powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_smoke.ps1
         if ($LASTEXITCODE) { throw "smoke test failed" }
     }
