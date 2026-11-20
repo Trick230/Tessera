@@ -381,11 +381,14 @@ fn safe_mode_key(exe: &std::ffi::OsStr) -> u64 {
     })
 }
 
-/// `<exe name>-<path key>.count`: keyed by the full path so games that share
-/// an exe name keep separate counters.
+/// `<exe name>-<path key>`: the layer's per-game file stem, keyed by the full
+/// path so games that share an exe name keep separate files.
+pub fn exe_key_name(exe: &Path) -> Option<String> {
+    Some(format!("{}-{:016x}", exe_file_name(exe)?, safe_mode_key(exe.as_os_str())))
+}
+
 fn safe_mode_file(exe: &Path) -> Option<PathBuf> {
-    let name = format!("{}-{:016x}.count", exe_file_name(exe)?, safe_mode_key(exe.as_os_str()));
-    Some(crate::paths::data_dir().join("safemode").join(name))
+    Some(crate::paths::data_dir().join("safemode").join(format!("{}.count", exe_key_name(exe)?)))
 }
 
 /// Unclean starts in a row recorded by the layer for this executable.

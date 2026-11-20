@@ -170,8 +170,11 @@ fn session_info(exe: &Path) -> (SessionInfo, u32) {
     }
 
     // Plain-language reading.
-    let other = sum.hitches - sum.hitches_creating - sum.hitches_over_budget;
+    let other = sum.hitches - sum.hitches_shaders - sum.hitches_creating - sum.hitches_over_budget;
     let mut causes = Vec::new();
+    if sum.hitches_shaders > 0 {
+        causes.push(format!("{} enquanto o jogo compilava shaders", sum.hitches_shaders));
+    }
     if sum.hitches_creating > 0 {
         causes.push(format!("{} enquanto o jogo criava texturas ou buffers", sum.hitches_creating));
     }
@@ -179,7 +182,7 @@ fn session_info(exe: &Path) -> (SessionInfo, u32) {
         causes.push(format!("{} com a VRAM acima do orçamento", sum.hitches_over_budget));
     }
     if other > 0 {
-        causes.push(format!("{other} sem causa identificada (shaders, CPU ou disco)"));
+        causes.push(format!("{other} sem causa identificada (CPU, disco ou lógica do jogo)"));
     }
     if !causes.is_empty() {
         info.causes = s(format!("Stutters: {}.", causes.join(" · ")));
@@ -193,6 +196,12 @@ fn session_info(exe: &Path) -> (SessionInfo, u32) {
     }
     if sum.hitches > 0 && sum.hitches_creating * 2 > sum.hitches {
         advice.push("A maior parte dos stutters coincide com a criação de recursos (streaming ou carregamentos).".to_string());
+    }
+    if sum.hitches > 0 && sum.hitches_shaders * 2 > sum.hitches {
+        advice.push(
+            "A maior parte dos stutters coincide com a compilação de shaders. O Tessera guardou-os; a próxima preparação vai aquecê-los antes do jogo."
+                .to_string(),
+        );
     }
     if sum.limited_frames > 0 {
         advice.push(format!(
@@ -223,6 +232,20 @@ fn session_info(exe: &Path) -> (SessionInfo, u32) {
         size(sum.buffer_bytes),
         sum.prioritized
     ));
+    if sum.shaders > 0 {
+        // Coverage: shaders of this session that were already stored (what a
+        // warm-up can compile before the game asks for them).
+        let known = sum.shaders - sum.shaders_new;
+        let store = tessera_core::shaders::stats(exe);
+        info.shaders = s(format!(
+            "{} criados em {} · {} % já conhecidos · {} guardados ({})",
+            sum.shaders,
+            duration(sum.shader_create_ms / 1000.0),
+            known * 100 / sum.shaders,
+            store.shaders,
+            size(store.bytes)
+        ));
+    }
     let fl = sum.feature_level;
     info.display = s(match sum.swapchain {
         Some((w, h)) => format!("{w}×{h} · D3D feature level {}_{}", fl >> 12, (fl >> 8) & 0xF),

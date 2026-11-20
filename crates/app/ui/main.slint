@@ -40,6 +40,7 @@ export struct SessionInfo {
     frames: string,
     frametime: string,
     created: string,
+    shaders: string,
     display: string,
     note: string,
     safe-mode: bool,
@@ -308,6 +309,7 @@ component Detail inherits VerticalLayout {
                 InfoRow { label: "Frames"; value: session.frames; }
                 InfoRow { label: "Frametime"; value: session.frametime; }
                 InfoRow { label: "Recursos criados"; value: session.created; }
+                if session.shaders != "": InfoRow { label: "Shaders"; value: session.shaders; }
                 InfoRow { label: "Ecrã"; value: session.display; }
                 if session.note != "": InfoRow { label: "Nota"; value: session.note; }
             }
