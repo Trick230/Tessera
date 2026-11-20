@@ -50,6 +50,7 @@ export struct GameSettings {
     present: bool,
     process: bool,
     residency: bool,
+    flip-model: bool,
     fps-options: [string],
     fps-index: int,
     vram-options: [string],
@@ -220,7 +221,7 @@ component Detail inherits VerticalLayout {
     callback uninstall();
     callback open-folder();
     callback reset-safe-mode();
-    callback settings-changed(bool, bool, int, int);
+    callback settings-changed(bool, bool, bool, int, int);
     padding: 32px;
     spacing: 18px;
     alignment: start;
@@ -327,7 +328,7 @@ component Detail inherits VerticalLayout {
                     fps := ComboBox {
                         model: settings.fps-options;
                         current-index: settings.fps-index;
-                        selected => { root.settings-changed(process.checked, residency.checked, fps.current-index, vram.current-index); }
+                        selected => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
                     }
                 }
                 Rectangle { height: 1px; background: Theme.line; }
@@ -337,7 +338,19 @@ component Detail inherits VerticalLayout {
                     vram := ComboBox {
                         model: settings.vram-options;
                         current-index: settings.vram-index;
-                        selected => { root.settings-changed(process.checked, residency.checked, fps.current-index, vram.current-index); }
+                        selected => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.line; }
+                SettingRow {
+                    title: "Apresentação flip (experimental)";
+                    help: "Em janela sem bordas, jogos D3D11 antigos passam ao modo flip: menos latência e G-Sync/FreeSync a funcionar. Se vires ecrã preto ou a piscar, desliga.";
+                    HorizontalLayout {
+                        alignment: end;
+                        flip := Switch {
+                            checked: settings.flip-model;
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
+                        }
                     }
                 }
                 Rectangle { height: 1px; background: Theme.line; }
@@ -348,7 +361,7 @@ component Detail inherits VerticalLayout {
                         alignment: end;
                         residency := Switch {
                             checked: settings.residency;
-                            toggled => { root.settings-changed(process.checked, residency.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
                         }
                     }
                 }
@@ -360,7 +373,7 @@ component Detail inherits VerticalLayout {
                         alignment: end;
                         process := Switch {
                             checked: settings.process;
-                            toggled => { root.settings-changed(process.checked, residency.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
                         }
                     }
                 }
@@ -418,7 +431,7 @@ export component MainWindow inherits Window {
     callback install(int);
     callback uninstall(int);
     callback open-folder(int);
-    callback settings-changed(int, bool, bool, int, int);
+    callback settings-changed(int, bool, bool, bool, int, int);
 
     HorizontalLayout {
         Rectangle {
@@ -473,7 +486,7 @@ export component MainWindow inherits Window {
                     install => { root.install(root.selected); }
                     uninstall => { root.uninstall(root.selected); }
                     open-folder => { root.open-folder(root.selected); }
-                    settings-changed(p, r, f, v) => { root.settings-changed(root.selected, p, r, f, v); }
+                    settings-changed(p, r, fl, f, v) => { root.settings-changed(root.selected, p, r, fl, f, v); }
                 }
             }
             if root.selected < 0 || root.selected >= root.games.length: VerticalLayout {

@@ -119,15 +119,17 @@ pub struct Settings {
     pub fps_limit: u32,
     /// Budget cap reported to the game, 0 = off.
     pub vram_budget_mb: u32,
+    /// P2: windowed blit swapchains become flip model; off by default.
+    pub flip_model: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { process: true, residency: true, fps_limit: 0, vram_budget_mb: 0 }
+        Settings { process: true, residency: true, fps_limit: 0, vram_budget_mb: 0, flip_model: false }
     }
 }
 
-const SETTING_KEYS: [&str; 4] = ["process", "residency", "fps_limit", "vram_budget_mb"];
+const SETTING_KEYS: [&str; 5] = ["process", "residency", "fps_limit", "vram_budget_mb", "flip_model"];
 
 pub fn settings(dir: &Path) -> Settings {
     let mut s = Settings::default();
@@ -140,6 +142,7 @@ pub fn settings(dir: &Path) -> Settings {
             "residency" => s.residency = v != 0,
             "fps_limit" => s.fps_limit = v,
             "vram_budget_mb" => s.vram_budget_mb = v,
+            "flip_model" => s.flip_model = v != 0,
             _ => {}
         }
     }
@@ -159,8 +162,8 @@ pub fn save_settings(dir: &Path, s: &Settings) -> io::Result<()> {
         out.push('\n');
     }
     out.push_str(&format!(
-        "process={}\nresidency={}\nfps_limit={}\nvram_budget_mb={}\n",
-        s.process as u8, s.residency as u8, s.fps_limit, s.vram_budget_mb
+        "process={}\nresidency={}\nfps_limit={}\nvram_budget_mb={}\nflip_model={}\n",
+        s.process as u8, s.residency as u8, s.fps_limit, s.vram_budget_mb, s.flip_model as u8
     ));
     fs::write(dir.join(INI), out)
 }
@@ -239,7 +242,7 @@ mod tests {
         assert_eq!(settings(t.path()), Settings::default());
         fs::write(t.path().join(INI), "[tessera]\nnext=d3d11.next.dll\nfps_limit=30\nmax_frame_latency=1\n").unwrap();
         assert_eq!(settings(t.path()).fps_limit, 30);
-        let s = Settings { process: false, residency: true, fps_limit: 141, vram_budget_mb: 6144 };
+        let s = Settings { process: false, residency: true, fps_limit: 141, vram_budget_mb: 6144, flip_model: true };
         save_settings(t.path(), &s).unwrap();
         assert_eq!(settings(t.path()), s);
         let ini = fs::read_to_string(t.path().join(INI)).unwrap();

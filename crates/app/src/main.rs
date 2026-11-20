@@ -285,6 +285,7 @@ fn game_settings(dir: &Path, budget_mb: u32) -> (GameSettings, SettingsLists) {
         present: true,
         process: cur.process,
         residency: cur.residency,
+        flip_model: cur.flip_model,
         fps_options: labels(&fps, "Sem limite", &|x| format!("{x} fps")),
         fps_index: idx(&fps, cur.fps_limit),
         vram_options: labels(&vram, "Sem teto", &|x| {
@@ -464,7 +465,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let w = ui.as_weak();
-        ui.on_settings_changed(move |_i, process, residency, fps_i, vram_i| {
+        ui.on_settings_changed(move |_i, process, residency, flip_model, fps_i, vram_i| {
             let ui = w.unwrap();
             let slot = SETTINGS.lock().unwrap();
             let Some(l) = slot.as_ref() else { return };
@@ -474,6 +475,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 residency,
                 fps_limit: pick(&l.fps, fps_i),
                 vram_budget_mb: pick(&l.vram, vram_i),
+                flip_model,
             };
             let msg = match install::save_settings(&l.dir, &new) {
                 Ok(()) => "Definições guardadas: aplicam-se no próximo arranque do jogo".to_string(),

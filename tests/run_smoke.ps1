@@ -25,15 +25,19 @@ Check "counter cleared on clean exit" ((Get-Content $counter) -eq "0")
 $log = "$data\logs\d3d11_smoke.exe.log"
 Check "process tweaks logged" ((Select-String -Path $log -Pattern "process:" -Quiet))
 
-# Frame limiter (P1) and budget cap (M1) from tessera.ini next to the layer.
+# Frame limiter (P1), budget cap (M1) and flip model (P2) from tessera.ini next to the layer.
 $ini = Join-Path (Split-Path $exe) "tessera.ini"
-Set-Content -Path $ini -Value "[tessera]`nfps_limit=60`nvram_budget_mb=2048" -Encoding ascii
+Set-Content -Path $ini -Value "[tessera]`nfps_limit=60`nvram_budget_mb=2048`nflip_model=1" -Encoding ascii
 $env:TESSERA_SMOKE_CAP_MB = "2048"
 try {
     & $exe | Write-Host
     Check "limited run" ($LASTEXITCODE -eq 0)
     & $exe --verify "$data\sessions" 60 | Write-Host
-    Check "limiter holds 60 fps, budget capped" ($LASTEXITCODE -eq 0)
+    Check "limiter holds 60 fps, budget capped, flip model" ($LASTEXITCODE -eq 0)
+    Check "flip conversion logged" ((Select-String -Path $log -Pattern "converted to flip model" -Quiet))
+    # S6: two shaders stored once each across both runs (header 24 + 2 index entries of 16).
+    $idx = Get-ChildItem "$data\shaders\d3d11_smoke.exe-*.tshi"
+    Check "shader store has 2 shaders" ($idx.Count -eq 1 -and $idx[0].Length -eq 56)
 } finally { Remove-Item $ini; Remove-Item Env:TESSERA_SMOKE_CAP_MB }
 
 & $exe --crash | Out-Null

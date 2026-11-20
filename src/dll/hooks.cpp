@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Phase 0 hooks: observe resource creation and Present, change nothing.
+// Device, factory and swapchain hooks: resource and swapchain creation, Present.
 #include "hooks.h"
 
 #include <windows.h>
 #include <intrin.h>
 
 #include "config.h"
+#include "flip.h"
 #include "log.h"
 #include "module.h"
 #include "memory.h"
+#include "shaders.h"
 #include "pacing.h"
 #include "session.h"
 #include "vtable.h"
@@ -24,6 +26,7 @@ constexpr int kFactory2CreateSwapChainForHwnd = 15;
 constexpr int kFactory2CreateSwapChainForCoreWindow = 16;
 constexpr int kFactory2CreateSwapChainForComposition = 24;
 constexpr int kSwapPresent = 8;
+constexpr int kSwapResizeBuffers = 13;
 constexpr int kSwap1Present1 = 22;
 
 // Depth of hooked calls on this thread: the runtime may call back through
@@ -58,6 +61,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForComposition(IDXGIFactory2*, IUnkn
                                                            IDXGIOutput*, IDXGISwapChain1**);
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain*, UINT, UINT);
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 
 VtHook g_create_buffer = {kDevCreateBuffer, reinterpret_cast<void*>(&hk_CreateBuffer)};
 VtHook g_create_tex2d = {kDevCreateTexture2D, reinterpret_cast<void*>(&hk_CreateTexture2D)};
@@ -70,6 +74,7 @@ VtHook g_create_sc_comp = {kFactory2CreateSwapChainForComposition,
                            reinterpret_cast<void*>(&hk_CreateSwapChainForComposition)};
 VtHook g_present = {kSwapPresent, reinterpret_cast<void*>(&hk_Present)};
 VtHook g_present1 = {kSwap1Present1, reinterpret_cast<void*>(&hk_Present1)};
+VtHook g_resize = {kSwapResizeBuffers, reinterpret_cast<void*>(&hk_ResizeBuffers)};
 
 template <class F>
 F orig(const VtHook& h, void* self) {
@@ -160,7 +165,8 @@ HRESULT STDMETHODCALLTYPE hk_CreateSRV(ID3D11Device* self, ID3D11Resource* res,
     return hr;
 }
 
-void record_swapchain(UINT w, UINT h, DXGI_FORMAT fmt, UINT buffers, DXGI_SWAP_EFFECT effect, UINT flags) {
+void record_swapchain(UINT w, UINT h, DXGI_FORMAT fmt, UINT buffers, DXGI_SWAP_EFFECT effect, UINT flags,
+                      bool converted) {
     TesseraRecord r = {};
     r.qpc = now_qpc();
     r.kind = TESSERA_REC_SWAPCHAIN;
@@ -169,20 +175,32 @@ void record_swapchain(UINT w, UINT h, DXGI_FORMAT fmt, UINT buffers, DXGI_SWAP_E
     r.a = w;
     r.b = h;
     r.c = buffers;
-    r.d = static_cast<uint32_t>(effect);
+    r.d = static_cast<uint32_t>(effect) | (converted ? kSwapConverted : 0);
     session_push(r);
-    logf("swapchain %ux%u format %u buffers %u effect %u flags 0x%x", w, h, fmt, buffers, effect, flags);
+    logf("swapchain %ux%u format %u buffers %u effect %u flags 0x%x%s", w, h, fmt, buffers, effect, flags,
+         converted ? " (flip model by Tessera)" : "");
 }
 
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChain(IDXGIFactory* self, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d,
                                              IDXGISwapChain** out) {
+    void* const ret = _ReturnAddress();
     Depth depth;
     using F = decltype(&hk_CreateSwapChain);
-    const HRESULT hr = orig<F>(g_create_sc, self)(self, dev, d, out);
+    DXGI_SWAP_CHAIN_DESC flip;
+    bool tearing = false;
+    bool conv = d && depth.outer() && flip_convert(dev, is_game_code(ret), *d, &flip, &tearing);
+    HRESULT hr = conv ? orig<F>(g_create_sc, self)(self, dev, &flip, out) : E_FAIL;
+    if (conv && FAILED(hr)) {
+        logf("flip: CreateSwapChain failed 0x%x, keeping the original swapchain", hr);
+        conv = false;
+    }
+    if (!conv) hr = orig<F>(g_create_sc, self)(self, dev, d, out);
     if (SUCCEEDED(hr) && out && *out) {
-        if (d && depth.outer())
-            record_swapchain(d->BufferDesc.Width, d->BufferDesc.Height, d->BufferDesc.Format, d->BufferCount,
-                             d->SwapEffect, d->Flags);
+        flip_track(*out, dev, conv, tearing);
+        const DXGI_SWAP_CHAIN_DESC* u = conv ? &flip : d;
+        if (u && depth.outer())
+            record_swapchain(u->BufferDesc.Width, u->BufferDesc.Height, u->BufferDesc.Format, u->BufferCount,
+                             u->SwapEffect, u->Flags, conv);
         on_swapchain(*out);
     }
     return hr;
@@ -192,12 +210,23 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForHwnd(IDXGIFactory2* self, IUnknow
                                                     const DXGI_SWAP_CHAIN_DESC1* d,
                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* output,
                                                     IDXGISwapChain1** out) {
+    void* const ret = _ReturnAddress();
     Depth depth;
     using F = decltype(&hk_CreateSwapChainForHwnd);
-    const HRESULT hr = orig<F>(g_create_sc_hwnd, self)(self, dev, wnd, d, fs, output, out);
+    DXGI_SWAP_CHAIN_DESC1 flip;
+    bool tearing = false;
+    bool conv = d && depth.outer() && flip_convert1(dev, is_game_code(ret), wnd, *d, fs, &flip, &tearing);
+    HRESULT hr = conv ? orig<F>(g_create_sc_hwnd, self)(self, dev, wnd, &flip, fs, output, out) : E_FAIL;
+    if (conv && FAILED(hr)) {
+        logf("flip: CreateSwapChainForHwnd failed 0x%x, keeping the original swapchain", hr);
+        conv = false;
+    }
+    if (!conv) hr = orig<F>(g_create_sc_hwnd, self)(self, dev, wnd, d, fs, output, out);
     if (SUCCEEDED(hr) && out && *out) {
-        if (d && depth.outer())
-            record_swapchain(d->Width, d->Height, d->Format, d->BufferCount, d->SwapEffect, d->Flags);
+        flip_track(*out, dev, conv, tearing);
+        const DXGI_SWAP_CHAIN_DESC1* u = conv ? &flip : d;
+        if (u && depth.outer())
+            record_swapchain(u->Width, u->Height, u->Format, u->BufferCount, u->SwapEffect, u->Flags, conv);
         on_swapchain(*out);
     }
     return hr;
@@ -210,8 +239,9 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForCoreWindow(IDXGIFactory2* self, I
     using F = decltype(&hk_CreateSwapChainForCoreWindow);
     const HRESULT hr = orig<F>(g_create_sc_core, self)(self, dev, window, d, output, out);
     if (SUCCEEDED(hr) && out && *out) {
+        flip_track(*out, dev, false, false);
         if (d && depth.outer())
-            record_swapchain(d->Width, d->Height, d->Format, d->BufferCount, d->SwapEffect, d->Flags);
+            record_swapchain(d->Width, d->Height, d->Format, d->BufferCount, d->SwapEffect, d->Flags, false);
         on_swapchain(*out);
     }
     return hr;
@@ -224,8 +254,9 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForComposition(IDXGIFactory2* self, 
     using F = decltype(&hk_CreateSwapChainForComposition);
     const HRESULT hr = orig<F>(g_create_sc_comp, self)(self, dev, d, output, out);
     if (SUCCEEDED(hr) && out && *out) {
+        flip_track(*out, dev, false, false);
         if (d && depth.outer())
-            record_swapchain(d->Width, d->Height, d->Format, d->BufferCount, d->SwapEffect, d->Flags);
+            record_swapchain(d->Width, d->Height, d->Format, d->BufferCount, d->SwapEffect, d->Flags, false);
         on_swapchain(*out);
     }
     return hr;
@@ -233,17 +264,39 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForComposition(IDXGIFactory2* self, 
 
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
     Depth depth;
-    if (depth.outer() && !(flags & DXGI_PRESENT_TEST)) session_frame(pace_before_present(self));
+    FlipFrame ff;
+    if (depth.outer()) {
+        if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) session_frame(pace_before_present(self));
+        flags = flip_before_present(self, sync, flags, ff);
+        if (ff.skip) return S_OK;
+    }
     using F = decltype(&hk_Present);
-    return orig<F>(g_present, self)(self, sync, flags);
+    const HRESULT hr = orig<F>(g_present, self)(self, sync, flags);
+    flip_after_present(ff);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT flags,
                                       const DXGI_PRESENT_PARAMETERS* params) {
     Depth depth;
-    if (depth.outer() && !(flags & DXGI_PRESENT_TEST)) session_frame(pace_before_present(self));
+    FlipFrame ff;
+    if (depth.outer()) {
+        if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) session_frame(pace_before_present(self));
+        flags = flip_before_present(self, sync, flags, ff);
+        if (ff.skip) return S_OK;
+    }
     using F = decltype(&hk_Present1);
-    return orig<F>(g_present1, self)(self, sync, flags, params);
+    const HRESULT hr = orig<F>(g_present1, self)(self, sync, flags, params);
+    flip_after_present(ff);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* self, UINT buffers, UINT w, UINT h, DXGI_FORMAT fmt,
+                                           UINT flags) {
+    Depth depth;
+    flip_resize(self, &buffers, &flags);  // also nested: DXGI resizes inside Present on fullscreen exit
+    using F = decltype(&hk_ResizeBuffers);
+    return orig<F>(g_resize, self)(self, buffers, w, h, fmt, flags);
 }
 
 void hook_factory(IDXGIFactory* f) {
@@ -307,8 +360,16 @@ uint64_t texture2d_bytes(const D3D11_TEXTURE2D_DESC& d) {
     return total * (d.ArraySize ? d.ArraySize : 1) * samples;
 }
 
+bool flip_hooks_ready() {
+    constexpr long kMax = sizeof(g_present.vt) / sizeof(g_present.vt[0]);
+    return g_present.n < kMax && g_present1.n < kMax && g_resize.n < kMax;
+}
+
+InternalCall::InternalCall() { ++t_depth; }
+InternalCall::~InternalCall() { --t_depth; }
+
 void on_swapchain(IDXGISwapChain* sc) {
-    bool ok = vt_hook(g_present, sc);
+    bool ok = vt_hook(g_present, sc) && vt_hook(g_resize, sc);
     IDXGISwapChain1* sc1 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1)))) {
         ok = vt_hook(g_present1, sc1) && ok;
@@ -316,6 +377,15 @@ void on_swapchain(IDXGISwapChain* sc) {
     }
     if (!ok) logf("present hook failed");
     pacing_on_swapchain(sc);
+}
+
+void on_legacy_swapchain(IDXGISwapChain* sc, IUnknown* dev, const DXGI_SWAP_CHAIN_DESC* d, bool converted,
+                         bool tearing) {
+    flip_track(sc, dev, converted, tearing);
+    if (d)
+        record_swapchain(d->BufferDesc.Width, d->BufferDesc.Height, d->BufferDesc.Format, d->BufferCount,
+                         d->SwapEffect, d->Flags, converted);
+    on_swapchain(sc);
 }
 
 void on_device(ID3D11Device* dev, UINT create_flags) {
@@ -330,6 +400,7 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
     const bool ok = vt_hook(g_create_buffer, dev) && vt_hook(g_create_tex2d, dev) && vt_hook(g_create_srv, dev);
     logf("device fl 0x%x flags 0x%x, device hooks %s", r.a, create_flags, ok ? "ok" : "FAILED");
     memory_on_device(dev);
+    shaders_on_device(dev);
 
     IDXGIDevice* dxgi = nullptr;
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dxgi)))) {

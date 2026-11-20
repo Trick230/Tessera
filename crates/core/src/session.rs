@@ -18,12 +18,15 @@ pub const REC_SRV: u16 = 4;
 pub const REC_DEVICE: u16 = 5;
 pub const REC_SWAPCHAIN: u16 = 6;
 pub const REC_VRAM: u16 = 7;
+pub const REC_SHADER: u16 = 8;
 pub const REC_END: u16 = 0xFFFF;
 
 /// Resource created by code outside the game's folder (overlay, SDK).
 pub const FLAG_FOREIGN: u32 = 0x8000_0000;
 /// Eviction priority raised by the layer (M2).
 pub const FLAG_PRIORITY: u32 = 0x4000_0000;
+/// Bit in `d` of SHADER records: not in the shader store when created (shader_store_format.h).
+pub const SHADER_NEW: u32 = 0x4;
 
 /// A hitch counts as caused by resource creation when the game created at
 /// least this many resources or bytes during that frame.
@@ -76,6 +79,14 @@ pub struct Summary {
     /// (streaming or loading); the rest are other causes (shaders, I/O,
     /// game logic) that the layer does not record yet.
     pub hitches_creating: u64,
+    /// D2: hitches in frames where the game created a shader (driver compile);
+    /// counted before the other causes.
+    pub hitches_shaders: u64,
+    /// S6: shaders the game created, those not yet in the shader store (cold:
+    /// compiled for the first time), and the time the creation calls took.
+    pub shaders: u64,
+    pub shaders_new: u64,
+    pub shader_create_ms: f64,
     /// D2: hitches while the game used more VRAM than the OS budget (and
     /// not creating resources): paging between VRAM and system memory.
     pub hitches_over_budget: u64,
@@ -202,6 +213,9 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
     // Frames during which the game created many resources, by index into frame_us.
     let mut creating: Vec<bool> = Vec::with_capacity(frame_us.capacity());
     let mut over: Vec<bool> = Vec::with_capacity(frame_us.capacity());
+    let mut compiling: Vec<bool> = Vec::with_capacity(frame_us.capacity());
+    let mut shader_now = false;
+    let mut shader_us = 0u64;
     let mut over_now = false;
     let (mut made, mut made_bytes) = (0u32, 0u64);
     let mut limiter_us = 0u64;
@@ -229,7 +243,9 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
                     frame_us.push(r.a);
                     creating.push(made >= HITCH_CREATE_COUNT || made_bytes >= HITCH_CREATE_BYTES);
                     over.push(over_now);
+                    compiling.push(shader_now);
                 }
+                shader_now = false;
                 if r.b != 0 {
                     s.limited_frames += 1;
                     limiter_us += r.b as u64;
@@ -251,6 +267,12 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
                 over_now = r.b > r.a;
                 s.vram_over_s += over_now as u32;
             }
+            REC_SHADER if r.flags & FLAG_FOREIGN == 0 => {
+                s.shaders += 1;
+                s.shaders_new += (r.d & SHADER_NEW != 0) as u64;
+                shader_us += r.c as u64;
+                shader_now = true;
+            }
             REC_DEVICE => s.feature_level = r.a,
             REC_SWAPCHAIN => s.swapchain = Some((r.a, r.b)),
             REC_END => {
@@ -264,6 +286,7 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
         s.duration_s = (last - first) as f64 / s.header.qpc_frequency as f64;
     }
     s.limiter_wait_s = limiter_us as f64 / 1e6;
+    s.shader_create_ms = shader_us as f64 / 1e3;
     if !frame_us.is_empty() {
         let sum: u64 = frame_us.iter().map(|&v| v as u64).sum();
         s.frame_avg_ms = sum as f64 / frame_us.len() as f64 / 1000.0;
@@ -276,11 +299,12 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
         s.frame_p999_ms = ms(percentile(&sorted, 99.9));
         s.frame_max_ms = ms(*sorted.last().unwrap());
         let limit = p50.saturating_mul(2);
-        for ((&v, &c), &o) in frame_us.iter().zip(&creating).zip(&over) {
+        for (((&v, &c), &o), &sh) in frame_us.iter().zip(&creating).zip(&over).zip(&compiling) {
             if v > limit {
                 s.hitches += 1;
-                s.hitches_creating += c as u64;
-                s.hitches_over_budget += (!c && o) as u64;
+                s.hitches_shaders += sh as u64;
+                s.hitches_creating += (!sh && c) as u64;
+                s.hitches_over_budget += (!sh && !c && o) as u64;
             }
         }
     }
@@ -491,6 +515,29 @@ mod tests {
         let s = summarize(&b).unwrap();
         assert_eq!((s.hitches, s.hitches_over_budget, s.hitches_creating), (1, 1, 0));
         assert_eq!((s.vram_budget_mb, s.vram_peak_mb, s.vram_over_s), (6800, 7200, 1));
+    }
+
+    #[test]
+    fn hitches_while_compiling_shaders() {
+        let mut b = header(1_000_000);
+        for i in 0..99u64 {
+            rec(&mut b, 1 + i, REC_FRAME, 10_000, 0, 0);
+        }
+        // A cold game shader, a known one, and an overlay's (ignored).
+        let mut shader = |qpc: u64, flags: u32, d: u32| {
+            rec_flags(&mut b, qpc, REC_SHADER, flags, 4, 900, 0xABCD);
+            let n = b.len();
+            b[n - 16..n - 12].copy_from_slice(&2000u32.to_le_bytes()); // c = 2 ms
+            b[n - 12..n - 8].copy_from_slice(&d.to_le_bytes());
+        };
+        shader(150, 0, SHADER_NEW);
+        shader(151, 0, 0);
+        shader(152, FLAG_FOREIGN, SHADER_NEW);
+        rec(&mut b, 200, REC_FRAME, 40_000, 0, 0);
+        let s = summarize(&b).unwrap();
+        assert_eq!((s.hitches, s.hitches_shaders, s.hitches_creating), (1, 1, 0));
+        assert_eq!((s.shaders, s.shaders_new), (2, 1));
+        assert_eq!(s.shader_create_ms, 4.0);
     }
 
     #[test]

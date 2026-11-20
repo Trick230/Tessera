@@ -3,7 +3,7 @@
 # DLLs win over System32 for d3d11, which is not a KnownDLL).
 add_executable(d3d11_smoke main.cpp)
 target_include_directories(d3d11_smoke PRIVATE ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(d3d11_smoke PRIVATE d3d11 dxgi)
+target_link_libraries(d3d11_smoke PRIVATE d3d11 dxgi d3dcompiler)
 target_compile_options(d3d11_smoke PRIVATE /EHsc)
 add_dependencies(d3d11_smoke tessera_d3d11)
 add_custom_command(TARGET d3d11_smoke POST_BUILD

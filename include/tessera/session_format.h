@@ -26,9 +26,12 @@ enum TesseraRecordKind {
     TESSERA_REC_SRV = 4,        // a = view dimension (0 if no desc)
     TESSERA_REC_DEVICE = 5,     // a = feature level, d = create flags
     TESSERA_REC_SWAPCHAIN = 6,  // a = width, b = height, c = buffers, d = swap effect, flags = desc flags
+                                // (| 0x100 when Tessera converted it to flip model, P2)
     TESSERA_REC_VRAM = 7,       // ~1 s samples: a = local budget MB (real), b = local usage MB,
                                 // c = shared (non-local) usage MB, d = budget cap MB reported to
                                 // the game (0 = none), bytes = local usage
+    TESSERA_REC_SHADER = 8,     // a = stage, b = bytecode bytes, c = creation call us, d = TESSERA_SHADER_*
+                                // bits (shader_store_format.h), bytes = shader hash
     TESSERA_REC_END = 0xFFFF,   // a = records dropped (ring overrun), bytes = records written
 };
 

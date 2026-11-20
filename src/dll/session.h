@@ -13,6 +13,10 @@ void session_push(TesseraRecord& r);
 // wait_us: time the frame limiter waited before this Present.
 void session_frame(uint32_t wait_us);
 
+// Per-game data file: <data dir>\<sub>\<exe name>-<path key>.<ext> (same key as
+// the safe-mode counter); creates <sub>. out holds MAX_PATH. After session_init.
+bool session_data_path(const wchar_t* sub, const wchar_t* ext, wchar_t* out);
+
 // DllMain(DLL_PROCESS_DETACH): final flush, END record, clears the crash counter.
 void session_shutdown();
 }  // namespace tessera

@@ -5,6 +5,7 @@
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <windows.h>
 
@@ -15,11 +16,35 @@
 #include <vector>
 
 #include "tessera/session_format.h"
+#include "tessera/shader_store_format.h"
 
 namespace {
 int fail(const char* what, HRESULT hr = S_OK) {
     std::printf("FAIL: %s (0x%08lx)\n", what, static_cast<unsigned long>(hr));
     return 1;
+}
+
+// S6: a VS (created twice: the second is already known) and a PS.
+int make_shaders(ID3D11Device* dev) {
+    static const char kSrc[] =
+        "float4 vs(uint id : SV_VertexID) : SV_Position { return float4(id & 1, id >> 1, 0, 1); }\n"
+        "float4 ps() : SV_Target { return float4(1, 0.5, 0, 1); }\n";
+    ID3DBlob* vs = nullptr;
+    ID3DBlob* ps = nullptr;
+    HRESULT hr = D3DCompile(kSrc, sizeof kSrc - 1, "smoke", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, nullptr);
+    if (SUCCEEDED(hr)) hr = D3DCompile(kSrc, sizeof kSrc - 1, "smoke", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, nullptr);
+    if (FAILED(hr)) return fail("D3DCompile", hr);
+    for (int i = 0; i < 2 && SUCCEEDED(hr); ++i) {
+        ID3D11VertexShader* v = nullptr;
+        hr = dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &v);
+        if (v) v->Release();
+    }
+    ID3D11PixelShader* p = nullptr;
+    if (SUCCEEDED(hr)) hr = dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &p);
+    if (p) p->Release();
+    vs->Release();
+    ps->Release();
+    return FAILED(hr) ? fail("create shaders", hr) : 0;
 }
 
 HWND make_window() {
@@ -157,6 +182,7 @@ int run(bool crash) {
         if (FAILED(hr)) return fail("CreateBuffer", hr);
         b->Release();
     }
+    if (make_shaders(dev)) return 1;
 
     // A plain forwarded export (asm stub -> resolve thunk -> system d3d11).
     using PFN_FromDxgi = HRESULT(WINAPI*)(IDXGIDevice*, IUnknown**);
@@ -192,6 +218,10 @@ int run(bool crash) {
                                        &sd, &sc, &dev, nullptr, &ctx);
     if (FAILED(hr)) return fail("D3D11CreateDeviceAndSwapChain", hr);
     render(dev, ctx, sc, 60, false);
+    // A resize must keep working when the layer made this swapchain flip model (P2).
+    hr = sc->ResizeBuffers(0, 800, 450, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr)) return fail("ResizeBuffers", hr);
+    render(dev, ctx, sc, 10, false);
     sc->Release();
     ctx->Release();
     dev->Release();
@@ -225,7 +255,7 @@ int verify(const wchar_t* dir, int fps) {
     int frames = 0, tex = 0, bc7_full = 0, buffers = 0, srvs = 0, devices = 0, swapchains = 0, sc_comp = 0,
         end = 0;
     uint32_t dropped = 0, max_frame_us = 0;
-    int prio_buffers = 0, prio_tex = 0, foreign = 0, vram = 0;
+    int prio_buffers = 0, prio_tex = 0, foreign = 0, vram = 0, flipped = 0, shaders = 0, shaders_new = 0;
     uint32_t budget_mb = 0, usage_mb = 0, cap_mb = 0;
     std::vector<uint32_t> paced;  // frame times of frames the limiter waited for
     TesseraRecord r;
@@ -251,7 +281,13 @@ int verify(const wchar_t* dir, int fps) {
             case TESSERA_REC_DEVICE: ++devices; break;
             case TESSERA_REC_SWAPCHAIN:
                 ++swapchains;
+                if (r.d & 0x100) ++flipped;
                 if (r.d == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) ++sc_comp;
+                break;
+            case TESSERA_REC_SHADER:
+                ++shaders;
+                if (r.d & TESSERA_SHADER_NEW) ++shaders_new;
+                if (!(r.d & TESSERA_SHADER_DXBC) || r.c == 0 || r.bytes == 0) return fail("shader record fields");
                 break;
             case TESSERA_REC_VRAM: ++vram; budget_mb = r.a; usage_mb = r.b; cap_mb = r.d; break;
             case TESSERA_REC_END: ++end; dropped = r.a; break;
@@ -272,6 +308,12 @@ int verify(const wchar_t* dir, int fps) {
     std::printf("vram samples %d, budget %u MB, usage %u MB, cap %u MB\n", vram, budget_mb, usage_mb, cap_mb);
     if (vram < 1 || budget_mb == 0) return fail("no VRAM budget samples");
     if (fps > 0 && cap_mb != 2048) return fail("budget cap not in the log");
+    // P2: the limited run also sets flip_model=1; only the DISCARD swapchain qualifies.
+    std::printf("swapchains converted to flip model %d\n", flipped);
+    if (flipped != (fps > 0 ? 1 : 0)) return fail("flip model conversion");
+    // S6: the first run stores the VS and the PS; the limited run finds both in the store.
+    std::printf("shaders %d, new %d\n", shaders, shaders_new);
+    if (shaders != 3 || shaders_new != (fps > 0 ? 0 : 2)) return fail("shader records");
     if (fps > 0) {
         if (paced.size() < 100) return fail("limiter did not wait");
         std::sort(paced.begin(), paced.end());

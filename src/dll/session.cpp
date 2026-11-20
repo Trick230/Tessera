@@ -15,6 +15,7 @@
 #include "memory.h"
 #include "pacing.h"
 #include "process.h"
+#include "shaders.h"
 
 namespace tessera {
 namespace {
@@ -165,6 +166,7 @@ DWORD WINAPI writer_main(void*) {
         ++tick;
         if ((tick & 3) == 1) memory_background_tick();  // every 1 s, first after 250 ms
         if ((tick & 7) == 0) pacing_background_tick();  // every 2 s
+        shaders_background_tick();
         if (!stable) {
             const int64_t last = g_last_present.load(std::memory_order_relaxed);
             if (last && static_cast<uint64_t>(last) - g_init_qpc > 60 * static_cast<uint64_t>(g_freq.QuadPart)) {
@@ -263,6 +265,13 @@ BOOL CALLBACK init_once(PINIT_ONCE, void*, void**) {
 }
 }  // namespace
 
+bool session_data_path(const wchar_t* sub, const wchar_t* ext, wchar_t* out) {
+    if (!g_started) return false;
+    make_dir(L"%s\\%s", sub);
+    return _snwprintf_s(out, MAX_PATH, _TRUNCATE, L"%s\\%s\\%s-%016llx.%s", g_dir, sub, g_exe_name,
+                        path_key(g_exe_path), ext) >= 0;
+}
+
 bool session_init() {
     InitOnceExecuteOnce(&g_once, init_once, nullptr, nullptr);
     return g_enabled;
@@ -305,6 +314,7 @@ void session_shutdown() {
         // Process exit: other threads are already gone, so we are the only consumer.
         log_exiting();
         flush(true);
+        shaders_shutdown();
         g_dropped += g_claim_failed.load(std::memory_order_relaxed);
         TesseraRecord end = {};
         LARGE_INTEGER now;

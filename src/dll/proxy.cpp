@@ -4,12 +4,15 @@
 // which loads the real DLL lazily (never in DllMain): the DLL named by
 // tessera.ini `next=` (chained proxy) or the system d3d11.dll.
 #include <windows.h>
+#include <intrin.h>
 
 #include <cwchar>
 
 #include "exports_d3d11_gen.h"
+#include "flip.h"
 #include "hooks.h"
 #include "log.h"
+#include "module.h"
 #include "session.h"
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
@@ -92,17 +95,28 @@ extern "C" HRESULT WINAPI Tessera_D3D11CreateDeviceAndSwapChain(
     IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, HMODULE software, UINT flags, const D3D_FEATURE_LEVEL* levels,
     UINT nlevels, UINT sdk, const DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** sc, ID3D11Device** dev,
     D3D_FEATURE_LEVEL* level, ID3D11DeviceContext** ctx) {
+    void* const ret = _ReturnAddress();
     auto fn = reinterpret_cast<PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN>(
         real(tessera::exports::kD3D11CreateDeviceAndSwapChain));
-    const HRESULT hr = fn(adapter, type, software, flags, levels, nlevels, sdk, desc, sc, dev, level, ctx);
+    // P2: a qualifying blit swapchain is created as flip model from the start.
+    DXGI_SWAP_CHAIN_DESC flip;
+    bool tearing = false;
+    bool conv = desc && sc && tessera::session_init() &&
+                tessera::flip_convert(nullptr, tessera::is_game_code(ret), *desc, &flip, &tearing);
+    // d3d11 creates the swapchain through the hooked factory: recorded once, here.
+    HRESULT hr = E_FAIL;
+    {
+        tessera::InternalCall internal;
+        if (conv) hr = fn(adapter, type, software, flags, levels, nlevels, sdk, &flip, sc, dev, level, ctx);
+        if (conv && FAILED(hr)) {
+            tessera::logf("flip: D3D11CreateDeviceAndSwapChain failed 0x%x with flip model, retrying as asked", hr);
+            conv = false;
+        }
+        if (!conv) hr = fn(adapter, type, software, flags, levels, nlevels, sdk, desc, sc, dev, level, ctx);
+    }
     if (SUCCEEDED(hr) && dev && *dev) {
         tessera::on_device(*dev, flags);
-        if (sc && *sc && tessera::session_init()) {
-            if (desc)
-                tessera::logf("swapchain (CreateDeviceAndSwapChain) %ux%u buffers %u", desc->BufferDesc.Width,
-                              desc->BufferDesc.Height, desc->BufferCount);
-            tessera::on_swapchain(*sc);
-        }
+        if (sc && *sc && tessera::session_init()) tessera::on_legacy_swapchain(*sc, *dev, conv ? &flip : desc, conv, tearing);
     }
     return hr;
 }
