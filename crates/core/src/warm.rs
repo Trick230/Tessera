@@ -144,15 +144,15 @@ pub fn is_running(exe: &Path) -> bool {
 /// lines. Blocks until done: call it off the UI thread.
 pub fn run(exe: &Path, warm_exe: &Path) -> io::Result<String> {
     let other = |m: &str| io::Error::other(m.to_string());
-    let base = store_base(exe).ok_or_else(|| other("caminho do jogo inválido"))?;
+    let base = store_base(exe).ok_or_else(|| other("invalid game path"))?;
     let todo: Vec<PathBuf> = bases(exe).into_iter().filter(|b| with_suffix(b, ".tshi").is_file()).collect();
     if todo.is_empty() || stored(exe).shaders == 0 {
-        return Err(other("ainda não há shaders: procura nos ficheiros ou joga uma vez com a camada"));
+        return Err(other("no shaders yet: search the files or play once with the layer"));
     }
     if is_running(exe) {
-        return Err(other("fecha o jogo antes de aquecer os shaders"));
+        return Err(other("close the game before warming shaders"));
     }
-    let name = exe.file_name().ok_or_else(|| other("caminho do jogo inválido"))?;
+    let name = exe.file_name().ok_or_else(|| other("invalid game path"))?;
     let dir = crate::paths::data_dir().join("warm").join(base.file_name().unwrap_or_default());
     fs::create_dir_all(&dir)?;
     let copy = dir.join(name);

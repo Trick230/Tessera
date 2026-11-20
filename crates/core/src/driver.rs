@@ -51,13 +51,13 @@ impl Report {
         match self.nv_limit {
             Some(NvCacheLimit::Unlimited) | None => {}
             Some(NvCacheLimit::Disabled) => out.push(
-                "A cache de shaders da NVIDIA está desligada: os jogos recompilam shaders em cada arranque. \
-                 Painel de Controlo NVIDIA → Tamanho da cache de shaders → Ilimitado."
+                "The NVIDIA shader cache is off, so games recompile shaders on every start. \
+                 NVIDIA Control Panel → Shader Cache Size → Unlimited."
                     .to_string(),
             ),
             Some(_) => out.push(
-                "A cache de shaders da NVIDIA tem limite: com vários jogos grandes, shaders antigos são \
-                 apagados e voltam a compilar. Painel de Controlo NVIDIA → Tamanho da cache de shaders → Ilimitado."
+                "The NVIDIA shader cache has a size limit: with several big games, old shaders get \
+                 evicted and compile again. NVIDIA Control Panel → Shader Cache Size → Unlimited."
                     .to_string(),
             ),
         }
@@ -65,16 +65,16 @@ impl Report {
             let amd: u64 = self.caches.iter().filter(|(p, _)| is_amd_cache(p)).map(|(_, s)| s).sum();
             if amd > AMD_CACHE_LIMIT * 9 / 10 {
                 out.push(format!(
-                    "A cache de shaders da AMD está perto do limite de 16 GiB ({:.1} GiB): os shaders mais \
-                     antigos vão ser descartados.",
+                    "The AMD shader cache is close to its 16 GiB limit ({:.1} GiB); the oldest shaders \
+                     will be dropped.",
                     amd as f64 / (1u64 << 30) as f64
                 ));
             }
         }
         if self.driver_changed {
             out.push(
-                "O driver da gráfica mudou desde a última vez: as caches de shaders foram invalidadas e os jogos \
-                 vão recompilar shaders nas primeiras sessões."
+                "The graphics driver changed since last time: shader caches were reset and games \
+                 will recompile shaders in their first sessions."
                     .to_string(),
             );
         }

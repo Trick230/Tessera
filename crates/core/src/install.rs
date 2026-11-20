@@ -67,7 +67,7 @@ pub fn state(dir: &Path, proxy: &str) -> InstallState {
 /// Reinstalling over our own layer only replaces the DLL.
 pub fn install(dir: &Path, payload: &Path, proxy: &str) -> io::Result<InstallState> {
     if !payload.is_file() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, format!("camada não encontrada: {}", payload.display())));
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("layer not found: {}", payload.display())));
     }
     let target = dir.join(proxy);
     let mut chained = read_marker(dir).and_then(|m| m.chained);
@@ -75,7 +75,7 @@ pub fn install(dir: &Path, payload: &Path, proxy: &str) -> io::Result<InstallSta
     if read_marker(dir).is_none() && target.exists() {
         let next = next_name(proxy);
         if dir.join(&next).exists() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{next} já existe; não sobrescrevo")));
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{next} already exists; not overwriting it")));
         }
         fs::rename(&target, dir.join(&next))?;
         chained = Some(next);
@@ -171,7 +171,7 @@ pub fn save_settings(dir: &Path, s: &Settings) -> io::Result<()> {
 /// Removes our layer and restores a chained DLL to its original name.
 pub fn uninstall(dir: &Path) -> io::Result<InstallState> {
     let Some(m) = read_marker(dir) else {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "o Tessera não está instalado aqui"));
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Tessera is not installed here"));
     };
     let target = dir.join(&m.proxy);
     if target.exists() {

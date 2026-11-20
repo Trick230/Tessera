@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { Button, ComboBox, LineEdit, ListView, ScrollView, Switch } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
+// Chakra Petch (SIL OFL 1.1, see fonts/OFL.txt) is the face of the whole app.
+import "./fonts/ChakraPetch-Regular.ttf";
+import "./fonts/ChakraPetch-Medium.ttf";
+import "./fonts/ChakraPetch-SemiBold.ttf";
+import "./fonts/ChakraPetch-Bold.ttf";
 
 export struct GameRow {
     name: string,
@@ -15,6 +20,10 @@ export struct GameRow {
     blocked: bool,
     can-install: bool,
     d3d11: bool,
+    // First letter, shown when there is no icon.
+    initial: string,
+    // Steam's 32x32 icon; empty for other stores.
+    icon: image,
 }
 
 // Last session recorded by the layer for the selected game.
@@ -60,60 +69,303 @@ export struct GameSettings {
     vram-hint: string,
 }
 
+// Neutral greys; colour is kept for state only (ok, warning, error). The
+// mosaic tones are greys too.
 global Theme {
-    out property <color> bg: #111318;
-    out property <color> side: #171a20;
-    out property <color> card: #1c2028;
-    out property <color> line: #272c36;
-    out property <color> text: #e8eaee;
-    out property <color> dim: #9aa1ad;
-    out property <color> faint: #6b7280;
-    out property <color> accent: #6d8cff;
-    out property <color> ok: #34d399;
-    out property <color> warn: #fbbf24;
-    out property <color> bad: #f87171;
+    out property <color> bg: #161616;
+    out property <color> side: #1f1f1f;
+    out property <color> surface: #1d1d1d;
+    out property <color> raised: #222222;
+    out property <color> hover: #ffffff0a;
+    out property <color> press: #ffffff12;
+    out property <color> line: #2a2a2a;
+    out property <color> line-strong: #3a3a3a;
+    out property <color> text: #ebebeb;
+    out property <color> dim: #a0a0a0;
+    out property <color> faint: #808080;
+    out property <color> accent: #e4e4e4;
+    out property <color> ink: #141414;
+    out property <color> ok: #8cc88c;
+    out property <color> warn: #e3b25a;
+    out property <color> bad: #e06c5a;
+    // Mosaic tones.
+    out property <color> ochre: #d6d6d6;
+    out property <color> sand: #9a9a9a;
+    out property <color> umber: #5c5c5c;
+    out property <color> slate: #3a3a3a;
+    out property <string> display: "Chakra Petch";
+    out property <string> mono: "Consolas";
+    out property <string> icons: "Segoe Fluent Icons";
+    // Windows 11 control fills and stroke.
+    out property <color> fill: #ffffff0f;
+    out property <color> fill-hover: #ffffff15;
+    out property <color> fill-press: #ffffff08;
+    out property <color> fill-sunk: #0000001f;
+    out property <color> stroke: #ffffff12;
+    // Slightly rounded corners, graphite switches, white knobs.
+    out property <length> r-ctl: 3px;
+    out property <length> r-card: 5px;
+    out property <color> graphite: #8e8e93;
+    out property <color> knob: #f4f4f4;
+    out property <color> ring: #ffffff38;
 }
 
-component Chip inherits Rectangle {
-    in property <string> text;
-    in property <color> tint: Theme.accent;
-    height: 24px;
-    width: label.preferred-width + 20px;
-    border-radius: 12px;
-    background: tint.with-alpha(0.16);
-    label := Text {
-        text: root.text;
-        color: tint.brighter(0.35);
-        font-size: 12px;
-        font-weight: 600;
-        vertical-alignment: center;
-        horizontal-alignment: center;
+// The mark: a 3x3 patch of mosaic tiles. While busy, the tiles breathe in a
+// diagonal wave.
+component Mark inherits Rectangle {
+    in property <length> tile: 6px;
+    in property <length> gap: tile / 3;
+    in property <bool> busy;
+    width: 3 * tile + 2 * gap;
+    height: self.width;
+    for c[i] in [Theme.accent, Theme.sand, Theme.ochre, Theme.umber, Theme.accent, Theme.sand, Theme.sand, Theme.slate, Theme.accent]: Rectangle {
+        x: Math.mod(i, 3) * (root.tile + root.gap);
+        y: Math.floor(i / 3) * (root.tile + root.gap);
+        width: root.tile;
+        height: root.tile;
+        border-radius: root.tile / 4;
+        background: c;
+        opacity: root.busy ? 0.3 + 0.7 * Math.abs(Math.sin((animation-tick() / 1400ms - (Math.mod(i, 3) + Math.floor(i / 3)) * 0.09) * 180deg)) : 1;
     }
 }
 
-component Card inherits Rectangle {
-    background: Theme.card;
-    border-radius: 12px;
-    border-width: 1px;
-    border-color: Theme.line;
+// Small uppercase label above a value or a section.
+component Caps inherits Text {
+    font-family: Theme.display;
+    color: Theme.faint;
+    font-size: 13px;
+    font-weight: 500;
+    vertical-alignment: center;
 }
 
-// Coloured strip with a message: warnings, safe mode, driver advice.
+// A Segoe Fluent Icons glyph.
+component Icon inherits Text {
+    font-family: Theme.icons;
+    font-size: 15px;
+    vertical-alignment: center;
+    horizontal-alignment: center;
+}
+
+// Windows 11 style button: soft fill, hairline stroke, darker bottom edge,
+// arrow cursor. `icon` is a Segoe Fluent Icons code point.
+component Btn inherits Rectangle {
+    in property <string> text;
+    in property <string> icon;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    // Toolbar style: no fill or stroke until hovered.
+    in property <bool> flat;
+    callback clicked;
+    height: 34px;
+    min-width: row.preferred-width;
+    preferred-width: self.min-width;
+    border-radius: Theme.r-ctl;
+    border-width: 1px;
+    border-color: root.primary ? Theme.accent.brighter(0.15) : root.flat ? transparent : Theme.stroke;
+    background: root.primary
+        ? (ta.pressed ? Theme.accent.darker(0.12) : ta.has-hover ? Theme.accent.brighter(0.08) : Theme.accent)
+        : (ta.pressed ? Theme.fill-press : ta.has-hover ? Theme.fill-hover : root.flat ? transparent : Theme.fill);
+    opacity: root.enabled ? 1 : 0.4;
+    animate background { duration: 90ms; }
+    animate opacity { duration: 160ms; }
+    Rectangle {
+        x: 6px;
+        y: 0;
+        width: parent.width - 12px;
+        height: 1px;
+        background: root.primary ? #ffffff60 : #ffffff10;
+        visible: !ta.pressed && !root.flat;
+    }
+    row := HorizontalLayout {
+        padding-left: root.flat ? 10px : 12px;
+        padding-right: root.flat ? 10px : 12px;
+        spacing: 8px;
+        alignment: center;
+        if root.icon != "": Icon {
+            text: root.icon;
+            color: root.primary ? Theme.ink : ta.pressed ? Theme.dim : Theme.text;
+        }
+        Text {
+            text: root.text;
+            color: root.primary ? Theme.ink : ta.pressed ? Theme.dim : Theme.text;
+            font-size: 14px;
+            font-family: Theme.display;
+            font-weight: root.primary ? 700 : 600;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Switch: a graphite track when on, a squared white knob that
+// stretches while pressed.
+component Toggle inherits Rectangle {
+    in-out property <bool> checked;
+    callback toggled;
+    width: 44px;
+    height: 24px;
+    border-radius: 6px;
+    background: root.checked
+        ? (ta.has-hover ? Theme.graphite.brighter(0.1) : Theme.graphite)
+        : (ta.has-hover ? #ffffff26 : #ffffff1c);
+    animate background { duration: 100ms; }
+    knob := Rectangle {
+        property <length> d: 20px;
+        width: ta.pressed ? 25px : self.d;
+        height: self.d;
+        border-radius: 4px;
+        y: (root.height - self.height) / 2;
+        x: root.checked ? root.width - self.width - 2px : 2px;
+        background: Theme.knob;
+        drop-shadow-blur: 3px;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-color: #00000066;
+        animate x { duration: 120ms; easing: ease-out; }
+        animate width { duration: 80ms; }
+    }
+    ta := TouchArea {
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled();
+        }
+    }
+}
+
+component StepArrow inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> enabled;
+    callback clicked;
+    width: 32px;
+    border-radius: 2px;
+    background: ta.pressed && root.enabled ? Theme.fill-press : ta.has-hover && root.enabled ? Theme.fill-hover : transparent;
+    animate background { duration: 90ms; }
+    Icon {
+        text: root.glyph;
+        font-size: 12px;
+        color: root.enabled ? Theme.dim : Theme.line-strong;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Steps through a short list of choices: < value >.
+component Stepper inherits Rectangle {
+    in property <[string]> model;
+    in-out property <int> current-index;
+    callback selected;
+    width: 180px;
+    height: 34px;
+    border-radius: Theme.r-ctl;
+    background: Theme.fill;
+    border-width: 1px;
+    border-color: Theme.stroke;
+    HorizontalLayout {
+        padding: 2px;
+        StepArrow {
+            glyph: "\u{E76B}";
+            enabled: root.current-index > 0;
+            clicked => {
+                root.current-index -= 1;
+                root.selected();
+            }
+        }
+        Text {
+            text: root.model[root.current-index];
+            font-family: Theme.display;
+            font-weight: 600;
+            color: Theme.text;
+            font-size: 14px;
+            horizontal-stretch: 1;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        StepArrow {
+            glyph: "\u{E76C}";
+            enabled: root.current-index < root.model.length - 1;
+            clicked => {
+                root.current-index += 1;
+                root.selected();
+            }
+        }
+    }
+}
+
+// Rounded search field with a soft focus ring.
+component SearchField inherits Rectangle {
+    callback edited(string);
+    height: 34px;
+    border-radius: Theme.r-ctl;
+    background: #ffffff0c;
+    border-width: input.has-focus ? 2px : 1px;
+    border-color: input.has-focus ? Theme.ring : Theme.stroke;
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 10px;
+        spacing: 7px;
+        Icon { text: "\u{E721}"; font-size: 13px; color: Theme.faint; }
+        Rectangle {
+            horizontal-stretch: 1;
+            Text {
+                x: 0;
+                height: parent.height;
+                text: "Search games";
+                color: Theme.faint;
+                font-size: 14px;
+                vertical-alignment: center;
+                visible: input.text == "";
+            }
+            input := TextInput {
+                color: Theme.text;
+                font-size: 14px;
+                vertical-alignment: center;
+                selection-background-color: Theme.accent.with-alpha(0.35);
+                edited => { root.edited(self.text); }
+            }
+        }
+    }
+}
+
+component Pill inherits Rectangle {
+    in property <string> text;
+    in property <color> tint;
+    height: 26px;
+    width: label.preferred-width + 22px;
+    border-radius: Theme.r-ctl;
+    background: root.tint.with-alpha(0.13);
+    label := Text {
+        text: root.text;
+        color: root.tint;
+        font-family: Theme.display;
+        font-size: 13px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// Message with a thin coloured edge: warnings, safe mode, driver advice.
 component Banner inherits Rectangle {
     in property <string> text;
     in property <color> tint: Theme.warn;
-    border-radius: 10px;
-    background: tint.with-alpha(0.10);
+    border-radius: Theme.r-card;
+    background: root.tint.with-alpha(0.08);
     border-width: 1px;
-    border-color: tint.with-alpha(0.35);
+    border-color: root.tint.with-alpha(0.16);
     HorizontalLayout {
         padding: 12px;
-        spacing: 10px;
-        Rectangle { width: 4px; border-radius: 2px; background: root.tint; }
+        padding-left: 14px;
+        spacing: 12px;
+        Icon { text: "\u{E946}"; font-size: 17px; color: root.tint; }
         Text {
             text: root.text;
             color: Theme.text;
-            font-size: 13px;
+            font-size: 14px;
             wrap: word-wrap;
             vertical-alignment: center;
             horizontal-stretch: 1;
@@ -122,290 +374,389 @@ component Banner inherits Rectangle {
     }
 }
 
-component SectionTitle inherits HorizontalLayout {
-    in property <string> text;
-    in property <string> sub;
-    spacing: 10px;
-    Text { text: root.text; color: Theme.text; font-size: 16px; font-weight: 600; vertical-alignment: center; }
-    Text { text: root.sub; color: Theme.dim; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+component Hairline inherits Rectangle {
+    height: 1px;
+    background: Theme.line;
 }
 
-component StatTile inherits Card {
+// Vertical divider between toolbar groups.
+component ToolSep inherits VerticalLayout {
+    alignment: center;
+    padding-left: 6px;
+    padding-right: 6px;
+    Rectangle { width: 1px; height: 22px; background: Theme.line-strong; }
+}
+
+// One figure of the session readout: label, value, a short line under it.
+component Readout inherits VerticalLayout {
     in property <string> label;
     in property <string> value;
     in property <string> sub;
-    in property <color> tint: Theme.text;
+    in property <bool> flagged;
     horizontal-stretch: 1;
-    min-width: 120px;
-    VerticalLayout {
-        padding: 14px;
-        spacing: 4px;
-        Text { text: root.label; color: Theme.dim; font-size: 12px; }
-        Text { text: root.value; color: root.tint; font-size: 24px; font-weight: 700; overflow: elide; }
-        Text { text: root.sub; color: Theme.faint; font-size: 11px; wrap: word-wrap; }
+    min-width: 130px;
+    preferred-width: 130px;
+    spacing: 2px;
+    Caps { text: root.label; }
+    Text {
+        text: root.value;
+        color: root.flagged ? Theme.warn : Theme.text;
+        font-size: 26px;
+        font-weight: 600;
+        overflow: elide;
     }
+    Text { text: root.sub; color: Theme.faint; font-size: 13px; overflow: elide; }
 }
 
+// One line of the game list: name, and the layer state when it matters.
 component GameItem inherits Rectangle {
     in property <GameRow> game;
     in property <bool> selected;
     callback clicked;
-    height: 58px;
-    border-radius: 8px;
-    background: selected ? Theme.card : ta.has-hover ? #1d2129 : transparent;
-    animate background { duration: 120ms; }
-    // Accent bar on the selected row.
+    border-radius: Theme.r-ctl;
+    background: root.selected ? #ffffff17 : ta.has-hover ? Theme.hover : transparent;
     Rectangle {
-        x: 0; width: 3px; height: 26px;
-        border-radius: 2px;
-        background: selected ? Theme.accent : transparent;
+        x: 0;
+        width: 3px;
+        height: 20px;
+        border-radius: 1.5px;
+        background: Theme.accent;
+        visible: root.selected;
     }
     HorizontalLayout {
-        padding-left: 14px;
-        padding-right: 12px;
-        spacing: 12px;
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 10px;
         VerticalLayout {
             alignment: center;
             Rectangle {
-                width: 9px; height: 9px; border-radius: 4.5px;
-                background: game.blocked ? Theme.bad : game.installed ? Theme.ok : #4b5260;
+                width: 24px;
+                height: 24px;
+                border-radius: 4px;
+                clip: true;
+                background: Theme.fill-hover;
+                if root.game.icon.width > 0: Image {
+                    source: root.game.icon;
+                    image-fit: cover;
+                }
+                if root.game.icon.width == 0: Text {
+                    text: root.game.initial;
+                    color: Theme.dim;
+                    font-size: 13px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
             }
         }
-        VerticalLayout {
-            alignment: center;
-            spacing: 3px;
-            Text { text: game.name; color: Theme.text; font-size: 14px; overflow: elide; }
-            Text {
-                text: game.blocked ? "Anti-cheat · só leitura" : game.installed ? "Camada ativa · " + game.api : game.store + "  ·  " + game.api;
-                color: game.blocked ? #fca5a5 : game.installed ? #6ee7b7 : Theme.dim;
-                font-size: 11px;
-                overflow: elide;
-            }
+        Text {
+            text: root.game.name;
+            color: root.selected || ta.has-hover ? Theme.text : Theme.text.darker(0.12);
+            font-size: 14px;
+            font-weight: root.selected ? 600 : 400;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if root.game.blocked || root.game.installed: Text {
+            text: root.game.blocked ? "Anti-cheat" : "On";
+            color: root.game.blocked ? Theme.bad : Theme.ok;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
         }
     }
-    ta := TouchArea { clicked => { root.clicked(); } }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// Underlined tab, as in the Windows pivot control.
+component Tab inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    width: label.preferred-width + 26px;
+    height: 40px;
+    label := Text {
+        text: root.text;
+        color: root.active ? Theme.text : ta.has-hover ? Theme.dim.brighter(0.25) : Theme.dim;
+        font-size: 14px;
+        font-weight: root.active ? 600 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: 12px;
+        y: parent.height - 2px;
+        width: parent.width - 24px;
+        height: 2px;
+        background: Theme.accent;
+        visible: root.active;
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
 }
 
 component InfoRow inherits HorizontalLayout {
     in property <string> label;
     in property <string> value;
+    in property <bool> code;
     spacing: 16px;
-    Text { text: label; width: 110px; color: Theme.dim; font-size: 12px; }
-    Text { text: value; color: Theme.text; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
-}
-
-// One setting: title and explanation on the left, the control on the right.
-component SettingRow inherits HorizontalLayout {
-    in property <string> title;
-    in property <string> help;
-    spacing: 16px;
-    VerticalLayout {
+    Text { text: root.label; width: 120px; color: Theme.faint; font-size: 13px; }
+    Text {
+        text: root.value;
+        color: Theme.dim.brighter(0.15);
+        font-family: root.code ? Theme.mono : "";
+        font-size: root.code ? 13px : 14px;
+        wrap: word-wrap;
         horizontal-stretch: 1;
-        spacing: 3px;
-        alignment: center;
-        Text { text: root.title; color: Theme.text; font-size: 13px; font-weight: 600; }
-        Text { text: root.help; color: Theme.dim; font-size: 12px; wrap: word-wrap; }
-    }
-    VerticalLayout {
-        alignment: center;
-        width: 170px;
-        @children
     }
 }
 
-component Detail inherits VerticalLayout {
+// Property grid row: name, control, a short note.
+component PropRow inherits VerticalLayout {
+    in property <string> label;
+    in property <string> help;
+    HorizontalLayout {
+        padding-top: 9px;
+        padding-bottom: 9px;
+        spacing: 16px;
+        Text { text: root.label; width: 190px; color: Theme.text; font-size: 14px; vertical-alignment: center; }
+        HorizontalLayout {
+            width: 190px;
+            alignment: start;
+            @children
+        }
+        Text { text: root.help; color: Theme.faint; font-size: 13px; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1; }
+    }
+    Hairline { }
+}
+
+component Detail inherits Rectangle {
     in property <GameRow> game;
-    in property <bool> busy;
     in property <SessionInfo> session;
     in property <GameSettings> settings;
-    in-out property <bool> show-files: false;
-    callback install();
-    callback uninstall();
-    callback open-folder();
+    in-out property <int> tab;
+    // Steam's key art for the game; empty when there is none.
+    in property <image> hero;
+    property <bool> has-hero: root.hero.width > 0;
     callback reset-safe-mode();
-    callback warm-shaders();
     callback settings-changed(bool, bool, bool, int, int);
-    padding: 32px;
-    spacing: 18px;
-    alignment: start;
 
-    // Header: name, tags and the layer actions.
-    HorizontalLayout {
-        spacing: 16px;
-        VerticalLayout {
-            horizontal-stretch: 1;
-            spacing: 10px;
-            Text { text: game.name; font-size: 28px; font-weight: 700; color: Theme.text; wrap: word-wrap; }
-            HorizontalLayout {
-                spacing: 8px;
-                alignment: start;
-                Chip { text: game.store; tint: #a78bfa; }
-                Chip { text: game.engine; tint: #60a5fa; }
-                Chip { text: game.api; tint: #2dd4bf; }
-                if game.installed: Chip { text: "Camada ativa"; tint: Theme.ok; }
-                if game.blocked: Chip { text: "Anti-cheat: " + game.anticheat; tint: Theme.bad; }
-            }
-        }
-        VerticalLayout {
-            alignment: start;
-            HorizontalLayout {
-                spacing: 8px;
-                if !game.blocked: Button {
-                    text: game.installed ? "Reinstalar" : "Instalar camada";
-                    primary: !game.installed;
-                    enabled: game.can-install && !busy;
-                    clicked => { root.install(); }
-                }
-                if game.installed: Button { text: "Desinstalar"; enabled: !busy; clicked => { root.uninstall(); } }
-                if game.d3d11: Button { text: "Preparar shaders"; enabled: !busy; clicked => { root.warm-shaders(); } }
-                Button { text: "Abrir pasta"; clicked => { root.open-folder(); } }
-            }
-        }
-    }
-
-    if game.blocked: Banner {
-        tint: Theme.bad;
-        text: "Este jogo tem anti-cheat. O Tessera só lê os ficheiros e nunca instala a camada.";
-    }
-    if session.safe-mode: Banner {
-        tint: Theme.bad;
-        text: "Modo seguro: a camada desligou-se depois de dois arranques que não terminaram bem.";
-        Button { text: "Reativar"; clicked => { root.reset-safe-mode(); } }
-    }
-    if !game.blocked && !game.installed && !session.present: Banner {
-        tint: Theme.accent;
-        text: "Instala a camada e joga uma vez: o Tessera mede a sessão (frametimes, stutters, VRAM) e mostra aqui o que pode melhorar.";
-    }
-
-    // Last session.
-    if session.present: VerticalLayout {
-        spacing: 12px;
-        SectionTitle { text: "Última sessão"; sub: session.when; }
-        HorizontalLayout {
-            spacing: 12px;
-            StatTile { label: "FPS médio"; value: session.fps; sub: session.fps-sub; }
-            StatTile {
-                label: "Frames lentos (p99)"; value: session.p99; sub: session.p99-sub;
-                tint: session.p99-good ? Theme.text : Theme.warn;
-            }
-            StatTile {
-                label: "Stutters"; value: session.stutters; sub: session.stutters-sub;
-                tint: session.stutters-good ? Theme.ok : Theme.warn;
-            }
-            StatTile {
-                label: "VRAM"; value: session.vram; sub: session.vram-sub;
-                tint: session.vram-good ? Theme.text : Theme.warn;
-            }
-        }
-        if session.causes != "" || session.advice != "": Card {
-            VerticalLayout {
-                padding: 16px;
-                spacing: 8px;
-                if session.causes != "": Text { text: session.causes; color: Theme.text; font-size: 13px; wrap: word-wrap; }
-                if session.advice != "": Text { text: session.advice; color: Theme.dim; font-size: 12px; wrap: word-wrap; }
-            }
-        }
-        Card {
-            VerticalLayout {
-                padding: 16px;
-                spacing: 10px;
-                InfoRow { label: "Frames"; value: session.frames; }
-                InfoRow { label: "Frametime"; value: session.frametime; }
-                InfoRow { label: "Recursos criados"; value: session.created; }
-                if session.shaders != "": InfoRow { label: "Shaders"; value: session.shaders; }
-                InfoRow { label: "Ecrã"; value: session.display; }
-                if session.note != "": InfoRow { label: "Nota"; value: session.note; }
-            }
-        }
-    }
-
-    // Optimizations written to tessera.ini; the layer reads them at start.
-    if settings.present: VerticalLayout {
-        spacing: 12px;
-        SectionTitle { text: "Otimizações"; sub: "Aplicam-se no próximo arranque do jogo"; }
-        Card {
-            VerticalLayout {
-                padding: 16px;
-                spacing: 16px;
-                SettingRow {
-                    title: "Limite de FPS";
-                    help: "Frames a ritmo certo, menos calor e ruído. Desliga-se sozinho se o jogo usar Reflex ou frame generation.";
-                    fps := ComboBox {
-                        model: settings.fps-options;
-                        current-index: settings.fps-index;
-                        selected => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
-                    }
-                }
-                Rectangle { height: 1px; background: Theme.line; }
-                SettingRow {
-                    title: "Teto de VRAM";
-                    help: settings.vram-hint;
-                    vram := ComboBox {
-                        model: settings.vram-options;
-                        current-index: settings.vram-index;
-                        selected => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
-                    }
-                }
-                Rectangle { height: 1px; background: Theme.line; }
-                SettingRow {
-                    title: "Apresentação flip (experimental)";
-                    help: "Em janela sem bordas, jogos D3D11 antigos passam ao modo flip: menos latência e G-Sync/FreeSync a funcionar. Se vires ecrã preto ou a piscar, desliga.";
-                    HorizontalLayout {
-                        alignment: end;
-                        flip := Switch {
-                            checked: settings.flip-model;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
-                        }
-                    }
-                }
-                Rectangle { height: 1px; background: Theme.line; }
-                SettingRow {
-                    title: "Prioridade de memória";
-                    help: "Mantém render targets e buffers grandes do jogo na VRAM quando a memória aperta.";
-                    HorizontalLayout {
-                        alignment: end;
-                        residency := Switch {
-                            checked: settings.residency;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
-                        }
-                    }
-                }
-                Rectangle { height: 1px; background: Theme.line; }
-                SettingRow {
-                    title: "Ajustes do processo";
-                    help: "Timer de alta resolução e prioridade moderada, só no processo do jogo.";
-                    HorizontalLayout {
-                        alignment: end;
-                        process := Switch {
-                            checked: settings.process;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Files: collapsed by default, they matter only when something is wrong.
     VerticalLayout {
-        spacing: 10px;
-        HorizontalLayout {
-            alignment: start;
-            Text {
-                text: (root.show-files ? "Esconder" : "Mostrar") + " ficheiros e estado da camada";
-                color: files-ta.has-hover ? Theme.text : Theme.dim;
-                font-size: 13px;
-                files-ta := TouchArea { clicked => { root.show-files = !root.show-files; } }
+        // The game and what Tessera knows about it at a glance, over its
+        // key art when Steam has some.
+        Rectangle {
+            height: root.has-hero ? 168px : head.preferred-height;
+            clip: true;
+            if root.has-hero: Image {
+                source: root.hero;
+                image-fit: cover;
+            }
+            if root.has-hero: Rectangle {
+                background: @linear-gradient(90deg, #161616e6 0%, #16161699 45%, #16161626 100%);
+            }
+            if root.has-hero: Rectangle {
+                background: @linear-gradient(180deg, #16161600 40%, #161616 100%);
+            }
+        head := VerticalLayout {
+            y: parent.height - self.preferred-height;
+            height: self.preferred-height;
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-top: 14px;
+            spacing: 4px;
+            HorizontalLayout {
+                spacing: 12px;
+                Text {
+                    text: root.game.name;
+                    color: Theme.text;
+                    font-size: 22px;
+                    font-weight: 700;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    if root.game.installed: Pill { text: "Layer on"; tint: Theme.ok; }
+                    if root.game.blocked: Pill { text: "Anti-cheat: " + root.game.anticheat; tint: Theme.bad; }
+                    if !root.game.installed && !root.game.blocked: Pill { text: "Not installed"; tint: Theme.dim; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            HorizontalLayout {
+                alignment: start;
+                spacing: 18px;
+                Text { text: root.game.api; color: Theme.dim; font-size: 13px; }
+                Text { text: root.game.engine; color: Theme.dim; font-size: 13px; }
+                Text { text: root.game.store; color: Theme.dim; font-size: 13px; }
             }
         }
-        if root.show-files: Card {
-            VerticalLayout {
-                padding: 16px;
-                spacing: 10px;
-                InfoRow { label: "Executável"; value: game.exe; }
-                InfoRow { label: "Pasta"; value: game.root; }
-                InfoRow { label: "Hash (xxh3)"; value: game.hash; }
-                InfoRow { label: "Camada"; value: game.status; }
+        }
+
+        if root.game.blocked || root.session.safe-mode: VerticalLayout {
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-top: 12px;
+            if root.game.blocked: Banner {
+                tint: Theme.bad;
+                text: "This game uses anti-cheat. Tessera only reads its files and never installs the layer.";
+            }
+            if root.session.safe-mode: Banner {
+                tint: Theme.bad;
+                text: "Safe mode: the layer turned itself off after two runs that did not end cleanly.";
+                Btn { text: "Turn back on"; clicked => { root.reset-safe-mode(); } }
+            }
+        }
+
+        // Tabs.
+        VerticalLayout {
+            padding-top: 8px;
+            HorizontalLayout {
+                padding-left: 8px;
+                alignment: start;
+                Tab { text: "Session"; active: root.tab == 0; clicked => { root.tab = 0; } }
+                Tab { text: "Settings"; active: root.tab == 1; clicked => { root.tab = 1; } }
+                Tab { text: "Files"; active: root.tab == 2; clicked => { root.tab = 2; } }
+            }
+            Hairline { }
+        }
+
+        page := ScrollView {
+            vertical-stretch: 1;
+            content-width: self.visible-width;
+            content-height: content.preferred-height;
+            content := VerticalLayout {
+                width: page.visible-width;
+                padding: 20px;
+                padding-top: 16px;
+                spacing: 16px;
+                alignment: start;
+
+                // Session: the numbers, what they mean, the raw facts.
+                if root.tab == 0 && root.session.present: VerticalLayout {
+                    spacing: 16px;
+                    Text { text: "Last run " + root.session.when; color: Theme.faint; font-size: 13px; }
+                    HorizontalLayout {
+                        spacing: 24px;
+                        Readout { label: "Average FPS"; value: root.session.fps; sub: root.session.fps-sub; }
+                        Readout {
+                            label: "Slow frames (p99)"; value: root.session.p99; sub: root.session.p99-sub;
+                            flagged: !root.session.p99-good;
+                        }
+                        Readout {
+                            label: "Stutters"; value: root.session.stutters; sub: root.session.stutters-sub;
+                            flagged: !root.session.stutters-good;
+                        }
+                        Readout {
+                            label: "VRAM"; value: root.session.vram; sub: root.session.vram-sub;
+                            flagged: !root.session.vram-good;
+                        }
+                    }
+                    if root.session.causes != "" || root.session.advice != "": HorizontalLayout {
+                        spacing: 12px;
+                        Rectangle { width: 2px; border-radius: 1px; background: Theme.warn; }
+                        VerticalLayout {
+                            spacing: 4px;
+                            if root.session.causes != "": Text { text: root.session.causes; color: Theme.text; font-size: 14px; wrap: word-wrap; }
+                            if root.session.advice != "": Text { text: root.session.advice; color: Theme.dim; font-size: 14px; wrap: word-wrap; }
+                        }
+                    }
+                    Hairline { }
+                    VerticalLayout {
+                        spacing: 7px;
+                        InfoRow { label: "Frames"; value: root.session.frames; }
+                        InfoRow { label: "Frame time"; value: root.session.frametime; }
+                        InfoRow { label: "Resources"; value: root.session.created; }
+                        if root.session.shaders != "": InfoRow { label: "Shaders"; value: root.session.shaders; }
+                        InfoRow { label: "Display"; value: root.session.display; }
+                        if root.session.note != "": InfoRow { label: "Notes"; value: root.session.note; }
+                    }
+                }
+                if root.tab == 0 && !root.session.present: Text {
+                    color: Theme.dim;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                    text: root.game.blocked
+                        ? "No sessions are recorded for anti-cheat games."
+                        : root.game.installed
+                        ? "No session recorded yet. Play once with the layer on and the results show up here."
+                        : root.game.can-install
+                        ? "Install the layer and play once. Tessera then shows how the game ran and what can be improved."
+                        : "The layer works with 64-bit D3D11 games only, so it cannot be installed here.";
+                }
+
+                // Settings written to tessera.ini; the layer reads them at start.
+                if root.tab == 1 && root.settings.present: VerticalLayout {
+                    PropRow {
+                        label: "FPS limit";
+                        help: "Even frame pacing. Steps aside when the game uses Reflex or frame generation.";
+                        fps := Stepper {
+                            width: 170px;
+                            model: root.settings.fps-options;
+                            current-index: root.settings.fps-index;
+                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
+                        }
+                    }
+                    PropRow {
+                        label: "VRAM cap";
+                        help: root.settings.vram-hint;
+                        vram := Stepper {
+                            width: 170px;
+                            model: root.settings.vram-options;
+                            current-index: root.settings.vram-index;
+                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
+                        }
+                    }
+                    PropRow {
+                        label: "Memory priority";
+                        help: "Keeps render targets and large buffers in VRAM when memory runs short.";
+                        residency := Toggle {
+                            checked: root.settings.residency;
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
+                        }
+                    }
+                    PropRow {
+                        label: "Process tweaks";
+                        help: "High-resolution timer and moderate priority, game process only.";
+                        process := Toggle {
+                            checked: root.settings.process;
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
+                        }
+                    }
+                    PropRow {
+                        label: "Flip presentation";
+                        help: "Experimental. Lower latency and G-Sync/FreeSync in borderless windows. Turn off if the screen flickers.";
+                        flip := Toggle {
+                            checked: root.settings.flip-model;
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, fps.current-index, vram.current-index); }
+                        }
+                    }
+                    Text { text: "Changes apply the next time the game starts."; color: Theme.faint; font-size: 13px; }
+                }
+                if root.tab == 1 && !root.settings.present: Text {
+                    color: Theme.dim;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                    text: root.game.blocked
+                        ? "Settings need the layer, which is never installed in anti-cheat games."
+                        : root.game.can-install
+                        ? "Install the layer to change these settings."
+                        : "The layer works with 64-bit D3D11 games only, so there is nothing to set here.";
+                }
+
+                // Files and identity.
+                if root.tab == 2: VerticalLayout {
+                    spacing: 7px;
+                    InfoRow { label: "Layer"; value: root.game.status; }
+                    InfoRow { label: "Store"; value: root.game.store; }
+                    InfoRow { label: "Engine"; value: root.game.engine; }
+                    InfoRow { label: "Executable"; value: root.game.exe; code: true; }
+                    InfoRow { label: "Folder"; value: root.game.root; code: true; }
+                    InfoRow { label: "Hash (xxh3)"; value: root.game.hash; code: true; }
+                }
             }
         }
     }
@@ -413,19 +764,22 @@ component Detail inherits VerticalLayout {
 
 export component MainWindow inherits Window {
     title: "Tessera";
-    preferred-width: 1180px;
-    preferred-height: 760px;
-    min-width: 900px;
-    min-height: 560px;
+    preferred-width: 1240px;
+    preferred-height: 800px;
+    min-width: 1000px;
+    min-height: 620px;
     background: Theme.bg;
-    default-font-family: "Segoe UI Variable Text";
+    default-font-family: Theme.display;
 
     in property <[GameRow]> games;
     in-out property <int> selected: -1;
+    in-out property <int> tab: 0;
     in property <string> status-text;
     in property <bool> busy;
     in property <SessionInfo> session;
     in property <GameSettings> settings;
+    // Key art of the selected game.
+    in property <image> hero;
     // S7: driver shader cache advice, empty when all is well.
     in property <string> driver-notice;
     callback refresh();
@@ -439,89 +793,136 @@ export component MainWindow inherits Window {
     callback open-folder(int);
     callback settings-changed(int, bool, bool, bool, int, int);
 
-    HorizontalLayout {
+    property <length> row-h: 40px;
+    property <bool> has-sel: root.selected >= 0 && root.selected < root.games.length;
+    property <GameRow> cur: root.games[root.selected];
+
+    VerticalLayout {
+        // Command bar: library commands, then the commands for the selected game.
         Rectangle {
-            width: 320px;
+            height: 50px;
             background: Theme.side;
-            VerticalLayout {
-                padding: 16px;
-                spacing: 12px;
-                HorizontalLayout {
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 2px;
+                alignment: start;
+                Btn { flat: true; icon: "\u{E8F4}"; text: "Add folder"; enabled: !root.busy; clicked => { root.add-folder(); } }
+                Btn { flat: true; icon: "\u{E72C}"; text: "Refresh"; enabled: !root.busy; clicked => { root.refresh(); } }
+                ToolSep { }
+                Btn {
+                    flat: !(root.has-sel && !root.cur.installed && root.cur.can-install);
+                    primary: root.has-sel && !root.cur.installed && root.cur.can-install;
+                    icon: root.has-sel && root.cur.installed ? "\u{E72C}" : "\u{E896}";
+                    text: root.has-sel && root.cur.installed ? "Reinstall layer" : "Install layer";
+                    enabled: root.has-sel && root.cur.can-install && !root.cur.blocked && !root.busy;
+                    clicked => { root.install(root.selected); }
+                }
+                Btn {
+                    flat: true;
+                    icon: "\u{E74D}";
+                    text: "Uninstall";
+                    enabled: root.has-sel && root.cur.installed && !root.busy;
+                    clicked => { root.uninstall(root.selected); }
+                }
+                Btn {
+                    flat: true;
+                    icon: "\u{E945}";
+                    text: "Prepare shaders";
+                    enabled: root.has-sel && root.cur.d3d11 && !root.busy;
+                    clicked => { root.warm-shaders(root.selected); }
+                }
+                ToolSep { }
+                Btn {
+                    flat: true;
+                    icon: "\u{E838}";
+                    text: "Open folder";
+                    enabled: root.has-sel;
+                    clicked => { root.open-folder(root.selected); }
+                }
+            }
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+        }
+
+        if root.driver-notice != "": VerticalLayout {
+            padding: 8px;
+            Banner { text: root.driver-notice; }
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            // Game list.
+            Rectangle {
+                width: 300px;
+                background: Theme.side;
+                VerticalLayout {
+                    padding: 8px;
                     spacing: 8px;
-                    VerticalLayout {
-                        horizontal-stretch: 1;
-                        Text { text: "Tessera"; font-size: 22px; font-weight: 700; color: Theme.text; }
-                        Text { text: "Menos stutter, menos VRAM"; font-size: 11px; color: Theme.faint; }
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        Button { text: "Atualizar"; enabled: !root.busy; clicked => { root.refresh(); } }
-                    }
-                }
-                LineEdit {
-                    placeholder-text: "Procurar jogos…";
-                    edited(t) => { root.filter-changed(t); }
-                }
-                ListView {
-                    vertical-stretch: 1;
-                    for g[i] in root.games: GameItem {
-                        game: g;
-                        selected: i == root.selected;
-                        clicked => { root.selected = i; root.select(i); }
+                    SearchField { edited(t) => { root.filter-changed(t); } }
+                    list := ScrollView {
+                        vertical-stretch: 1;
+                        content-width: self.visible-width;
+                        content-height: root.games.length * root.row-h;
+                        for g[i] in root.games: GameItem {
+                            x: 0;
+                            y: i * root.row-h;
+                            width: list.visible-width;
+                            height: root.row-h - 2px;
+                            game: g;
+                            selected: i == root.selected;
+                            clicked => {
+                                root.selected = i;
+                                root.select(i);
+                            }
+                        }
                     }
                 }
-                Button { text: "Adicionar pasta de jogo…"; enabled: !root.busy; clicked => { root.add-folder(); } }
+                Rectangle { x: parent.width - 1px; width: 1px; background: Theme.line; }
+            }
+
+            if root.has-sel: Detail {
+                horizontal-stretch: 1;
+                game: root.cur;
+                hero: root.hero;
+                session: root.session;
+                settings: root.settings;
+                tab <=> root.tab;
+                reset-safe-mode => { root.reset-safe-mode(root.selected); }
+                settings-changed(p, r, fl, f, v) => { root.settings-changed(root.selected, p, r, fl, f, v); }
+            }
+            if !root.has-sel: VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: 16px;
+                HorizontalLayout {
+                    alignment: center;
+                    Mark { tile: 12px; busy: root.busy; }
+                }
+                Text {
+                    text: root.busy ? "Looking for games…" : "Select a game from the list.";
+                    color: Theme.dim;
+                    font-size: 15px;
+                    horizontal-alignment: center;
+                }
             }
         }
-        VerticalLayout {
-            horizontal-stretch: 1;
-            if root.driver-notice != "": VerticalLayout {
-                padding: 16px;
-                padding-bottom: 0px;
-                Banner { text: root.driver-notice; }
-            }
-            if root.selected >= 0 && root.selected < root.games.length: ScrollView {
-                vertical-stretch: 1;
-                Detail {
-                    width: parent.visible-width;
-                    game: root.games[root.selected];
-                    busy: root.busy;
-                    session: root.session;
-                    settings: root.settings;
-                    reset-safe-mode => { root.reset-safe-mode(root.selected); }
-                    warm-shaders => { root.warm-shaders(root.selected); }
-                    install => { root.install(root.selected); }
-                    uninstall => { root.uninstall(root.selected); }
-                    open-folder => { root.open-folder(root.selected); }
-                    settings-changed(p, r, fl, f, v) => { root.settings-changed(root.selected, p, r, fl, f, v); }
-                }
-            }
-            if root.selected < 0 || root.selected >= root.games.length: VerticalLayout {
-                vertical-stretch: 1;
-                alignment: center;
+
+        // Status bar.
+        Rectangle {
+            height: 30px;
+            background: Theme.side;
+            Rectangle { y: 0; height: 1px; background: Theme.line; }
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
                 spacing: 8px;
-                Text {
-                    text: root.busy ? "A procurar jogos…" : "Escolhe um jogo à esquerda";
-                    color: Theme.text;
-                    font-size: 17px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
+                if root.busy: VerticalLayout {
+                    alignment: center;
+                    Mark { tile: 3px; gap: 1.5px; busy: true; }
                 }
-                Text {
-                    text: "Verde: camada ativa · Cinzento: por instalar · Vermelho: anti-cheat (só leitura)";
-                    color: Theme.dim;
-                    font-size: 12px;
-                    horizontal-alignment: center;
-                }
-            }
-            Rectangle {
-                height: 30px;
-                background: Theme.side;
-                HorizontalLayout {
-                    padding-left: 16px;
-                    padding-right: 16px;
-                    Text { text: root.status-text; color: Theme.dim; font-size: 12px; vertical-alignment: center; overflow: elide; }
-                }
+                Text { text: root.status-text; color: Theme.dim; font-size: 13px; vertical-alignment: center; overflow: elide; }
             }
         }
     }

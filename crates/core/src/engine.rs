@@ -18,7 +18,7 @@ impl Engine {
             Engine::Unreal { io_store: false } => "Unreal",
             Engine::Unity => "Unity",
             Engine::ReEngine => "RE Engine",
-            Engine::Unknown => "Motor desconhecido",
+            Engine::Unknown => "Unknown",
         }
     }
 }

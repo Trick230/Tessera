@@ -494,7 +494,7 @@ pub fn up_to_date(exe: &Path, root: &Path) -> bool {
 /// Scans the install folder of `exe` (`root`) and writes what the layer has
 /// not stored yet to the scan store, which the warm-up compiles too.
 pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
-    let base = scan_base(exe).ok_or_else(|| io::Error::other("caminho do jogo inválido"))?;
+    let base = scan_base(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
     let key = install_key(root);
     let (mut shaders, stats) = scan_dir(root);
     let stored: std::collections::HashSet<u64> = crate::shaders::read(exe).iter().map(|s| s.hash).collect();

@@ -26,18 +26,18 @@ impl GameInfo {
         self.exe.as_deref().and_then(Path::parent)
     }
 
-    /// Short API description for the UI, e.g. "D3D12 · D3D11 (-dx11)".
+    /// Short API description for the UI, e.g. "D3D12, D3D11 (-dx11)".
     pub fn api_label(&self) -> String {
         let all = self.scan.all();
         if all.is_empty() {
-            return "API desconhecida".into();
+            return "Unknown API".into();
         }
         let names = all.names();
         // Unreal ships D3D12 and D3D11 RHIs; D3D11 is picked with -dx11.
         if matches!(self.engine, Engine::Unreal { .. }) && all.has(ApiSet::D3D12) && all.has(ApiSet::D3D11) {
-            return "D3D12 · D3D11 (-dx11)".into();
+            return "D3D12, D3D11 (-dx11)".into();
         }
-        names.join(" · ")
+        names.join(", ")
     }
 
     /// Phase 0 layer only supports D3D11, and never with anti-cheat.

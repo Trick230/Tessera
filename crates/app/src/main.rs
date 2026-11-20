@@ -47,10 +47,10 @@ fn save_folders(folders: &[PathBuf]) {
 
 fn status_label(s: &InstallState) -> String {
     match s {
-        InstallState::NotInstalled => "Não instalada".into(),
-        InstallState::Installed { chained: Some(n), .. } => format!("Instalada (encadeia {n})"),
-        InstallState::Installed { .. } => "Instalada".into(),
-        InstallState::Foreign { proxy } => format!("Não instalada ({proxy} de outra ferramenta será encadeada)"),
+        InstallState::NotInstalled => "Not installed".into(),
+        InstallState::Installed { chained: Some(n), .. } => format!("Installed (chains {n})"),
+        InstallState::Installed { .. } => "Installed".into(),
+        InstallState::Foreign { proxy } => format!("Not installed ({proxy} from another tool will be chained)"),
     }
 }
 
@@ -61,7 +61,7 @@ fn row(g: &GameInfo) -> GameRow {
         store: s(g.entry.store.label().into()),
         engine: s(g.engine.label().into()),
         api: s(g.api_label()),
-        exe: s(g.exe.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "não encontrado".into())),
+        exe: s(g.exe.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "not found".into())),
         root: s(g.entry.root.display().to_string()),
         hash: s(g.exe_hash.map(|h| format!("{h:032x}")).unwrap_or_else(|| "-".into())),
         anticheat: s(g.anticheat.join(", ")),
@@ -76,12 +76,31 @@ fn row(g: &GameInfo) -> GameRow {
             let all = g.scan.all();
             all.has(tessera_core::pe::ApiSet::D3D11) && (!all.has(tessera_core::pe::ApiSet::D3D12) || tessera_core::shaders::stats(e).shaders > 0)
         }),
+        icon: steam_image(g, false),
+        initial: s(g.entry.name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_default()),
     }
 }
 
-/// Decimal comma, as a Portuguese reader expects.
+/// Steam's icon (`hero == false`) or key art for a game; empty when there is none.
+/// Decoded images are kept, so filtering the list does not decode them again.
+fn steam_image(g: &GameInfo, hero: bool) -> slint::Image {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<(u32, bool), slint::Image>> = Default::default();
+    }
+    let Some(id) = g.entry.steam_appid else { return slint::Image::default() };
+    CACHE.with_borrow_mut(|c| {
+        c.entry((id, hero))
+            .or_insert_with(|| {
+                let art = tessera_core::library::steam_art(id);
+                let path = if hero { art.hero } else { art.icon };
+                path.and_then(|p| slint::Image::load_from_path(&p).ok()).unwrap_or_default()
+            })
+            .clone()
+    })
+}
+
 fn num(v: f64, decimals: usize) -> String {
-    format!("{v:.decimals$}").replace('.', ",")
+    format!("{v:.decimals$}")
 }
 
 fn size(bytes: u64) -> String {
@@ -112,7 +131,7 @@ fn session_when(path: &Path) -> String {
     let (_pid, stamp) = (parts.next(), parts.next().unwrap_or(""));
     let d = stamp.as_bytes();
     if stamp.is_ascii() && d.len() == 15 && d[8] == b'-' {
-        format!("{}/{}/{} {}:{}", &stamp[6..8], &stamp[4..6], &stamp[0..4], &stamp[9..11], &stamp[11..13])
+        format!("{}-{}-{} {}:{}", &stamp[0..4], &stamp[4..6], &stamp[6..8], &stamp[9..11], &stamp[11..13])
     } else {
         name
     }
@@ -129,7 +148,7 @@ fn shader_text(exe: &Path, sum: Option<&session::Summary>) -> String {
     let mut parts = Vec::new();
     if let Some(sum) = sum.filter(|s| s.shaders > 0) {
         parts.push(format!(
-            "{} criados em {} · {} % já conhecidos",
+            "{} created in {}, {}% already known",
             sum.shaders,
             duration(sum.shader_create_ms / 1000.0),
             (sum.shaders - sum.shaders_new) * 100 / sum.shaders
@@ -137,17 +156,17 @@ fn shader_text(exe: &Path, sum: Option<&session::Summary>) -> String {
     }
     let store = tessera_core::warm::stored(exe);
     if store.shaders > 0 {
-        parts.push(format!("{} guardados ({})", store.shaders, size(store.bytes)));
+        parts.push(format!("{} stored ({})", store.shaders, size(store.bytes)));
     }
     let w = tessera_core::warm::stats(exe);
     if w.ok + w.failed > 0 {
-        let mut t = format!("{} aquecidos", w.ok);
+        let mut t = format!("{} warmed", w.ok);
         if w.failed > 0 {
-            t += &format!(", {} falharam", w.failed);
+            t += &format!(", {} failed", w.failed);
         }
         parts.push(t);
     }
-    parts.join(" · ")
+    parts.join("; ")
 }
 
 /// Fills the panel for the last session. Also returns the real VRAM budget
@@ -165,46 +184,45 @@ fn session_info(exe: &Path) -> (SessionInfo, u32) {
         Ok(v) => v,
         Err(e) => {
             info.when = s(session_when(&path));
-            info.note = s(format!("Não foi possível ler {}: {e}", path.display()));
+            info.note = s(format!("Could not read {}: {e}", path.display()));
             return (info, 0);
         }
     };
     info.clean = sum.clean;
     info.when = s(format!(
-        "{} · {} · {}",
+        "{}, {}",
         session_when(&path),
-        duration(sum.duration_s),
-        if sum.clean { "terminou bem" } else { "interrompida (crash ou fecho forçado)" }
+        duration(sum.duration_s)
     ));
 
     // Tiles.
     if sum.frame_avg_ms > 0.0 {
         info.fps = s(num(1000.0 / sum.frame_avg_ms, 0));
-        info.fps_sub = s(format!("{} ms por frame", num(sum.frame_avg_ms, 1)));
+        info.fps_sub = s(format!("{} ms per frame", num(sum.frame_avg_ms, 1)));
     } else {
         info.fps = "-".into();
-        info.fps_sub = "sem frames".into();
+        info.fps_sub = "no frames".into();
     }
     info.p99 = s(format!("{} ms", num(sum.frame_p99_ms, 1)));
-    info.p99_sub = s(format!("1 % dos frames demorou mais · pior {} ms", num(sum.frame_max_ms, 0)));
+    info.p99_sub = s(format!("worst frame {} ms", num(sum.frame_max_ms, 0)));
     // A p99 within 1.5x the median reads as smooth.
     info.p99_good = sum.frame_p50_ms > 0.0 && sum.frame_p99_ms <= sum.frame_p50_ms * 1.5;
     let minutes = (sum.duration_s / 60.0).max(1.0 / 60.0);
     let per_min = sum.hitches as f64 / minutes;
     info.stutters = s(sum.hitches.to_string());
     info.stutters_sub = s(if sum.hitches == 0 {
-        "nenhum frame acima do dobro da mediana".into()
+        "none above twice the median".into()
     } else {
-        format!("{} por minuto", num(per_min, 1))
+        format!("{} per minute", num(per_min, 1))
     });
     info.stutters_good = per_min < 1.0;
     if sum.vram_budget_mb > 0 {
         info.vram = s(gb(sum.vram_peak_mb));
-        info.vram_sub = s(format!("pico · o Windows deu {} ao jogo", gb(sum.vram_budget_mb)));
+        info.vram_sub = s(format!("peak, of {} available", gb(sum.vram_budget_mb)));
         info.vram_good = sum.vram_over_s == 0;
     } else {
         info.vram = s(size(sum.vram_bytes()));
-        info.vram_sub = "criada pelo jogo (estimativa)".into();
+        info.vram_sub = "created by the game (estimate)".into();
         info.vram_good = true;
     }
 
@@ -212,59 +230,59 @@ fn session_info(exe: &Path) -> (SessionInfo, u32) {
     let other = sum.hitches - sum.hitches_shaders - sum.hitches_creating - sum.hitches_over_budget;
     let mut causes = Vec::new();
     if sum.hitches_shaders > 0 {
-        causes.push(format!("{} enquanto o jogo compilava shaders", sum.hitches_shaders));
+        causes.push(format!("{} while compiling shaders", sum.hitches_shaders));
     }
     if sum.hitches_creating > 0 {
-        causes.push(format!("{} enquanto o jogo criava texturas ou buffers", sum.hitches_creating));
+        causes.push(format!("{} while creating textures or buffers", sum.hitches_creating));
     }
     if sum.hitches_over_budget > 0 {
-        causes.push(format!("{} com a VRAM acima do orçamento", sum.hitches_over_budget));
+        causes.push(format!("{} with VRAM over budget", sum.hitches_over_budget));
     }
     if other > 0 {
-        causes.push(format!("{other} sem causa identificada (CPU, disco ou lógica do jogo)"));
+        causes.push(format!("{other} with no clear cause (CPU, disk or game logic)"));
     }
     if !causes.is_empty() {
-        info.causes = s(format!("Stutters: {}.", causes.join(" · ")));
+        info.causes = s(format!("Stutters: {}.", causes.join(", ")));
     }
     let mut advice = Vec::new();
     if sum.vram_over_s > 0 {
         advice.push(format!(
-            "O jogo passou {} acima da VRAM disponível e a memória foi trocada com a RAM. Baixar a qualidade das texturas, fechar outras apps ou definir um teto de VRAM ajuda.",
+            "The game spent {} over the available VRAM, swapping memory with system RAM. Lower texture quality, close other apps or set a VRAM cap.",
             duration(sum.vram_over_s as f64)
         ));
     }
     if sum.hitches > 0 && sum.hitches_creating * 2 > sum.hitches {
-        advice.push("A maior parte dos stutters coincide com a criação de recursos (streaming ou carregamentos).".to_string());
+        advice.push("Most stutters line up with resource creation (streaming or loading).".to_string());
     }
     if sum.hitches > 0 && sum.hitches_shaders * 2 > sum.hitches {
         advice.push(
-            "A maior parte dos stutters coincide com a compilação de shaders. O Tessera guardou-os; a próxima preparação vai aquecê-los antes do jogo."
+            "Most stutters line up with shader compilation. Tessera kept the shaders; Prepare shaders warms them before the next run."
                 .to_string(),
         );
     }
     if sum.limited_frames > 0 {
         advice.push(format!(
-            "Limitador ativo em {} frames (esperou {} no total).",
+            "FPS limit held {} frames (waited {} in total).",
             sum.limited_frames,
             duration(sum.limiter_wait_s)
         ));
     }
     if !sum.clean {
-        advice.push("A sessão não terminou bem; se se repetir, o modo seguro desliga a camada.".to_string());
+        advice.push("The session did not end cleanly (crash or forced close). If it happens again, safe mode turns the layer off.".to_string());
     }
     info.advice = s(advice.join("\n"));
 
     // Details.
-    info.frames = s(format!("{} em {}", sum.frames, duration(sum.duration_s)));
+    info.frames = s(format!("{} in {}", sum.frames, duration(sum.duration_s)));
     info.frametime = s(format!(
-        "mediana {} ms · p99 {} ms · p99,9 {} ms · pior {} ms",
+        "median {} ms, p99 {} ms, p99.9 {} ms, worst {} ms",
         num(sum.frame_p50_ms, 1),
         num(sum.frame_p99_ms, 1),
         num(sum.frame_p999_ms, 1),
         num(sum.frame_max_ms, 1)
     ));
     info.created = s(format!(
-        "{} texturas ({}) · {} buffers ({}) · {} com prioridade de memória",
+        "{} textures ({}), {} buffers ({}), {} with memory priority",
         sum.textures,
         size(sum.texture_bytes),
         sum.buffers,
@@ -274,20 +292,20 @@ fn session_info(exe: &Path) -> (SessionInfo, u32) {
     info.shaders = s(shader_text(exe, Some(&sum)));
     let fl = sum.feature_level;
     info.display = s(match sum.swapchain {
-        Some((w, h)) => format!("{w}×{h} · D3D feature level {}_{}", fl >> 12, (fl >> 8) & 0xF),
-        None => "sem swapchain registada".into(),
+        Some((w, h)) => format!("{w}×{h}, D3D feature level {}_{}", fl >> 12, (fl >> 8) & 0xF),
+        None => "no swapchain recorded".into(),
     });
     let mut notes = Vec::new();
     if sum.dropped > 0 {
-        notes.push(format!("{} registos perdidos (buffer cheio)", sum.dropped));
+        notes.push(format!("{} records lost (buffer full)", sum.dropped));
     }
     if sum.foreign > 0 {
-        notes.push(format!("{} recursos de overlays ou SDKs deixados intactos", sum.foreign));
+        notes.push(format!("{} overlay or SDK resources left untouched", sum.foreign));
     }
     if sum.vram_cap_mb > 0 {
-        notes.push(format!("teto de VRAM de {} reportado ao jogo", gb(sum.vram_cap_mb)));
+        notes.push(format!("VRAM cap of {} reported to the game", gb(sum.vram_cap_mb)));
     }
-    info.note = s(notes.join(" · "));
+    info.note = s(notes.join("; "));
     (info, sum.vram_budget_mb)
 }
 
@@ -324,20 +342,20 @@ fn game_settings(dir: &Path, budget_mb: u32) -> (GameSettings, SettingsLists) {
     let idx = |list: &[u32], v: u32| list.iter().position(|&x| x == v).unwrap_or(0) as i32;
     let hint = if budget_mb > 0 {
         format!(
-            "O Windows deu {} a este jogo. Um teto mais baixo faz o jogo poupar memória mais cedo e deixa margem para o navegador e o Discord.",
+            "Windows gives this game {}. A lower cap makes it free memory sooner.",
             gb(budget_mb)
         )
     } else {
-        "Diz ao jogo que há menos VRAM, para gerir a memória mais cedo. Joga uma sessão para ver quanta o Windows lhe dá.".to_string()
+        "Makes the game free memory sooner. Play once to see how much it gets.".to_string()
     };
     let gs = GameSettings {
         present: true,
         process: cur.process,
         residency: cur.residency,
         flip_model: cur.flip_model,
-        fps_options: labels(&fps, "Sem limite", &|x| format!("{x} fps")),
+        fps_options: labels(&fps, "Off", &|x| format!("{x} fps")),
         fps_index: idx(&fps, cur.fps_limit),
-        vram_options: labels(&vram, "Sem teto", &|x| {
+        vram_options: labels(&vram, "Off", &|x| {
             if x % 1024 == 0 { format!("{} GB", x / 1024) } else { format!("{x} MB") }
         }),
         vram_index: idx(&vram, cur.vram_budget_mb),
@@ -356,6 +374,7 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
         return;
     }
     st.shown_exe = exe.clone();
+    ui.set_hero(game.map(|g| steam_image(g, true)).unwrap_or_default());
     *SETTINGS.lock().unwrap() = None;
     // A newer load supersedes any still running, even for the same view index.
     let gen = SESSION_GEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -395,7 +414,7 @@ fn apply_view(ui: &MainWindow, st: &mut State) {
 
 fn refresh(ui: &MainWindow, state: &Shared) {
     ui.set_busy(true);
-    ui.set_status_text("A procurar jogos…".into());
+    ui.set_status_text("Looking for games…".into());
     let weak = ui.as_weak();
     let state = state.clone();
     let folders = state.lock().unwrap().folders.clone();
@@ -415,10 +434,14 @@ fn refresh(ui: &MainWindow, state: &Shared) {
                 if let Some(i) = st.view.iter().position(|&gi| st.games[gi].entry.name.to_lowercase().contains(&want)) {
                     ui.set_selected(i as i32);
                     load_session(&ui, &mut st, i as i32, true);
+                    // TESSERA_TAB=<0..2>: open that tab (scripted screenshots).
+                    if let Some(t) = std::env::var("TESSERA_TAB").ok().and_then(|v| v.parse().ok()) {
+                        ui.set_tab(t);
+                    }
                 }
             }
             ui.set_busy(false);
-            ui.set_status_text(format!("{n} jogos analisados em {ms} ms").into());
+            ui.set_status_text(format!("{n} games found in {ms} ms").into());
         });
     });
 }
@@ -445,7 +468,7 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         return;
     };
     ui.set_busy(true);
-    ui.set_status_text("A preparar shaders…".into());
+    ui.set_status_text("Preparing shaders…".into());
     let (weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
@@ -455,19 +478,19 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         let mut found = String::new();
         let running = tessera_core::warm::is_running(&exe);
         if !running && !tessera_core::scan::up_to_date(&exe, &root) {
-            status("A procurar shaders nos ficheiros do jogo (só leitura)…");
+            status("Searching the game files for shaders (read only)…");
             match tessera_core::scan::scan_game(&exe, &root) {
-                Ok(st) => found = format!("{} encontrados nos ficheiros · ", st.usable),
-                Err(e) => found = format!("procura falhou ({e}) · "),
+                Ok(st) => found = format!("{} found in the files, ", st.usable),
+                Err(e) => found = format!("search failed ({e}), "),
             }
         }
-        status("A aquecer shaders (fora do jogo)…");
+        status("Warming shaders (outside the game)…");
         let result = tessera_core::warm::run(&exe, &app_dir().join(tessera_core::warm::WARM_EXE));
         let msg = match result {
             Ok(_) => {
                 let w = tessera_core::warm::stats(&exe);
                 format!(
-                    "Shaders: {found}{} prontos, {} falharam ({:.1} s)",
+                    "Shaders: {found}{} ready, {} failed ({:.1} s)",
                     w.ok,
                     w.failed,
                     t0.elapsed().as_secs_f64()
@@ -504,9 +527,9 @@ fn layer_action(ui: &MainWindow, state: &Shared, view_idx: i32, do_install: bool
         install::uninstall(&dir)
     };
     let msg = match &result {
-        Ok(_) if do_install => format!("Camada instalada em {}", dir.display()),
-        Ok(_) => format!("Camada removida de {}", dir.display()),
-        Err(e) => format!("Erro: {e}"),
+        Ok(_) if do_install => format!("Layer installed in {}", dir.display()),
+        Ok(_) => format!("Layer removed from {}", dir.display()),
+        Err(e) => format!("Error: {e}"),
     };
     st.games[gi].install = install::state(&dir, install::PROXY_D3D11);
     apply_view(ui, &mut st);
@@ -533,7 +556,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_add_folder(move || {
-            let Some(dir) = rfd::FileDialog::new().set_title("Pasta do jogo").pick_folder() else { return };
+            let Some(dir) = rfd::FileDialog::new().set_title("Game folder").pick_folder() else { return };
             {
                 let mut st = s.lock().unwrap();
                 if !st.folders.contains(&dir) {
@@ -563,8 +586,8 @@ fn main() -> Result<(), slint::PlatformError> {
             let mut st = s.lock().unwrap();
             let Some(exe) = st.view.get(i as usize).and_then(|&gi| st.games[gi].exe.clone()) else { return };
             let msg = match session::reset_safe_mode(&exe) {
-                Ok(()) => "Modo seguro desligado: a camada volta a carregar no próximo arranque".to_string(),
-                Err(e) => format!("Erro: {e}"),
+                Ok(()) => "Safe mode off: the layer loads again next time the game starts".to_string(),
+                Err(e) => format!("Error: {e}"),
             };
             ui.set_status_text(msg.into());
             load_session(&ui, &mut st, i, true);
@@ -589,8 +612,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 flip_model,
             };
             let msg = match install::save_settings(&l.dir, &new) {
-                Ok(()) => "Definições guardadas: aplicam-se no próximo arranque do jogo".to_string(),
-                Err(e) => format!("Erro ao guardar tessera.ini: {e}"),
+                Ok(()) => "Saved. Applies the next time the game starts".to_string(),
+                Err(e) => format!("Could not save tessera.ini: {e}"),
             };
             ui.set_status_text(msg.into());
         });
@@ -619,7 +642,9 @@ fn main() -> Result<(), slint::PlatformError> {
     // TESSERA_SNAPSHOT=<file.bmp>: render the window to a file after a few
     // seconds and quit (scripted screenshots; works with the screen locked).
     let _snap_timer = std::env::var("TESSERA_SNAPSHOT").ok().map(|out| {
-        ui.window().set_size(slint::LogicalSize::new(1180.0, 1400.0));
+        // TESSERA_SNAPSHOT_H=<px>: window height for the snapshot (default 1400).
+        let h = std::env::var("TESSERA_SNAPSHOT_H").ok().and_then(|v| v.parse().ok()).unwrap_or(1400.0);
+        ui.window().set_size(slint::LogicalSize::new(1300.0, h));
         let w = ui.as_weak();
         let t = slint::Timer::default();
         t.start(slint::TimerMode::SingleShot, std::time::Duration::from_secs(6), move || {

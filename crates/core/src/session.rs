@@ -129,7 +129,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Io(e) => write!(f, "{e}"),
-            Error::Format(m) => write!(f, "sessão inválida: {m}"),
+            Error::Format(m) => write!(f, "invalid session: {m}"),
         }
     }
 }
@@ -157,7 +157,7 @@ pub fn parse_header(b: &[u8]) -> Result<(Header, usize, usize), Error> {
         return Err(Error::Format("magic"));
     }
     if u32_at(b, 8) != VERSION {
-        return Err(Error::Format("versão"));
+        return Err(Error::Format("version"));
     }
     let header_size = u32_at(b, 12) as usize;
     let record_size = u32_at(b, 16) as usize;
@@ -174,7 +174,7 @@ pub fn parse_header(b: &[u8]) -> Result<(Header, usize, usize), Error> {
         exe_path: String::from_utf16_lossy(&wide),
     };
     if h.qpc_frequency == 0 {
-        return Err(Error::Format("frequência"));
+        return Err(Error::Format("frequency"));
     }
     Ok((h, header_size, record_size))
 }
