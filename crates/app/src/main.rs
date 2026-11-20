@@ -611,8 +611,8 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         let running = tessera_core::warm::is_running(&exe);
         if !running && !tessera_core::scan::up_to_date(&exe, &root) {
             status("Searching the game files for shaders (read only)…");
-            match tessera_core::scan::scan_game(&exe, &root) {
-                Ok(st) => found = format!("{} found in the files, ", st.usable),
+            match scan_isolated(&exe, &root) {
+                Ok(n) => found = format!("{n} found in the files, "),
                 Err(e) => found = format!("search failed ({e}), "),
             }
         }
@@ -669,7 +669,48 @@ fn layer_action(ui: &MainWindow, state: &Shared, view_idx: i32, do_install: bool
     ui.set_status_text(msg.into());
 }
 
+/// Runs the install scan (S1) in a child `tessera.exe --scan`, so a crash in
+/// the game's own Oodle DLL cannot take the app down. The scan writes its
+/// store whole (temp file, then rename), so a crash leaves the old one.
+fn scan_isolated(exe: &Path, root: &Path) -> Result<u64, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let out = std::process::Command::new(me)
+        .arg("--scan")
+        .arg(exe)
+        .arg(root)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| e.to_string())?;
+    match out.status.code() {
+        Some(0) => String::from_utf8_lossy(&out.stdout).trim().parse().map_err(|_| "no result".to_string()),
+        Some(1) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Some(c) => Err(format!("the search crashed, code {:#x}", c as u32)),
+        None => Err("the search was stopped".into()),
+    }
+}
+
+/// `tessera.exe --scan <game exe> <install folder>`: the child side of
+/// scan_isolated. Prints the usable shader count.
+fn scan_child(args: &[String]) -> i32 {
+    match tessera_core::scan::scan_game(Path::new(&args[0]), Path::new(&args[1])) {
+        Ok(st) => {
+            println!("{}", st.usable);
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
 fn main() -> Result<(), slint::PlatformError> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 3 && args[0] == "--scan" {
+        std::process::exit(scan_child(&args[1..]));
+    }
     let ui = MainWindow::new()?;
     let state: Shared = Arc::new(Mutex::new(State { folders: load_folders(), ..Default::default() }));
 
