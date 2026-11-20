@@ -8,6 +8,7 @@
 #include "config.h"
 #include "log.h"
 #include "module.h"
+#include "memory.h"
 #include "pacing.h"
 #include "session.h"
 #include "vtable.h"
@@ -328,6 +329,7 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
 
     const bool ok = vt_hook(g_create_buffer, dev) && vt_hook(g_create_tex2d, dev) && vt_hook(g_create_srv, dev);
     logf("device fl 0x%x flags 0x%x, device hooks %s", r.a, create_flags, ok ? "ok" : "FAILED");
+    memory_on_device(dev);
 
     IDXGIDevice* dxgi = nullptr;
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dxgi)))) {

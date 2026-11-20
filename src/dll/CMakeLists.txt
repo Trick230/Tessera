@@ -12,6 +12,7 @@ add_library(tessera_d3d11 SHARED
   module.cpp
   process.cpp
   pacing.cpp
+  memory.cpp
   exports_d3d11.asm
   exports_d3d11.def)
 

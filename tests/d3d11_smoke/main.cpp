@@ -5,7 +5,7 @@
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_4.h>
 #include <windows.h>
 
 #include <algorithm>
@@ -78,6 +78,19 @@ int run(bool crash) {
     dxgi->GetAdapter(&adapter);
     hr = adapter->GetParent(IID_PPV_ARGS(&factory));
     if (FAILED(hr)) return fail("IDXGIFactory2", hr);
+    // M1: with TESSERA_SMOKE_CAP_MB set, the budget the app sees must be capped.
+    if (GetEnvironmentVariableW(L"TESSERA_SMOKE_CAP_MB", nullptr, 0)) {
+        wchar_t cap_s[16] = {};
+        GetEnvironmentVariableW(L"TESSERA_SMOKE_CAP_MB", cap_s, 16);
+        IDXGIAdapter3* a3 = nullptr;
+        if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&a3)))) return fail("IDXGIAdapter3");
+        DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
+        hr = a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi);
+        a3->Release();
+        const unsigned long long cap = static_cast<unsigned long long>(_wtoi(cap_s)) << 20;
+        std::printf("budget seen by the app: %llu MB\n", mi.Budget >> 20);
+        if (FAILED(hr) || mi.Budget > cap) return fail("budget cap not applied", hr);
+    }
 
     DXGI_SWAP_CHAIN_DESC1 d1 = {};
     d1.Width = 640;
@@ -212,7 +225,8 @@ int verify(const wchar_t* dir, int fps) {
     int frames = 0, tex = 0, bc7_full = 0, buffers = 0, srvs = 0, devices = 0, swapchains = 0, sc_comp = 0,
         end = 0;
     uint32_t dropped = 0, max_frame_us = 0;
-    int prio_buffers = 0, prio_tex = 0, foreign = 0;
+    int prio_buffers = 0, prio_tex = 0, foreign = 0, vram = 0;
+    uint32_t budget_mb = 0, usage_mb = 0, cap_mb = 0;
     std::vector<uint32_t> paced;  // frame times of frames the limiter waited for
     TesseraRecord r;
     while (fread(&r, sizeof r, 1, f) == 1) {
@@ -239,6 +253,7 @@ int verify(const wchar_t* dir, int fps) {
                 ++swapchains;
                 if (r.d == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) ++sc_comp;
                 break;
+            case TESSERA_REC_VRAM: ++vram; budget_mb = r.a; usage_mb = r.b; cap_mb = r.d; break;
             case TESSERA_REC_END: ++end; dropped = r.a; break;
         }
     }
@@ -254,6 +269,9 @@ int verify(const wchar_t* dir, int fps) {
     std::printf("priority buffers %d tex %d, foreign %d, paced frames %zu\n", prio_buffers, prio_tex, foreign,
                 paced.size());
     if (prio_buffers < 5 || prio_tex != 1 || foreign != 0) return fail("residency / module flags");
+    std::printf("vram samples %d, budget %u MB, usage %u MB, cap %u MB\n", vram, budget_mb, usage_mb, cap_mb);
+    if (vram < 1 || budget_mb == 0) return fail("no VRAM budget samples");
+    if (fps > 0 && cap_mb != 2048) return fail("budget cap not in the log");
     if (fps > 0) {
         if (paced.size() < 100) return fail("limiter did not wait");
         std::sort(paced.begin(), paced.end());

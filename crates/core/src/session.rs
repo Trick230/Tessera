@@ -17,6 +17,7 @@ pub const REC_BUFFER: u16 = 3;
 pub const REC_SRV: u16 = 4;
 pub const REC_DEVICE: u16 = 5;
 pub const REC_SWAPCHAIN: u16 = 6;
+pub const REC_VRAM: u16 = 7;
 pub const REC_END: u16 = 0xFFFF;
 
 /// Resource created by code outside the game's folder (overlay, SDK).
@@ -75,6 +76,16 @@ pub struct Summary {
     /// (streaming or loading); the rest are other causes (shaders, I/O,
     /// game logic) that the layer does not record yet.
     pub hitches_creating: u64,
+    /// D2: hitches while the game used more VRAM than the OS budget (and
+    /// not creating resources): paging between VRAM and system memory.
+    pub hitches_over_budget: u64,
+    /// M1 samples (about one a second): lowest real budget, highest usage
+    /// and seconds spent over budget, in MB. Zero when the layer had no samples.
+    pub vram_budget_mb: u32,
+    pub vram_peak_mb: u32,
+    pub vram_over_s: u32,
+    /// Budget cap the layer reported to the game (0 = none).
+    pub vram_cap_mb: u32,
     /// Frames the frame limiter waited for (P1), and its total wait in seconds.
     pub limited_frames: u64,
     pub limiter_wait_s: f64,
@@ -190,6 +201,8 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
     let mut frame_us: Vec<u32> = Vec::with_capacity((b.len() - hs) / rs);
     // Frames during which the game created many resources, by index into frame_us.
     let mut creating: Vec<bool> = Vec::with_capacity(frame_us.capacity());
+    let mut over: Vec<bool> = Vec::with_capacity(frame_us.capacity());
+    let mut over_now = false;
     let (mut made, mut made_bytes) = (0u32, 0u64);
     let mut limiter_us = 0u64;
     let (mut first, mut last) = (u64::MAX, 0u64);
@@ -215,6 +228,7 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
                 if r.a != 0 && r.a != u32::MAX {
                     frame_us.push(r.a);
                     creating.push(made >= HITCH_CREATE_COUNT || made_bytes >= HITCH_CREATE_BYTES);
+                    over.push(over_now);
                 }
                 if r.b != 0 {
                     s.limited_frames += 1;
@@ -229,6 +243,13 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
             REC_BUFFER => {
                 s.buffers += 1;
                 s.buffer_bytes = s.buffer_bytes.saturating_add(r.bytes);
+            }
+            REC_VRAM if r.a > 0 => {
+                s.vram_budget_mb = if s.vram_budget_mb == 0 { r.a } else { s.vram_budget_mb.min(r.a) };
+                s.vram_peak_mb = s.vram_peak_mb.max(r.b);
+                s.vram_cap_mb = r.d;
+                over_now = r.b > r.a;
+                s.vram_over_s += over_now as u32;
             }
             REC_DEVICE => s.feature_level = r.a,
             REC_SWAPCHAIN => s.swapchain = Some((r.a, r.b)),
@@ -255,10 +276,11 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
         s.frame_p999_ms = ms(percentile(&sorted, 99.9));
         s.frame_max_ms = ms(*sorted.last().unwrap());
         let limit = p50.saturating_mul(2);
-        for (&v, &c) in frame_us.iter().zip(&creating) {
+        for ((&v, &c), &o) in frame_us.iter().zip(&creating).zip(&over) {
             if v > limit {
                 s.hitches += 1;
                 s.hitches_creating += c as u64;
+                s.hitches_over_budget += (!c && o) as u64;
             }
         }
     }
@@ -455,6 +477,20 @@ mod tests {
         assert_eq!((s.foreign, s.prioritized), (10, 10));
         assert_eq!(s.limited_frames, 98);
         assert!((s.limiter_wait_s - 0.196).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hitches_over_vram_budget() {
+        let mut b = header(1_000_000);
+        rec(&mut b, 0, REC_VRAM, 7000, 5000, 0);
+        for i in 0..99u64 {
+            rec(&mut b, 1 + i, REC_FRAME, 10_000, 0, 0);
+        }
+        rec(&mut b, 200, REC_VRAM, 6800, 7200, 0); // over budget from here
+        rec(&mut b, 300, REC_FRAME, 40_000, 0, 0);
+        let s = summarize(&b).unwrap();
+        assert_eq!((s.hitches, s.hitches_over_budget, s.hitches_creating), (1, 1, 0));
+        assert_eq!((s.vram_budget_mb, s.vram_peak_mb, s.vram_over_s), (6800, 7200, 1));
     }
 
     #[test]
