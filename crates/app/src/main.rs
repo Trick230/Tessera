@@ -332,5 +332,13 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     refresh(&ui, &state);
+    {
+        // S7: read-only driver shader cache check, off the UI thread.
+        let weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let notice = tessera_core::driver::check().advice().join("\n");
+            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_driver_notice(notice.into()));
+        });
+    }
     ui.run()
 }

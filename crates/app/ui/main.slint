@@ -194,6 +194,8 @@ export component MainWindow inherits Window {
     in property <string> status-text;
     in property <bool> busy;
     in property <SessionInfo> session;
+    // S7: driver shader cache advice, empty when all is well.
+    in property <string> driver-notice;
     callback refresh();
     callback select(int);
     callback reset-safe-mode(int);
@@ -239,6 +241,13 @@ export component MainWindow inherits Window {
         }
         VerticalLayout {
             horizontal-stretch: 1;
+            if root.driver-notice != "": Rectangle {
+                background: Theme.side;
+                VerticalLayout {
+                    padding: 12px;
+                    Text { text: root.driver-notice; color: Theme.text; font-size: 13px; wrap: word-wrap; }
+                }
+            }
             if root.selected >= 0 && root.selected < root.games.length: ScrollView {
                 vertical-stretch: 1;
                 Detail {
