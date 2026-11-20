@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <timeapi.h>
 
+#include "config.h"
 #include "log.h"
 
 namespace tessera {
@@ -22,5 +23,18 @@ void apply_process_tweaks() {
     // since Windows 10 2004; released by the OS when the process exits.
     const bool timer = timeBeginPeriod(1) == TIMERR_NOERROR;
     logf("process: EcoQoS off %s, 1 ms timer %s", qos ? "ok" : "failed", timer ? "ok" : "failed");
+
+    // One step up, never more: above normal keeps the game ahead of
+    // background work without starving input, audio or the compositor. A
+    // class the game or the user chose (anything but normal) is left alone.
+    if (config().priority) {
+        const DWORD cls = GetPriorityClass(GetCurrentProcess());
+        if (cls == NORMAL_PRIORITY_CLASS) {
+            const bool ok = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) != 0;
+            logf("process: above-normal priority %s", ok ? "ok" : "failed");
+        } else {
+            logf("process: priority class 0x%lx left alone", cls);
+        }
+    }
 }
 }  // namespace tessera

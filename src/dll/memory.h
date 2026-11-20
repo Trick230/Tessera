@@ -5,10 +5,17 @@
 #pragma once
 #include <d3d11.h>
 
+#include <cstdint>
+
 namespace tessera {
 // From device creation: keeps the adapter for sampling; hooks
 // QueryVideoMemoryInfo only when a budget cap is configured.
 void memory_on_device(ID3D11Device* dev);
+// Dedicated memory a vendor API (NVAPI) should report: the honest / capped
+// budget when the game renders on that vendor's GPU, else the real value.
+uint64_t memory_reported_for(uint32_t vendor_id, uint64_t real);
+// A D3D11 device of ours exists (so the session is up); any thread.
+bool memory_device_seen();
 // From the writer thread, about once a second: pushes a VRAM record.
 void memory_background_tick();
 }  // namespace tessera

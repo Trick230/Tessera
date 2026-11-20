@@ -26,8 +26,16 @@ const int64_t g_freq = [] {
 thread_local HANDLE t_timer = nullptr;
 
 // Modules that bring their own pacing: NVIDIA Streamline Reflex and DLSS
-// frame generation. (Reflex through NVAPI alone is not visible this way.)
-const wchar_t* const kPacingModules[] = {L"sl.reflex.dll", L"sl.dlss_g.dll", L"nvngx_dlssg.dll"};
+// frame generation, AMD FSR 3 frame generation (amd_fidelityfx_dx12 also
+// holds the upscaler, but frame generation can be turned on at any time
+// from it: back off), Intel XeSS frame generation and the DLSS-G to FSR 3
+// mod. Reflex through NVAPI alone is caught at SetSleepMode (nvapi.cpp).
+const wchar_t* const kPacingModules[] = {
+    L"sl.reflex.dll",           L"sl.dlss_g.dll",
+    L"nvngx_dlssg.dll",         L"amd_fidelityfx_dx12.dll",
+    L"amd_fidelityfx_framegeneration_dx12.dll", L"libxess_fg.dll",
+    L"dlssg_to_fsr3_amd_is_better.dll",
+};
 
 int64_t qpc() {
     LARGE_INTEGER t;
@@ -71,7 +79,11 @@ uint32_t pace_before_present(IDXGISwapChain* sc) {
         return 0;
     }
 
-    const int64_t interval = g_freq / fps;
+    // Another limiter (RTSS, NVIDIA) at or below ours: run 0.3% under it so
+    // it never engages and the two never fight. One below ours is the
+    // user's choice and stands; ours then only adds precision.
+    const int ext = config().ext_fps_limit;
+    const int64_t interval = ext > 0 && ext <= fps ? g_freq * 1000 / (static_cast<int64_t>(ext) * 997) : g_freq / fps;
     if (g_deadline == 0 || start > g_deadline + interval) {
         g_deadline = start + interval;  // first frame, or fell behind: resync, never burst to catch up
         return 0;
@@ -80,6 +92,11 @@ uint32_t pace_before_present(IDXGISwapChain* sc) {
     g_deadline += interval;
     const int64_t waited = qpc() - start;
     return static_cast<uint32_t>(waited * 1000000 / g_freq);
+}
+
+void pacing_backoff(const char* why) {
+    if (g_backoff.exchange(true, std::memory_order_relaxed) || config().fps_limit <= 0) return;
+    logf("limiter off: %s (the game paces frames itself)", why);
 }
 
 void pacing_background_tick() {

@@ -15,6 +15,9 @@ uint32_t pace_before_present(IDXGISwapChain* sc);
 // for modules that own pacing themselves and makes the limiter back off.
 void pacing_background_tick();
 
+// P6: the game turned on pacing of its own (Reflex through NVAPI): the
+// limiter stops for the rest of the session. Any thread; logs once.
+void pacing_backoff(const char* why);
 // P3: applies max_frame_latency to a new swap chain's device, unless the
 // game manages latency itself with a waitable swap chain.
 void pacing_on_swapchain(IDXGISwapChain* sc);

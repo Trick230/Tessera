@@ -115,6 +115,44 @@ int run(bool crash) {
         const unsigned long long cap = static_cast<unsigned long long>(_wtoi(cap_s)) << 20;
         std::printf("budget seen by the app: %llu MB\n", mi.Budget >> 20);
         if (FAILED(hr) || mi.Budget > cap) return fail("budget cap not applied", hr);
+        // Adapter descriptions too, through every version of GetDesc.
+        DXGI_ADAPTER_DESC d0 = {};
+        DXGI_ADAPTER_DESC1 dd1 = {};
+        DXGI_ADAPTER_DESC2 dd2 = {};
+        IDXGIAdapter2* a2 = nullptr;
+        if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&a2)))) return fail("IDXGIAdapter2");
+        const bool got = SUCCEEDED(adapter->GetDesc(&d0)) && SUCCEEDED(a2->GetDesc1(&dd1)) && SUCCEEDED(a2->GetDesc2(&dd2));
+        a2->Release();
+        std::printf("dedicated memory seen by the app: %zu / %zu / %zu MB\n", d0.DedicatedVideoMemory >> 20,
+                    dd1.DedicatedVideoMemory >> 20, dd2.DedicatedVideoMemory >> 20);
+        if (!got || d0.DedicatedVideoMemory > cap || dd1.DedicatedVideoMemory > cap || dd2.DedicatedVideoMemory > cap)
+            return fail("dedicated memory cap not applied");
+        // NVAPI (NVIDIA only): resolved through our import, the memory it reports is capped as well.
+        if (HMODULE nv = LoadLibraryW(L"nvapi64.dll")) {
+            using Qi = void*(__cdecl*)(unsigned);
+            const auto qi = reinterpret_cast<Qi>(GetProcAddress(nv, "nvapi_QueryInterface"));
+            HMODULE owner = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(qi), &owner);
+            if (!qi || owner == nv) return fail("nvapi_QueryInterface not wrapped");
+            using Init = int(__cdecl*)();
+            using Enum = int(__cdecl*)(void**, unsigned*);
+            using Mem = int(__cdecl*)(void*, unsigned*);
+            const auto init = reinterpret_cast<Init>(qi(0x0150E828));
+            const auto enum_gpus = reinterpret_cast<Enum>(qi(0xE5AC921F));
+            const auto mem = reinterpret_cast<Mem>(qi(0x07F9B368));
+            void* gpus[64] = {};
+            unsigned n = 0;
+            unsigned info[8] = {32 | (3 << 16)};
+            if (init && enum_gpus && mem && init() == 0 && enum_gpus(gpus, &n) == 0 && n > 0 &&
+                mem(gpus[0], info) == 0) {
+                std::printf("NVAPI dedicated memory seen by the app: %u MB\n", info[1] >> 10);
+                if ((static_cast<unsigned long long>(info[1]) << 10) > cap) return fail("NVAPI memory cap not applied");
+            } else {
+                std::printf("NVAPI memory query not available, skipped\n");
+            }
+            FreeLibrary(nv);
+        }
     }
 
     DXGI_SWAP_CHAIN_DESC1 d1 = {};

@@ -13,6 +13,7 @@ add_library(tessera_d3d11 SHARED
   process.cpp
   pacing.cpp
   memory.cpp
+  nvapi.cpp
   flip.cpp
   shaders.cpp
   workset.cpp
