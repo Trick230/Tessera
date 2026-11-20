@@ -6,6 +6,7 @@
 //! the game's exe name (drivers key their cache by it). Never runs while the
 //! game is running.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::windows::process::CommandExt;
@@ -29,7 +30,7 @@ pub struct WarmStats {
     pub skipped: u64,
 }
 
-fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
     let mut s = base.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
@@ -63,24 +64,25 @@ pub fn stored(exe: &Path) -> crate::shaders::StoreStats {
     t
 }
 
-#[derive(Clone, Copy)]
-enum Outcome {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
     Ok,
     Failed,
     Skipped,
 }
 
-/// Adds a log's settled hashes to `seen` (first outcome wins). A pending
+/// Adds a log's settled hashes to `seen` (first outcome wins) and returns
+/// the driver version in its header (None for a foreign file). A pending
 /// "try" (the run died on it) counts as failed, as the warm exe does on its
 /// next launch.
-fn settle(text: &str, seen: &mut std::collections::HashMap<String, Outcome>) {
+pub(crate) fn settle(text: &str, seen: &mut HashMap<u64, Outcome>) -> Option<u64> {
     let mut lines = text.lines();
-    if !lines.next().is_some_and(|h| h.starts_with("tessera-warm 1 ")) {
-        return;
-    }
+    let driver = lines.next()?.strip_prefix("tessera-warm 1 driver ")?;
+    let driver = u64::from_str_radix(driver.trim(), 16).ok()?;
     let mut pending = None;
     for l in lines {
         let Some((word, h)) = l.split_once(' ') else { continue };
+        let Ok(h) = u64::from_str_radix(h.trim(), 16) else { continue };
         let o = match word {
             "try" => {
                 pending = Some(h);
@@ -92,14 +94,15 @@ fn settle(text: &str, seen: &mut std::collections::HashMap<String, Outcome>) {
             _ => continue,
         };
         pending = None;
-        seen.entry(h.to_string()).or_insert(o);
+        seen.entry(h).or_insert(o);
     }
     if let Some(h) = pending {
-        seen.entry(h.to_string()).or_insert(Outcome::Failed);
+        seen.entry(h).or_insert(Outcome::Failed);
     }
+    Some(driver)
 }
 
-fn count(seen: &std::collections::HashMap<String, Outcome>) -> WarmStats {
+fn count(seen: &HashMap<u64, Outcome>) -> WarmStats {
     let mut st = WarmStats::default();
     for o in seen.values() {
         match o {
@@ -113,14 +116,14 @@ fn count(seen: &std::collections::HashMap<String, Outcome>) -> WarmStats {
 
 /// Parses one warm-up log; each hash counts once.
 pub fn parse_log(text: &str) -> WarmStats {
-    let mut seen = std::collections::HashMap::new();
+    let mut seen = HashMap::new();
     settle(text, &mut seen);
     count(&seen)
 }
 
 /// Both stores' logs, each hash once.
 pub fn stats(exe: &Path) -> WarmStats {
-    let mut seen = std::collections::HashMap::new();
+    let mut seen = HashMap::new();
     for b in bases(exe) {
         if let Ok(text) = fs::read_to_string(with_suffix(&b, ".twarm")) {
             settle(&text, &mut seen);

@@ -80,6 +80,14 @@ pub fn hashes_at(store: &Path, index: &Path) -> Vec<u64> {
     index_entries(&idx, meta.len()).iter().map(|e| e.0).collect()
 }
 
+/// Entries the index lists, whole or not (0 for a missing or foreign index).
+pub fn listed_at(index: &Path) -> u64 {
+    match fs::read(index) {
+        Ok(idx) if header_ok(&idx, INDEX_MAGIC, INDEX_ENTRY) => ((idx.len() - HEADER) / INDEX_ENTRY) as u64,
+        _ => 0,
+    }
+}
+
 /// Reads the index only (cheap: 16 bytes per shader).
 pub fn stats_at(store: &Path, index: &Path) -> StoreStats {
     let (Ok(meta), Ok(idx)) = (fs::metadata(store), fs::read(index)) else { return StoreStats::default() };

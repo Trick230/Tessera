@@ -273,6 +273,14 @@ mod nvapi {
     }
 }
 
+/// "32.0.15.6094" as the 64-bit UMD version D3D reports (16 bits a part),
+/// the form the warm-up logs record.
+pub fn umd_version(s: &str) -> Option<u64> {
+    let parts: Vec<u16> = s.trim().split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    let [a, b, c, d] = parts[..] else { return None };
+    Some((a as u64) << 48 | (b as u64) << 32 | (c as u64) << 16 | d as u64)
+}
+
 /// Remembers the primary driver version in `<data>\driver.txt` and says
 /// whether it differs from the stored one (false on the first check).
 pub fn note_driver(data_dir: &Path, version: &str) -> bool {
@@ -309,6 +317,13 @@ mod tests {
         assert_eq!(vendor_of("Advanced Micro Devices, Inc.", "AMD Radeon RX 7600"), Vendor::Amd);
         assert_eq!(vendor_of("Intel Corporation", "Intel(R) Arc(TM) A750"), Vendor::Intel);
         assert_eq!(vendor_of("Microsoft", "Microsoft Basic Display Adapter"), Vendor::Other);
+    }
+
+    #[test]
+    fn umd_version_matches_d3d() {
+        assert_eq!(umd_version("32.0.16.2114"), Some(0x0020_0000_0010_0842));
+        assert_eq!(umd_version("32.0.16"), None);
+        assert_eq!(umd_version("32.0.x.1"), None);
     }
 
     #[test]

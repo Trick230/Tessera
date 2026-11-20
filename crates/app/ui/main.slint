@@ -56,6 +56,20 @@ export struct SessionInfo {
     safe-mode: bool,
 }
 
+// One line of the Shaders tab; tone 0 neutral, 1 good, 2 warning, 3 bad.
+export struct ShaderRow {
+    label: string,
+    value: string,
+    detail: string,
+    tone: int,
+}
+
+// The Shaders tab; not present while the stores are being checked.
+export struct ShaderState {
+    present: bool,
+    rows: [ShaderRow],
+}
+
 // tessera.ini switches for an installed game.
 export struct GameSettings {
     present: bool,
@@ -515,6 +529,29 @@ component InfoRow inherits HorizontalLayout {
     }
 }
 
+// A shader check: state bar, name, verdict, then what it means.
+component ShaderLine inherits HorizontalLayout {
+    in property <ShaderRow> check;
+    property <color> tint: root.check.tone == 1 ? Theme.ok : root.check.tone == 2 ? Theme.warn : root.check.tone == 3 ? Theme.bad : Theme.faint;
+    spacing: 14px;
+    Rectangle { width: 3px; border-radius: 1.5px; background: root.tint; }
+    VerticalLayout {
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 16px;
+            Text { text: root.check.label; width: 120px; color: Theme.faint; font-size: 13px; vertical-alignment: center; }
+            Text {
+                text: root.check.value;
+                color: root.check.tone == 0 ? Theme.text : root.tint;
+                font-size: 17px;
+                font-weight: 600;
+                horizontal-stretch: 1;
+            }
+        }
+        Text { text: root.check.detail; color: Theme.dim; font-size: 13px; wrap: word-wrap; }
+    }
+}
+
 // Property grid row: name, control, a short note.
 component PropRow inherits VerticalLayout {
     in property <string> label;
@@ -538,6 +575,7 @@ component Detail inherits Rectangle {
     in property <GameRow> game;
     in property <SessionInfo> session;
     in property <GameSettings> settings;
+    in property <ShaderState> shaders;
     in-out property <int> tab;
     // Steam's key art for the game; empty when there is none.
     in property <image> hero;
@@ -618,6 +656,7 @@ component Detail inherits Rectangle {
                 padding-left: 8px;
                 alignment: start;
                 Tab { text: "Session"; active: root.tab == 0; clicked => { root.tab = 0; } }
+                Tab { text: "Shaders"; active: root.tab == 3; clicked => { root.tab = 3; } }
                 Tab { text: "Settings"; active: root.tab == 1; clicked => { root.tab = 1; } }
                 Tab { text: "Files"; active: root.tab == 2; clicked => { root.tab = 2; } }
             }
@@ -686,6 +725,13 @@ component Detail inherits Rectangle {
                         : root.game.can-install
                         ? "Install the layer and play once. Tessera then shows how the game ran and what can be improved."
                         : "The layer works with 64-bit D3D11 games only, so it cannot be installed here.";
+                }
+
+                // Shaders: compiled, covered, damaged, out of date.
+                if root.tab == 3: VerticalLayout {
+                    spacing: 20px;
+                    if !root.shaders.present: Text { text: "Checking the stored shaders…"; color: Theme.dim; font-size: 14px; }
+                    for r in root.shaders.rows: ShaderLine { check: r; }
                 }
 
                 // Settings written to tessera.ini; the layer reads them at start.
@@ -778,6 +824,7 @@ export component MainWindow inherits Window {
     in property <bool> busy;
     in property <SessionInfo> session;
     in property <GameSettings> settings;
+    in property <ShaderState> shader-state;
     // Key art of the selected game.
     in property <image> hero;
     // S7: driver shader cache advice, empty when all is well.
@@ -888,6 +935,7 @@ export component MainWindow inherits Window {
                 hero: root.hero;
                 session: root.session;
                 settings: root.settings;
+                shaders: root.shader-state;
                 tab <=> root.tab;
                 reset-safe-mode => { root.reset-safe-mode(root.selected); }
                 settings-changed(p, r, fl, f, v) => { root.settings-changed(root.selected, p, r, fl, f, v); }

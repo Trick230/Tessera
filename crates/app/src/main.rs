@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tessera_core::install::{self, InstallState};
+use tessera_core::shader_check::ShaderCheck;
 use tessera_core::{paths, session, GameInfo};
 
 slint::include_modules!();
@@ -69,13 +70,7 @@ fn row(g: &GameInfo) -> GameRow {
         installed: g.install.is_installed(),
         blocked: !g.anticheat.is_empty(),
         can_install: g.can_install(),
-        // S1/S5 only read the install and run outside the game: anti-cheat games too.
-        // A game that also has D3D12 gains nothing unless it runs on D3D11:
-        // shown once the layer has stored shaders it created.
-        d3d11: g.exe.as_ref().is_some_and(|e| {
-            let all = g.scan.all();
-            all.has(tessera_core::pe::ApiSet::D3D11) && (!all.has(tessera_core::pe::ApiSet::D3D12) || tessera_core::shaders::stats(e).shaders > 0)
-        }),
+        d3d11: can_prepare(g),
         icon: steam_image(g, false),
         initial: s(g.entry.name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_default()),
     }
@@ -83,6 +78,18 @@ fn row(g: &GameInfo) -> GameRow {
 
 /// Steam's icon (`hero == false`) or key art for a game; empty when there is none.
 /// Decoded images are kept, so filtering the list does not decode them again.
+/// Whether Prepare shaders applies. S1/S5 only read the install and run
+/// outside the game: anti-cheat games too. A game that also has D3D12 gains
+/// nothing unless it runs on D3D11: offered once the layer has stored
+/// shaders it created.
+fn can_prepare(g: &GameInfo) -> bool {
+    g.exe.as_ref().is_some_and(|e| {
+        let all = g.scan.all();
+        all.has(tessera_core::pe::ApiSet::D3D11)
+            && (!all.has(tessera_core::pe::ApiSet::D3D12) || tessera_core::shaders::stats(e).shaders > 0)
+    })
+}
+
 fn steam_image(g: &GameInfo, hero: bool) -> slint::Image {
     thread_local! {
         static CACHE: std::cell::RefCell<std::collections::HashMap<(u32, bool), slint::Image>> = Default::default();
@@ -170,22 +177,23 @@ fn shader_text(exe: &Path, sum: Option<&session::Summary>) -> String {
 }
 
 /// Fills the panel for the last session. Also returns the real VRAM budget
-/// seen in it (MB, 0 if unknown) for the budget cap choices.
-fn session_info(exe: &Path) -> (SessionInfo, u32) {
+/// seen in it (MB, 0 if unknown) for the budget cap choices, and the shaders
+/// it created and how many of those were new (not stored yet).
+fn session_info(exe: &Path) -> (SessionInfo, u32, Option<(u64, u64)>) {
     let s = |v: String| SharedString::from(v);
     let mut info = SessionInfo {
         safe_mode: session::safe_mode_active(exe),
         shaders: s(shader_text(exe, None)),
         ..Default::default()
     };
-    let Some(path) = session::latest(exe) else { return (info, 0) };
+    let Some(path) = session::latest(exe) else { return (info, 0, None) };
     info.present = true;
     let sum = match session::summarize_file(&path) {
         Ok(v) => v,
         Err(e) => {
             info.when = s(session_when(&path));
             info.note = s(format!("Could not read {}: {e}", path.display()));
-            return (info, 0);
+            return (info, 0, None);
         }
     };
     info.clean = sum.clean;
@@ -306,7 +314,117 @@ fn session_info(exe: &Path) -> (SessionInfo, u32) {
         notes.push(format!("VRAM cap of {} reported to the game", gb(sum.vram_cap_mb)));
     }
     info.note = s(notes.join("; "));
-    (info, sum.vram_budget_mb)
+    let run = (sum.shaders > 0).then_some((sum.shaders, sum.shaders_new));
+    (info, sum.vram_budget_mb, run)
+}
+
+/// The Shaders tab: what the driver already compiled, how much of what the
+/// game uses is covered, what is damaged and what is out of date.
+fn shader_state(c: &ShaderCheck, run: Option<(u64, u64)>, can_prepare: bool) -> ShaderState {
+    const NEUTRAL: i32 = 0;
+    const OK: i32 = 1;
+    const WARN: i32 = 2;
+    const BAD: i32 = 3;
+    let line = |label: &str, value: String, detail: Vec<String>, tone: i32| ShaderRow {
+        label: label.into(),
+        value: value.into(),
+        detail: detail.join(" ").into(),
+        // Nothing stored: nothing to call good yet.
+        tone: if c.stored == 0 && tone == OK { NEUTRAL } else { tone },
+    };
+    let mut rows = Vec::new();
+
+    // Compiled: the warm-up logs written with the installed driver.
+    let mut d = Vec::new();
+    let warmable = c.stored - c.skipped;
+    let (value, tone) = if c.stored == 0 {
+        d.push(if can_prepare {
+            "No shaders stored yet. Prepare shaders searches the game files; playing with the layer on stores the rest."
+        } else {
+            "No shaders stored yet. The warm-up is for D3D11: play once on D3D11 with the layer on, then Prepare shaders compiles what it stored."
+        }.to_string());
+        ("Nothing stored".to_string(), NEUTRAL)
+    } else if c.all_compiled() {
+        d.push(format!("The installed driver already compiled all {} stored shaders the warm-up can take.", c.compiled));
+        (format!("All {}", c.compiled), OK)
+    } else {
+        d.push(format!(
+            "{} of {} stored shaders are compiled with the installed driver; {} would compile while playing. Prepare shaders compiles them first.",
+            c.compiled, warmable, c.pending
+        ));
+        let v = if c.compiled == 0 { "Not yet".to_string() } else { format!("{} of {}", c.compiled, warmable) };
+        (v, WARN)
+    };
+    if c.skipped > 0 {
+        d.push(format!("{} are D3D12 shaders (DXIL) the D3D11 warm-up cannot take.", c.skipped));
+    }
+    rows.push(line("Compiled", value, d, tone));
+
+    // Coverage: how many of the shaders the last run created were already stored.
+    let (value, tone, d) = match run {
+        Some((n, new)) => {
+            let mut d = vec![format!("The last run created {n} shaders; {} were already stored.", n - new)];
+            if new > 0 {
+                d.push(format!("The other {new} are stored now and compile in the next preparation."));
+            }
+            (format!("{}%", (n - new) * 100 / n), if new == 0 { OK } else { WARN }, d)
+        }
+        None => (
+            "Unknown".to_string(),
+            NEUTRAL,
+            vec!["Play once with the layer on: the run records every shader the game creates.".to_string()],
+        ),
+    };
+    rows.push(line("Coverage", value, d, tone));
+
+    // Damaged: bad store entries, driver refusals, bad containers in the install.
+    let mut d = Vec::new();
+    if c.damaged > 0 {
+        d.push(format!("{} stored entries are cut short or fail their checksum; they are left out.", c.damaged));
+    }
+    if c.failed > 0 {
+        d.push(format!("The driver refused {} in the warm-up.", c.failed));
+    }
+    let bad_files = c.bad_in_install.unwrap_or(0);
+    if bad_files > 0 {
+        d.push(format!("{bad_files} shaders in the game files fail their checksum; the search leaves them out."));
+    }
+    let tone = if c.damaged > 0 { BAD } else if d.is_empty() { OK } else { WARN };
+    let value = if d.is_empty() { "None".to_string() } else { (c.damaged + c.failed + bad_files).to_string() };
+    if d.is_empty() {
+        d.push(if c.stored == 0 { "Nothing to check yet." } else { "Every stored shader is whole and matches its checksum." }.to_string());
+    }
+    rows.push(line("Damaged", value, d, tone));
+
+    // Out of date: game updated since the search, driver updated since the warm-up.
+    let mut d = Vec::new();
+    if c.scan_outdated == Some(true) {
+        d.push("The game changed since its files were searched; Prepare shaders searches them again.".to_string());
+    }
+    if c.old_driver > 0 {
+        d.push(format!("{} were compiled with an older driver and must be compiled again.", c.old_driver));
+    }
+    let tone = if d.is_empty() { OK } else { WARN };
+    let value = if d.is_empty() {
+        "None"
+    } else if c.old_driver > 0 {
+        "Driver updated"
+    } else {
+        "Game updated"
+    };
+    if tone == OK {
+        d.push(match (c.stored, c.scan_outdated) {
+            (0, _) => "Nothing to compare yet.",
+            (_, Some(_)) => "The search matches the game as installed, and the warm-up the installed driver.",
+            (_, None) => "The warm-up matches the installed driver. The game files were not searched yet.",
+        }.to_string());
+    }
+    if c.dropped > 0 {
+        d.push(format!("{} warm-up entries refer to shaders no longer stored (ignored).", c.dropped));
+    }
+    rows.push(line("Out of date", value.to_string(), d, tone));
+
+    ShaderState { present: true, rows: ModelRc::new(VecModel::from(rows)) }
 }
 
 const FPS_CHOICES: [u32; 9] = [0, 30, 40, 60, 90, 120, 144, 165, 240];
@@ -380,10 +498,13 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
     let gen = SESSION_GEN.fetch_add(1, Ordering::Relaxed) + 1;
     ui.set_session(SessionInfo::default());
     ui.set_settings(GameSettings::default());
+    ui.set_shader_state(ShaderState::default());
     let Some(exe) = exe else { return };
+    let root = game.map(|g| g.entry.root.clone());
+    let prepare = game.is_some_and(can_prepare);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
-        let (info, budget) = session_info(&exe);
+        let (info, budget, run) = session_info(&exe);
         // GameSettings holds models (not Send); tessera.ini is tiny, read it on the UI thread.
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if SESSION_GEN.load(Ordering::Relaxed) != gen {
@@ -393,6 +514,17 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
             if let Some((gs, lists)) = dir.map(|d| game_settings(&d, budget)) {
                 *SETTINGS.lock().unwrap() = Some(lists);
                 ui.set_settings(gs);
+            }
+        });
+        // Reads whole stores (checksums): after the session, which shows first.
+        let drivers: Vec<u64> = tessera_core::driver::gpus()
+            .iter()
+            .filter_map(|g| tessera_core::driver::umd_version(&g.driver_version))
+            .collect();
+        let check = tessera_core::shader_check::check(&exe, root.as_deref(), &drivers);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if SESSION_GEN.load(Ordering::Relaxed) == gen {
+                ui.set_shader_state(shader_state(&check, run, prepare));
             }
         });
     });
@@ -434,7 +566,7 @@ fn refresh(ui: &MainWindow, state: &Shared) {
                 if let Some(i) = st.view.iter().position(|&gi| st.games[gi].entry.name.to_lowercase().contains(&want)) {
                     ui.set_selected(i as i32);
                     load_session(&ui, &mut st, i as i32, true);
-                    // TESSERA_TAB=<0..2>: open that tab (scripted screenshots).
+                    // TESSERA_TAB=<0..3>: open that tab (3 = Shaders) (scripted screenshots).
                     if let Some(t) = std::env::var("TESSERA_TAB").ok().and_then(|v| v.parse().ok()) {
                         ui.set_tab(t);
                     }

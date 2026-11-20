@@ -485,10 +485,30 @@ fn key_path(base: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// What the last scan recorded in `<base>.key`: the install key on the
+/// first line, then "invalid <n>" (containers whose checksum did not match).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRecord {
+    pub key: String,
+    pub invalid: Option<u64>,
+}
+
+pub fn record_at(base: &Path) -> Option<ScanRecord> {
+    let text = fs::read_to_string(key_path(base)).ok()?;
+    let mut lines = text.lines();
+    let key = lines.next()?.to_string();
+    let invalid = lines.find_map(|l| l.strip_prefix("invalid ")?.trim().parse().ok());
+    Some(ScanRecord { key, invalid })
+}
+
 /// True when the scan store matches the install as it is now.
 pub fn up_to_date(exe: &Path, root: &Path) -> bool {
-    let Some(base) = scan_base(exe) else { return false };
-    fs::read_to_string(key_path(&base)).is_ok_and(|k| k == install_key(root))
+    scan_base(exe).and_then(|b| record_at(&b)).is_some_and(|r| r.key == install_key(root))
+}
+
+/// The key of the install as it is now (walks the folder's file metadata).
+pub fn current_key(root: &Path) -> String {
+    install_key(root)
 }
 
 /// Scans the install folder of `exe` (`root`) and writes what the layer has
@@ -500,7 +520,9 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     let stored: std::collections::HashSet<u64> = crate::shaders::read(exe).iter().map(|s| s.hash).collect();
     shaders.retain(|s| !stored.contains(&s.hash));
     crate::shaders::write_base(&base, &shaders)?;
-    fs::write(key_path(&base), key)?;
+    fs::write(key_path(&base), format!("{key}
+invalid {}
+", stats.invalid))?;
     Ok(stats)
 }
 

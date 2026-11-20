@@ -13,6 +13,7 @@ pub mod pe;
 pub mod paths;
 pub mod scan;
 pub mod session;
+pub mod shader_check;
 pub mod shaders;
 pub mod warm;
 
