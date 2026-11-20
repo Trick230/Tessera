@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! S1: exhaustive bytecode search over a game's install files. Finds DXBC
 //! containers stored raw (exe, DLLs, loose files, uncompressed archives) and
-//! inside zlib, zstd and LZ4-frame streams, then keeps the ones the D3D11
-//! warm-up can create. Read-only: never writes into the game folder.
+//! inside zlib, zstd and LZ4-frame streams and Oodle blocks (with the game's
+//! own codec DLL, when it ships one), then keeps the ones the D3D11 warm-up
+//! can create. Read-only: never writes into the game folder.
 //!
-//! Not covered yet: Oodle (needs the game's own codec DLL), Brotli and raw
-//! LZ4 blocks (no magic to find them by), encrypted archives (need the key).
+//! Not covered yet: Brotli and raw LZ4 blocks (no magic to find them by),
+//! encrypted archives (need the key), an Oodle block shorter than the
+//! archive's block size (the last of an entry; its raw size is unknown), and
+//! the blocks after the first of one Oodle stream (they need its history).
 
 use std::collections::HashMap;
 use std::fs;
@@ -14,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
+use crate::oodle::{self, Oodle};
 use crate::shaders::{Shader, FLAG_DXBC, FLAG_DXIL, STAGE_CS, STAGE_DS, STAGE_GS, STAGE_HS, STAGE_PS, STAGE_VS};
 
 /// Largest decompressed stream searched; bigger ones are cut (their start is still searched).
@@ -21,6 +25,8 @@ const STREAM_CAP: u64 = 64 << 20;
 /// Streams found inside decompressed streams are searched to this depth.
 const MAX_DEPTH: u32 = 2;
 const MIN_FILE: u64 = 32;
+/// Files scanned at once (see scan_dir).
+const SCAN_THREADS: usize = 4;
 /// Search window: candidates of one window are found while it is in cache.
 const CHUNK: usize = 8 << 20;
 
@@ -33,6 +39,7 @@ pub struct ScanStats {
     pub zlib: u64,
     pub zstd: u64,
     pub lz4: u64,
+    pub oodle: u64,
     /// Unique containers the D3D11 warm-up can create.
     pub usable: u64,
     /// Unique containers it cannot (DXIL, SM 5.1+, libraries, mesh shaders).
@@ -50,6 +57,7 @@ impl ScanStats {
         self.zlib += o.zlib;
         self.zstd += o.zstd;
         self.lz4 += o.lz4;
+        self.oodle += o.oodle;
         self.invalid += o.invalid;
     }
 }
@@ -206,6 +214,7 @@ struct Found {
     shaders: HashMap<u64, Shader>,
     skipped: HashMap<u64, ()>,
     stats: ScanStats,
+    oodle: Option<Oodle>,
 }
 
 impl Found {
@@ -239,6 +248,7 @@ impl Found {
     /// Returns how many new unique containers were found.
     fn search(&mut self, b: &[u8], depth: u32) -> u64 {
         const DXBC: u8 = 3;
+        const OODLE: u8 = 4;
         let zstd = memchr::memmem::Finder::new(&[0x28, 0xB5, 0x2F, 0xFD]);
         let lz4 = memchr::memmem::Finder::new(&[0x04, 0x22, 0x4D, 0x18]);
         let dxbc = memchr::memmem::Finder::new(b"DXBC");
@@ -259,6 +269,13 @@ impl Found {
                         .filter(|&i| i + 2 <= w.len() && is_zlib_header(&w[i..]))
                         .map(|i| (start + i, 0)),
                 );
+                if self.oodle.is_some() {
+                    cand.extend(
+                        memchr::memchr_iter(0x8C, &w[..end - start])
+                            .filter(|&i| oodle::run_start(&b[start + i..]).is_some())
+                            .map(|i| (start + i, OODLE)),
+                    );
+                }
             }
             cand.sort_unstable();
             for &(p, kind) in &cand {
@@ -280,7 +297,11 @@ impl Found {
                 }
                 out.clear();
                 let consumed = match kind {
-                    0 => inflate(rest, &mut out),
+                    0 => inflate_run(rest, &mut out),
+                    OODLE => match self.oodle.map(|o| o.run(rest, &mut out, STREAM_CAP as usize)) {
+                        Some(used) if used > 0 => Some(Some(used)),
+                        _ => None,
+                    },
                     1 => read_capped(ruzstd::decoding::StreamingDecoder::new(rest).ok(), &mut out).then_some(None),
                     _ => read_capped(Some(lz4_flex::frame::FrameDecoder::new(rest)), &mut out).then_some(None),
                 };
@@ -295,6 +316,7 @@ impl Found {
                 match kind {
                     0 => self.stats.zlib += n,
                     1 => self.stats.zstd += n,
+                    OODLE => self.stats.oodle += n,
                     _ => self.stats.lz4 += n,
                 }
                 // Only a stream that ended cleanly is skipped: a false header
@@ -329,12 +351,45 @@ fn inflate(b: &[u8], out: &mut Vec<u8>) -> Option<Option<usize>> {
         match r {
             Ok(flate2::Status::StreamEnd) => return Some(Some(d.total_in() as usize)),
             Ok(_) if produced == 0 && d.total_in() as usize == i0 => break, // input ended
-            Ok(_) if d.total_out() >= STREAM_CAP => break,
+            Ok(_) if out.len() as u64 >= STREAM_CAP => break, // whole output, across a run
             Ok(_) => {}
             Err(_) => break,
         }
     }
     (!out.is_empty()).then_some(None)
+}
+
+/// Inflates a run of zlib streams that follow each other (up to 15 bytes
+/// apart, the padding of encrypted-size alignment), joined into one output:
+/// archives like Unreal paks compress a file in 64 KiB blocks, one stream
+/// each, so a container across a block edge is only whole once joined.
+fn inflate_run(b: &[u8], out: &mut Vec<u8>) -> Option<Option<usize>> {
+    let first = inflate(b, out)?;
+    let Some(mut used) = first else { return Some(None) };
+    'run: while (out.len() as u64) < STREAM_CAP {
+        for gap in 0..16 {
+            let q = used + gap;
+            if q + 2 > b.len() {
+                break 'run;
+            }
+            if !is_zlib_header(&b[q..]) {
+                continue;
+            }
+            let keep = out.len();
+            match inflate(&b[q..], out) {
+                Some(Some(c)) => {
+                    used = q + c;
+                    continue 'run;
+                }
+                _ => {
+                    out.truncate(keep); // not a whole stream: the run ends here
+                    break 'run;
+                }
+            }
+        }
+        break;
+    }
+    Some(Some(used))
 }
 
 /// Reads a decoder to its end or STREAM_CAP; false when it gave nothing.
@@ -344,8 +399,8 @@ fn read_capped<R: Read>(r: Option<R>, out: &mut Vec<u8>) -> bool {
     !out.is_empty()
 }
 
-fn scan_file(path: &Path) -> Found {
-    let mut f = Found::default();
+fn scan_file(path: &Path, oodle: Option<Oodle>) -> Found {
+    let mut f = Found { oodle, ..Found::default() };
     let Ok(file) = fs::File::open(path) else { return f };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     if len < MIN_FILE {
@@ -372,7 +427,15 @@ pub fn files(dir: &Path) -> Vec<PathBuf> {
 
 /// Scans `dir`; returns the D3D11-creatable shaders (sorted by hash) and stats.
 pub fn scan_dir(dir: &Path) -> (Vec<Shader>, ScanStats) {
-    let found = files(dir).par_iter().map(|p| scan_file(p)).reduce(Found::default, Found::merge);
+    let oodle = oodle::find(dir).and_then(|p| oodle::load(&p));
+    // Each thread may hold a few STREAM_CAP buffers (a stream and the streams
+    // inside it), so the thread count bounds the scan's memory.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(SCAN_THREADS);
+    let scan = || files(dir).par_iter().map(|p| scan_file(p, oodle)).reduce(Found::default, Found::merge);
+    let found = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+        Ok(pool) => pool.install(scan),
+        Err(_) => scan(),
+    };
     let mut stats = found.stats;
     let mut shaders: Vec<Shader> = found.shaders.into_values().collect();
     shaders.sort_unstable_by_key(|s| s.hash);
@@ -413,7 +476,7 @@ fn install_key(root: &Path) -> String {
         let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
         newest = newest.max(t.map_or(0, |d| d.as_secs()));
     }
-    format!("tessera-scan 1 files {n} bytes {bytes} newest {newest}")
+    format!("tessera-scan 2 files {n} bytes {bytes} newest {newest}")
 }
 
 fn key_path(base: &Path) -> PathBuf {
@@ -511,6 +574,25 @@ mod tests {
         assert_eq!(shaders.iter().map(|s| (s.hash, s.stage)).collect::<Vec<_>>(), want);
         assert!(shaders.iter().any(|s| s.code == vs));
         assert_eq!((stats.files, stats.raw, stats.zlib, stats.usable, stats.invalid), (1, 1, 1, 2, 1));
+    }
+
+    #[test]
+    fn joins_a_container_split_across_zlib_streams() {
+        use std::io::Write;
+        let ps = signed(0x0000_0050);
+        let (a, b) = ps.split_at(ps.len() / 2);
+        let z = |d: &[u8]| {
+            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(d).unwrap();
+            e.finish().unwrap()
+        };
+        for pad in [0usize, 7] {
+            let blob = [vec![9u8; 5], z(a), vec![0u8; pad], z(b)].concat();
+            let t = tempfile::tempdir().unwrap();
+            fs::write(t.path().join("c.pak"), &blob).unwrap();
+            let (shaders, _) = scan_dir(t.path());
+            assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&ps)], "padding {pad}");
+        }
     }
 
     #[test]

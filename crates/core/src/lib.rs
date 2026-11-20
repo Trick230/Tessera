@@ -8,6 +8,7 @@ pub mod engine;
 pub mod game;
 pub mod install;
 pub mod library;
+pub mod oodle;
 pub mod pe;
 pub mod paths;
 pub mod scan;
