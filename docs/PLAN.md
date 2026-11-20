@@ -149,7 +149,12 @@ dos bytes da root signature (estado sintetizado acerta; exceção: view instanci
 - **P1 Limitador preciso** — timer de alta resolução + espera ativa final. Regra: o limitador mais baixo
   manda; o Tessera fica ligeiramente abaixo do limite mais baixo encontrado (RTSS, painel NVIDIA), a não
   ser que o utilizador tenha posto de propósito um limite mais baixo noutra ferramenta.
-- **P2 Flip model + tearing** para D3D11 em janela sem bordas.
+- **P2 Flip model + tearing** para D3D11 em janela sem bordas: converter swapchains blit (`DISCARD` →
+  `FLIP_DISCARD`, `SEQUENTIAL` → `FLIP_SEQUENTIAL`, mínimo 2 buffers) e, com VRR, `ALLOW_TEARING` em
+  `SyncInterval 0`. Só em janela, só swapchains do jogo (C3). Excluir: MSAA no back buffer, formatos
+  sRGB/não suportados pelo flip, janelas filhas/GDI. Manter a flag em `ResizeBuffers`; sem tearing em ecrã
+  inteiro exclusivo. O flip desliga o back buffer do OM em cada `Present`: repor os render targets do jogo
+  depois do `Present`. Desligado por omissão até ser validado em jogos reais.
 - **P3 Latência de frames** — `SetMaximumFrameLatency`, waitable object.
 - **P4 CPU sets** — thread que chama `Present` em P-cores (CPUs híbridos).
 - **P5 Processo** — resolução do timer, EcoQoS desligado (`SetProcessInformation`), prioridade moderada.
@@ -190,7 +195,7 @@ garbage collection, picos de lógica do jogo, DRM, a parte de CPU do traversal.
 |---|---|---|
 | 0. Fundações | C1, C2, C5, C6, C7, D1 (D3D11) | Jogo corre igual, custo < 1% |
 | 1. Ganhos seguros | M1, M2, P1–P3, P5, P6, S7, D2 básico | Pacing melhor, sem regressões |
-| 2. Shaders | S1, S2, S5 (D3D11 NVIDIA + D3D12), S6 + medidor | Zero stutters de compilação na 2.ª sessão |
+| 2. Shaders | S1, S2, S5 (D3D11 NVIDIA + D3D12), S6 + medidor | Já na 1.ª sessão: stutters de compilação e pop-in por PSOs por compilar a zero ou quase (só os casos impossíveis da secção S); zero na 2.ª |
 | 3. Memória D3D11 | M3, M4, M5, M10, M11, C3, C4 | VRAM a descer, zero restauros atrasados |
 | 4. Previsão e I/O | M7, M8, I1–I5, P4 | Menos stutters de traversal, pop-in ~0 |
 | 5. Qualidade fina | M6 (DXBC), M9 | Poupança extra sem diferença na FLIP |
