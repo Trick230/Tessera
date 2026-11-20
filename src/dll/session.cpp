@@ -16,6 +16,7 @@
 #include "pacing.h"
 #include "process.h"
 #include "shaders.h"
+#include "workset.h"
 
 namespace tessera {
 namespace {
@@ -164,7 +165,10 @@ DWORD WINAPI writer_main(void*) {
     while (WaitForSingleObject(g_stop, 250) == WAIT_TIMEOUT) {
         flush(false);
         ++tick;
-        if ((tick & 3) == 1) memory_background_tick();  // every 1 s, first after 250 ms
+        if ((tick & 3) == 1) {  // every 1 s, first after 250 ms
+            memory_background_tick();
+            workset_background_tick();
+        }
         if ((tick & 7) == 0) pacing_background_tick();  // every 2 s
         shaders_background_tick();
         if (!stable) {
@@ -306,6 +310,7 @@ void session_frame(uint32_t wait_us) {
         r.a = us > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<uint32_t>(us);
     }
     session_push(r);
+    workset_frame();
 }
 
 void session_shutdown() {

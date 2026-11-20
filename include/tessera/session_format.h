@@ -24,7 +24,7 @@ enum TesseraRecordKind {
                                 // d = usage | misc << 8, flags = bind, bytes = estimate
     TESSERA_REC_BUFFER = 3,     // a = byte width, d = usage | misc << 8, flags = bind, bytes = a
     TESSERA_REC_SRV = 4,        // a = view dimension (0 if no desc)
-    TESSERA_REC_DEVICE = 5,     // a = feature level, d = create flags
+    TESSERA_REC_DEVICE = 5,     // a = feature level, b = tiled resources tier (C4), d = create flags
     TESSERA_REC_SWAPCHAIN = 6,  // a = width, b = height, c = buffers, d = swap effect, flags = desc flags
                                 // (| 0x100 when Tessera converted it to flip model, P2)
     TESSERA_REC_VRAM = 7,       // ~1 s samples: a = local budget MB (real), b = local usage MB,
@@ -32,6 +32,12 @@ enum TesseraRecordKind {
                                 // the game (0 = none), bytes = local usage
     TESSERA_REC_SHADER = 8,     // a = stage, b = bytecode bytes, c = creation call us, d = TESSERA_SHADER_*
                                 // bits (shader_store_format.h), bytes = shader hash
+    TESSERA_REC_WORKSET = 9,    // ~1 s, M11: a = KB of sampled game textures bound in the last second,
+                                // b = the same over the last 10 s, c = such textures alive, d = left
+                                // untracked (tables full), flags = frames in the last second,
+                                // bytes = bytes of the tracked textures alive. "Last second"
+                                // includes the frame in flight at the previous tick, so at low
+                                // frame rates the window is a frame longer.
     TESSERA_REC_END = 0xFFFF,   // a = records dropped (ring overrun), bytes = records written
 };
 

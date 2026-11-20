@@ -297,12 +297,29 @@ fn session_info(exe: &Path) -> (SessionInfo, u32, Option<(u64, u64)>) {
         size(sum.buffer_bytes),
         sum.prioritized
     ));
+    if let Some(w) = &sum.workset {
+        let mb = |v: u32| size((v as u64) << 20);
+        let mut t = format!(
+            "{} a second on average (peak {}, {} over 10 s) of {} of sampled textures",
+            mb(w.used_avg_mb),
+            mb(w.used_peak_mb),
+            mb(w.used10_peak_mb),
+            mb(w.textures_mb)
+        );
+        if w.untracked > 0 {
+            t.push_str(&format!("; {} not tracked", w.untracked));
+        }
+        info.in_use = s(t);
+    }
     info.shaders = s(shader_text(exe, Some(&sum)));
     let fl = sum.feature_level;
     info.display = s(match sum.swapchain {
         Some((w, h)) => format!("{w}×{h}, D3D feature level {}_{}", fl >> 12, (fl >> 8) & 0xF),
         None => "no swapchain recorded".into(),
     });
+    if sum.tiled_tier > 0 {
+        info.display = s(format!("{}, tiled resources tier {}", info.display, sum.tiled_tier));
+    }
     let mut notes = Vec::new();
     if sum.dropped > 0 {
         notes.push(format!("{} records lost (buffer full)", sum.dropped));

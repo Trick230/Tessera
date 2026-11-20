@@ -19,6 +19,7 @@ pub const REC_DEVICE: u16 = 5;
 pub const REC_SWAPCHAIN: u16 = 6;
 pub const REC_VRAM: u16 = 7;
 pub const REC_SHADER: u16 = 8;
+pub const REC_WORKSET: u16 = 9;
 pub const REC_END: u16 = 0xFFFF;
 
 /// Resource created by code outside the game's folder (overlay, SDK).
@@ -109,7 +110,27 @@ pub struct Summary {
     pub buffers: u64,
     pub buffer_bytes: u64,
     pub feature_level: u32,
+    /// D3D11 tiled resources tier of the device (C4), 0 = none.
+    pub tiled_tier: u32,
     pub swapchain: Option<(u32, u32)>,
+    /// M11 texture working set; None when the layer had no samples.
+    pub workset: Option<WorkSet>,
+}
+
+/// M11: how much of the game's sampled texture memory play really binds.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkSet {
+    /// Seconds sampled while the game presented frames.
+    pub samples: u32,
+    /// Most sampled-texture memory alive at once, MB.
+    pub textures_mb: u32,
+    /// Bound in a second: average and highest, MB.
+    pub used_avg_mb: u32,
+    pub used_peak_mb: u32,
+    /// Highest bound over any 10 s, MB.
+    pub used10_peak_mb: u32,
+    /// Textures and views the meter could not track (tables full).
+    pub untracked: u32,
 }
 
 impl Summary {
@@ -219,6 +240,8 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
     let mut over_now = false;
     let (mut made, mut made_bytes) = (0u32, 0u64);
     let mut limiter_us = 0u64;
+    let mut ws = WorkSet::default();
+    let mut ws_used_kb = 0u64;
     let (mut first, mut last) = (u64::MAX, 0u64);
     for r in records(b, hs, rs) {
         if r.kind != REC_END {
@@ -273,7 +296,19 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
                 shader_us += r.c as u64;
                 shader_now = true;
             }
-            REC_DEVICE => s.feature_level = r.a,
+            REC_DEVICE => {
+                s.feature_level = r.a;
+                s.tiled_tier = r.b;
+            }
+            // Seconds with no frames (loading, menus paused) say nothing about play.
+            REC_WORKSET if r.flags > 0 => {
+                ws.samples += 1;
+                ws.textures_mb = ws.textures_mb.max((r.bytes >> 20) as u32);
+                ws.used_peak_mb = ws.used_peak_mb.max(r.a >> 10);
+                ws.used10_peak_mb = ws.used10_peak_mb.max(r.b >> 10);
+                ws.untracked = ws.untracked.max(r.d);
+                ws_used_kb += r.a as u64;
+            }
             REC_SWAPCHAIN => s.swapchain = Some((r.a, r.b)),
             REC_END => {
                 s.clean = true;
@@ -286,6 +321,10 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
         s.duration_s = (last - first) as f64 / s.header.qpc_frequency as f64;
     }
     s.limiter_wait_s = limiter_us as f64 / 1e6;
+    if ws.samples > 0 {
+        ws.used_avg_mb = (ws_used_kb / ws.samples as u64 >> 10) as u32;
+        s.workset = Some(ws);
+    }
     s.shader_create_ms = shader_us as f64 / 1e3;
     if !frame_us.is_empty() {
         let sum: u64 = frame_us.iter().map(|&v| v as u64).sum();
@@ -441,14 +480,36 @@ mod tests {
     }
 
     fn rec_flags(b: &mut Vec<u8>, qpc: u64, kind: u16, flags: u32, a: u32, bb: u32, bytes: u64) {
+        rec_full(b, qpc, kind, flags, [a, bb, 0, 0], bytes)
+    }
+
+    fn rec_full(b: &mut Vec<u8>, qpc: u64, kind: u16, flags: u32, abcd: [u32; 4], bytes: u64) {
         b.extend_from_slice(&qpc.to_le_bytes());
         b.extend_from_slice(&kind.to_le_bytes());
         b.extend_from_slice(&0u16.to_le_bytes());
         b.extend_from_slice(&flags.to_le_bytes());
-        for v in [a, bb, 0, 0] {
+        for v in abcd {
             b.extend_from_slice(&v.to_le_bytes());
         }
         b.extend_from_slice(&bytes.to_le_bytes());
+    }
+
+    #[test]
+    fn summarizes_the_working_set() {
+        let mut b = header(1_000_000);
+        rec(&mut b, 0, REC_DEVICE, 0xb000, 2, 0);
+        // A loading second (no frames) is left out.
+        rec_full(&mut b, 1, REC_WORKSET, 0, [9 << 20, 9 << 20, 5, 0], 900 << 20);
+        rec_full(&mut b, 2, REC_WORKSET, 60, [100 << 10, 300 << 10, 400, 0], 1000 << 20);
+        rec_full(&mut b, 3, REC_WORKSET, 60, [200 << 10, 350 << 10, 420, 3], 1200 << 20);
+        let s = summarize(&b).unwrap();
+        assert_eq!(s.tiled_tier, 2);
+        let w = s.workset.unwrap();
+        assert_eq!(
+            w,
+            WorkSet { samples: 2, textures_mb: 1200, used_avg_mb: 150, used_peak_mb: 200, used10_peak_mb: 350, untracked: 3 }
+        );
+        assert!(summarize(&header(1_000_000)).unwrap().workset.is_none());
     }
 
     #[test]

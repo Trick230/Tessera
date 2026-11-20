@@ -15,6 +15,7 @@ add_library(tessera_d3d11 SHARED
   memory.cpp
   flip.cpp
   shaders.cpp
+  workset.cpp
   exports_d3d11.asm
   exports_d3d11.def)
 

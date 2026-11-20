@@ -50,6 +50,8 @@ export struct SessionInfo {
     frames: string,
     frametime: string,
     created: string,
+    // M11: sampled textures bound during play against those alive.
+    in-use: string,
     shaders: string,
     display: string,
     note: string,
@@ -709,6 +711,7 @@ component Detail inherits Rectangle {
                         InfoRow { label: "Frames"; value: root.session.frames; }
                         InfoRow { label: "Frame time"; value: root.session.frametime; }
                         InfoRow { label: "Resources"; value: root.session.created; }
+                        if root.session.in-use != "": InfoRow { label: "Textures used"; value: root.session.in-use; }
                         if root.session.shaders != "": InfoRow { label: "Shaders"; value: root.session.shaders; }
                         InfoRow { label: "Display"; value: root.session.display; }
                         if root.session.note != "": InfoRow { label: "Notes"; value: root.session.note; }

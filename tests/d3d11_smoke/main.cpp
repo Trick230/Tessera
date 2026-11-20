@@ -173,6 +173,16 @@ int run(bool crash) {
     ID3D11ShaderResourceView* srv = nullptr;
     hr = dev->CreateShaderResourceView(texs[0], nullptr, &srv);
     if (FAILED(hr)) return fail("CreateShaderResourceView", hr);
+    // M11: bind the first texture on two stages for 1.5 s, so a working-set
+    // tick sees exactly one of the ten as used.
+    for (int i = 0; i < 150; ++i) {
+        ctx->PSSetShaderResources(0, 1, &srv);
+        ctx->CSSetShaderResources(3, 1, &srv);
+        ID3D11ShaderResourceView* none = nullptr;
+        ctx->PSSetShaderResources(0, 1, &none);
+        sc1->Present(0, 0);
+        Sleep(10);
+    }
     D3D11_BUFFER_DESC bd = {};
     bd.ByteWidth = 64 * 1024;
     bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
@@ -257,6 +267,8 @@ int verify(const wchar_t* dir, int fps) {
     uint32_t dropped = 0, max_frame_us = 0;
     int prio_buffers = 0, prio_tex = 0, foreign = 0, vram = 0, flipped = 0, shaders = 0, shaders_new = 0;
     uint32_t budget_mb = 0, usage_mb = 0, cap_mb = 0;
+    int workset = 0;
+    uint32_t used_kb = 0, alive = 0, untracked = 0, tiled = 0;
     std::vector<uint32_t> paced;  // frame times of frames the limiter waited for
     TesseraRecord r;
     while (fread(&r, sizeof r, 1, f) == 1) {
@@ -278,7 +290,13 @@ int verify(const wchar_t* dir, int fps) {
                 if (r.flags & TESSERA_FLAG_FOREIGN) ++foreign;
                 break;
             case TESSERA_REC_SRV: ++srvs; break;
-            case TESSERA_REC_DEVICE: ++devices; break;
+            case TESSERA_REC_DEVICE: ++devices; tiled = r.b; break;
+            case TESSERA_REC_WORKSET:
+                ++workset;
+                if (r.a > used_kb) used_kb = r.a;
+                if (r.c > alive) alive = r.c;
+                untracked = r.d;
+                break;
             case TESSERA_REC_SWAPCHAIN:
                 ++swapchains;
                 if (r.d & 0x100) ++flipped;
@@ -323,12 +341,73 @@ int verify(const wchar_t* dir, int fps) {
     } else if (!paced.empty()) {
         return fail("limiter waited with no fps_limit");
     }
+    // M11: 1398128 bytes (one BC7 1024^2 full chain) = 1365 KB bound; the
+    // render target and the swapchain buffers are not sampled textures.
+    std::printf("workset samples %d, max used %u KB, max alive %u, untracked %u, tiled tier %u\n", workset, used_kb,
+                alive, untracked, tiled);
+    if (workset < 1 || used_kb != 1365 || alive != 10 || untracked != 0) return fail("working set");
     std::printf("OK: session verified\n");
     return 0;
 }
 }  // namespace
 
+// Cost of the bind hooks (M11): 2M PSSetShaderResources of 16 views, taken
+// in turn from 4096 so lookups miss the cache as in a game.
+int bench() {
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev,
+                                   nullptr, &ctx);
+    if (FAILED(hr)) return fail("D3D11CreateDevice", hr);
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = td.Height = 64;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_BC1_UNORM;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    // Many live views bound in random order on tables that already saw churn
+    // (tombstones): the cache-missing case of a real game, not a hot loop.
+    constexpr int kViews = 24576, kChurn = 8192;
+    std::vector<ID3D11Texture2D*> t(kViews);
+    std::vector<ID3D11ShaderResourceView*> v(kViews);
+    for (int pass = 0; pass < 2; ++pass) {
+        const int n = pass == 0 ? kChurn : kViews;
+        for (int i = 0; i < n; ++i) {
+            if (FAILED(dev->CreateTexture2D(&td, nullptr, &t[i])) ||
+                FAILED(dev->CreateShaderResourceView(t[i], nullptr, &v[i])))
+                return fail("bench resources");
+        }
+        if (pass == 0)
+            for (int i = 0; i < n; ++i) {
+                v[i]->Release();
+                t[i]->Release();
+            }
+    }
+    std::vector<ID3D11ShaderResourceView*> order(v);
+    uint32_t seed = 12345;
+    for (int i = kViews - 1; i > 0; --i) {
+        seed = seed * 1664525u + 1013904223u;
+        std::swap(order[i], order[seed % (i + 1)]);
+    }
+    LARGE_INTEGER f, a, b;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&a);
+    constexpr int kCalls = 2000000;
+    for (int i = 0; i < kCalls; ++i)
+        ctx->PSSetShaderResources(0, 16, &order[static_cast<size_t>(i) * 16 * 61 % (kViews - 16)]);
+    QueryPerformanceCounter(&b);
+    std::printf("bench: %.1f ns per 16-view bind\n", (b.QuadPart - a.QuadPart) * 1e9 / f.QuadPart / kCalls);
+    for (int i = 0; i < kViews; ++i) {
+        v[i]->Release();
+        t[i]->Release();
+    }
+    ctx->Release();
+    dev->Release();
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0) return bench();
     if (argc >= 3 && wcscmp(argv[1], L"--verify") == 0) return verify(argv[2], argc >= 4 ? _wtoi(argv[3]) : 0);
     return run(argc >= 2 && wcscmp(argv[1], L"--crash") == 0);
 }

@@ -3,6 +3,7 @@
 #include "hooks.h"
 
 #include <windows.h>
+#include <d3d11_2.h>
 #include <intrin.h>
 
 #include "config.h"
@@ -14,6 +15,7 @@
 #include "pacing.h"
 #include "session.h"
 #include "vtable.h"
+#include "workset.h"
 
 namespace tessera {
 namespace {
@@ -137,11 +139,16 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
             r.flags |= TESSERA_FLAG_FOREIGN;
         else
             r.flags |= raise_priority(*out, d->Usage, d->MiscFlags, (d->BindFlags & kTargetBinds) != 0);
+        r.bytes = texture2d_bytes(*d);
+        // M11 tracks what M4 could manage: game textures that are only sampled.
+        if (!(r.flags & TESSERA_FLAG_FOREIGN) && (d->BindFlags & D3D11_BIND_SHADER_RESOURCE) &&
+            !(d->BindFlags & kTargetBinds) && !(d->MiscFlags & kSharedMisc) &&
+            (d->Usage == D3D11_USAGE_DEFAULT || d->Usage == D3D11_USAGE_IMMUTABLE))
+            workset_on_texture(*out, r.bytes);
         r.a = d->Width;
         r.b = d->Height;
         r.c = d->MipLevels | (d->ArraySize << 8);
         r.d = static_cast<uint32_t>(d->Usage) | (d->MiscFlags << 8);
-        r.bytes = texture2d_bytes(*d);
         session_push(r);
     }
     return hr;
@@ -149,6 +156,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
 
 HRESULT STDMETHODCALLTYPE hk_CreateSRV(ID3D11Device* self, ID3D11Resource* res,
                                        const D3D11_SHADER_RESOURCE_VIEW_DESC* d, ID3D11ShaderResourceView** out) {
+    void* const ret = _ReturnAddress();
     Depth depth;
     using F = decltype(&hk_CreateSRV);
     const HRESULT hr = orig<F>(g_create_srv, self)(self, res, d, out);
@@ -161,6 +169,8 @@ HRESULT STDMETHODCALLTYPE hk_CreateSRV(ID3D11Device* self, ID3D11Resource* res,
             r.a = static_cast<uint32_t>(d->ViewDimension);
         }
         session_push(r);
+        // Views made by overlays and SDKs are theirs: no private data on them.
+        if (is_game_code(ret)) workset_on_srv(res, *out);
     }
     return hr;
 }
@@ -394,12 +404,17 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
     r.qpc = now_qpc();
     r.kind = TESSERA_REC_DEVICE;
     r.a = static_cast<uint32_t>(dev->GetFeatureLevel());
+    // C4: what later modules may rely on; each checks this and stays off without it.
+    D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
+    if (SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)))
+        r.b = static_cast<uint32_t>(o1.TiledResourcesTier);
     r.d = create_flags;
     session_push(r);
 
     const bool ok = vt_hook(g_create_buffer, dev) && vt_hook(g_create_tex2d, dev) && vt_hook(g_create_srv, dev);
-    logf("device fl 0x%x flags 0x%x, device hooks %s", r.a, create_flags, ok ? "ok" : "FAILED");
+    logf("device fl 0x%x flags 0x%x tiled tier %u, device hooks %s", r.a, create_flags, r.b, ok ? "ok" : "FAILED");
     memory_on_device(dev);
+    workset_on_device(dev);
     shaders_on_device(dev);
 
     IDXGIDevice* dxgi = nullptr;
