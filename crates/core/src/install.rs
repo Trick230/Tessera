@@ -110,6 +110,61 @@ fn write_ini(dir: &Path, next: &str) -> io::Result<()> {
     fs::write(dir.join(INI), out)
 }
 
+/// Per-game switches the layer reads from tessera.ini (src/dll/config.cpp).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settings {
+    pub process: bool,
+    pub residency: bool,
+    /// 0 = off.
+    pub fps_limit: u32,
+    /// Budget cap reported to the game, 0 = off.
+    pub vram_budget_mb: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { process: true, residency: true, fps_limit: 0, vram_budget_mb: 0 }
+    }
+}
+
+const SETTING_KEYS: [&str; 4] = ["process", "residency", "fps_limit", "vram_budget_mb"];
+
+pub fn settings(dir: &Path) -> Settings {
+    let mut s = Settings::default();
+    let text = fs::read_to_string(dir.join(INI)).unwrap_or_default();
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let v: u32 = v.trim().parse().unwrap_or(0);
+        match k.trim().to_ascii_lowercase().as_str() {
+            "process" => s.process = v != 0,
+            "residency" => s.residency = v != 0,
+            "fps_limit" => s.fps_limit = v,
+            "vram_budget_mb" => s.vram_budget_mb = v,
+            _ => {}
+        }
+    }
+    s
+}
+
+/// Rewrites our keys in tessera.ini and keeps every other line (`next=`, manual keys).
+pub fn save_settings(dir: &Path, s: &Settings) -> io::Result<()> {
+    let old = fs::read_to_string(dir.join(INI)).unwrap_or_default();
+    let mut out = String::from("[tessera]\n");
+    for line in old.lines().map(str::trim) {
+        let key = line.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+        if line.is_empty() || line.starts_with('[') || SETTING_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "process={}\nresidency={}\nfps_limit={}\nvram_budget_mb={}\n",
+        s.process as u8, s.residency as u8, s.fps_limit, s.vram_budget_mb
+    ));
+    fs::write(dir.join(INI), out)
+}
+
 /// Removes our layer and restores a chained DLL to its original name.
 pub fn uninstall(dir: &Path) -> io::Result<InstallState> {
     let Some(m) = read_marker(dir) else {
@@ -176,5 +231,18 @@ mod tests {
         assert_eq!(fs::read(game.join("d3d11.dll")).unwrap(), b"reshade");
         assert!(!game.join("d3d11.next.dll").exists());
         assert!(!game.join(INI).exists());
+    }
+
+    #[test]
+    fn settings_round_trip_keeps_other_lines() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(settings(t.path()), Settings::default());
+        fs::write(t.path().join(INI), "[tessera]\nnext=d3d11.next.dll\nfps_limit=30\nmax_frame_latency=1\n").unwrap();
+        assert_eq!(settings(t.path()).fps_limit, 30);
+        let s = Settings { process: false, residency: true, fps_limit: 141, vram_budget_mb: 6144 };
+        save_settings(t.path(), &s).unwrap();
+        assert_eq!(settings(t.path()), s);
+        let ini = fs::read_to_string(t.path().join(INI)).unwrap();
+        assert!(ini.starts_with("[tessera]\nnext=d3d11.next.dll\nmax_frame_latency=1\n"), "{ini}");
     }
 }
