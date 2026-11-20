@@ -23,6 +23,9 @@ fn main() {
                 s.buffers,
                 s.buffer_bytes as f64 / 1048576.0
             );
+            println!("hitches    {} creating resources, {} other", s.hitches_creating, s.hitches - s.hitches_creating);
+            println!("layer      limited {} frames ({:.1} s waited), {} prioritized, {} foreign",
+                s.limited_frames, s.limiter_wait_s, s.prioritized, s.foreign);
             println!("display    {:?}, feature level {:#x}", s.swapchain, s.feature_level);
         }
         Err(e) => {

@@ -3,6 +3,7 @@
 //! installation of the graphics layer. Never touches a running game.
 
 pub mod anticheat;
+pub mod driver;
 pub mod engine;
 pub mod game;
 pub mod install;

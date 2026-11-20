@@ -19,6 +19,16 @@ pub const REC_DEVICE: u16 = 5;
 pub const REC_SWAPCHAIN: u16 = 6;
 pub const REC_END: u16 = 0xFFFF;
 
+/// Resource created by code outside the game's folder (overlay, SDK).
+pub const FLAG_FOREIGN: u32 = 0x8000_0000;
+/// Eviction priority raised by the layer (M2).
+pub const FLAG_PRIORITY: u32 = 0x4000_0000;
+
+/// A hitch counts as caused by resource creation when the game created at
+/// least this many resources or bytes during that frame.
+const HITCH_CREATE_COUNT: u32 = 8;
+const HITCH_CREATE_BYTES: u64 = 4 << 20;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Record {
     pub qpc: u64,
@@ -61,6 +71,17 @@ pub struct Summary {
     pub frame_max_ms: f64,
     /// Frames slower than twice the median: the stutters a player notices.
     pub hitches: u64,
+    /// D2 (basic): hitches in frames where the game created many resources
+    /// (streaming or loading); the rest are other causes (shaders, I/O,
+    /// game logic) that the layer does not record yet.
+    pub hitches_creating: u64,
+    /// Frames the frame limiter waited for (P1), and its total wait in seconds.
+    pub limited_frames: u64,
+    pub limiter_wait_s: f64,
+    /// Resources made by other modules (overlays, SDKs), left untouched.
+    pub foreign: u64,
+    /// Resources the layer raised to maximum eviction priority (M2).
+    pub prioritized: u64,
     pub textures: u64,
     pub texture_bytes: u64,
     pub buffers: u64,
@@ -167,18 +188,39 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
     }
     let mut s = Summary { header, ..Default::default() };
     let mut frame_us: Vec<u32> = Vec::with_capacity((b.len() - hs) / rs);
+    // Frames during which the game created many resources, by index into frame_us.
+    let mut creating: Vec<bool> = Vec::with_capacity(frame_us.capacity());
+    let (mut made, mut made_bytes) = (0u32, 0u64);
+    let mut limiter_us = 0u64;
     let (mut first, mut last) = (u64::MAX, 0u64);
     for r in records(b, hs, rs) {
         if r.kind != REC_END {
             first = first.min(r.qpc);
             last = last.max(r.qpc);
         }
+        if matches!(r.kind, REC_TEXTURE2D | REC_BUFFER) {
+            if r.flags & FLAG_FOREIGN != 0 {
+                s.foreign += 1;
+            } else {
+                made += 1;
+                made_bytes = made_bytes.saturating_add(r.bytes);
+            }
+            if r.flags & FLAG_PRIORITY != 0 {
+                s.prioritized += 1;
+            }
+        }
         match r.kind {
             REC_FRAME => {
                 s.frames += 1;
                 if r.a != 0 && r.a != u32::MAX {
                     frame_us.push(r.a);
+                    creating.push(made >= HITCH_CREATE_COUNT || made_bytes >= HITCH_CREATE_BYTES);
                 }
+                if r.b != 0 {
+                    s.limited_frames += 1;
+                    limiter_us += r.b as u64;
+                }
+                (made, made_bytes) = (0, 0);
             }
             REC_TEXTURE2D => {
                 s.textures += 1;
@@ -200,17 +242,25 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
     if last > first {
         s.duration_s = (last - first) as f64 / s.header.qpc_frequency as f64;
     }
+    s.limiter_wait_s = limiter_us as f64 / 1e6;
     if !frame_us.is_empty() {
         let sum: u64 = frame_us.iter().map(|&v| v as u64).sum();
         s.frame_avg_ms = sum as f64 / frame_us.len() as f64 / 1000.0;
-        frame_us.sort_unstable();
+        let mut sorted = frame_us.clone();
+        sorted.sort_unstable();
         let ms = |v: u32| v as f64 / 1000.0;
-        let p50 = percentile(&frame_us, 50.0);
+        let p50 = percentile(&sorted, 50.0);
         s.frame_p50_ms = ms(p50);
-        s.frame_p99_ms = ms(percentile(&frame_us, 99.0));
-        s.frame_p999_ms = ms(percentile(&frame_us, 99.9));
-        s.frame_max_ms = ms(*frame_us.last().unwrap());
-        s.hitches = frame_us.iter().filter(|&&v| v > p50.saturating_mul(2)).count() as u64;
+        s.frame_p99_ms = ms(percentile(&sorted, 99.0));
+        s.frame_p999_ms = ms(percentile(&sorted, 99.9));
+        s.frame_max_ms = ms(*sorted.last().unwrap());
+        let limit = p50.saturating_mul(2);
+        for (&v, &c) in frame_us.iter().zip(&creating) {
+            if v > limit {
+                s.hitches += 1;
+                s.hitches_creating += c as u64;
+            }
+        }
     }
     Ok(s)
 }
@@ -338,10 +388,14 @@ mod tests {
     }
 
     fn rec(b: &mut Vec<u8>, qpc: u64, kind: u16, a: u32, bb: u32, bytes: u64) {
+        rec_flags(b, qpc, kind, 0, a, bb, bytes)
+    }
+
+    fn rec_flags(b: &mut Vec<u8>, qpc: u64, kind: u16, flags: u32, a: u32, bb: u32, bytes: u64) {
         b.extend_from_slice(&qpc.to_le_bytes());
         b.extend_from_slice(&kind.to_le_bytes());
         b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&flags.to_le_bytes());
         for v in [a, bb, 0, 0] {
             b.extend_from_slice(&v.to_le_bytes());
         }
@@ -377,6 +431,30 @@ mod tests {
         assert_eq!(s.frame_max_ms, 50.0);
         assert_eq!(s.hitches, 1);
         assert!((s.duration_s - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attributes_hitches_and_counts_layer_actions() {
+        let mut b = header(1_000_000);
+        rec(&mut b, 0, REC_FRAME, 0, 0, 0);
+        for i in 0..98u64 {
+            rec(&mut b, 1 + i, REC_FRAME, 10_000, 2_000, 0); // limited: waited 2 ms
+        }
+        // Hitch 1: the game streams 10 textures in that frame.
+        for i in 0..10u64 {
+            rec_flags(&mut b, 200 + i, REC_TEXTURE2D, FLAG_PRIORITY, 64, 64, 100);
+        }
+        rec(&mut b, 300, REC_FRAME, 40_000, 0, 0);
+        // Hitch 2: only foreign creations (an overlay), so "other cause".
+        for i in 0..10u64 {
+            rec_flags(&mut b, 400 + i, REC_BUFFER, FLAG_FOREIGN, 64, 0, 64);
+        }
+        rec(&mut b, 500, REC_FRAME, 40_000, 0, 0);
+        let s = summarize(&b).unwrap();
+        assert_eq!((s.hitches, s.hitches_creating), (2, 1));
+        assert_eq!((s.foreign, s.prioritized), (10, 10));
+        assert_eq!(s.limited_frames, 98);
+        assert!((s.limiter_wait_s - 0.196).abs() < 1e-9);
     }
 
     #[test]

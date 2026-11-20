@@ -143,7 +143,16 @@ fn session_info(exe: &Path) -> SessionInfo {
         num(sum.frame_p999_ms, 1),
         num(sum.frame_max_ms, 1)
     ));
-    info.hitches = s(format!("{} frames acima do dobro da mediana", sum.hitches));
+    info.hitches = s(if sum.hitches > 0 {
+        format!(
+            "{} frames acima do dobro da mediana ({} a criar recursos, {} outras causas)",
+            sum.hitches,
+            sum.hitches_creating,
+            sum.hitches - sum.hitches_creating
+        )
+    } else {
+        "nenhum".to_string()
+    });
     info.vram = s(format!(
         "≈ {} criados ({} texturas, {}; {} buffers, {})",
         size(sum.vram_bytes()),
