@@ -18,4 +18,5 @@ add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/W4> $<$<COMPILE_LANGUAGE:C,CXX>
                     $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
 
 add_subdirectory(src/dll)
+add_subdirectory(src/warm)
 add_subdirectory(tests/d3d11_smoke)

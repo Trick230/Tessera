@@ -10,8 +10,10 @@ pub mod install;
 pub mod library;
 pub mod pe;
 pub mod paths;
+pub mod scan;
 pub mod session;
 pub mod shaders;
+pub mod warm;
 
 pub use game::{analyze, analyze_all, GameInfo};
 pub use library::{discover, GameEntry, Store};

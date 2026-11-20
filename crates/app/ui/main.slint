@@ -14,6 +14,7 @@ export struct GameRow {
     installed: bool,
     blocked: bool,
     can-install: bool,
+    d3d11: bool,
 }
 
 // Last session recorded by the layer for the selected game.
@@ -222,6 +223,7 @@ component Detail inherits VerticalLayout {
     callback uninstall();
     callback open-folder();
     callback reset-safe-mode();
+    callback warm-shaders();
     callback settings-changed(bool, bool, bool, int, int);
     padding: 32px;
     spacing: 18px;
@@ -255,6 +257,7 @@ component Detail inherits VerticalLayout {
                     clicked => { root.install(); }
                 }
                 if game.installed: Button { text: "Desinstalar"; enabled: !busy; clicked => { root.uninstall(); } }
+                if game.d3d11: Button { text: "Preparar shaders"; enabled: !busy; clicked => { root.warm-shaders(); } }
                 Button { text: "Abrir pasta"; clicked => { root.open-folder(); } }
             }
         }
@@ -428,6 +431,7 @@ export component MainWindow inherits Window {
     callback refresh();
     callback select(int);
     callback reset-safe-mode(int);
+    callback warm-shaders(int);
     callback add-folder();
     callback filter-changed(string);
     callback install(int);
@@ -466,7 +470,7 @@ export component MainWindow inherits Window {
                         clicked => { root.selected = i; root.select(i); }
                     }
                 }
-                Button { text: "Adicionar pasta de jogo…"; clicked => { root.add-folder(); } }
+                Button { text: "Adicionar pasta de jogo…"; enabled: !root.busy; clicked => { root.add-folder(); } }
             }
         }
         VerticalLayout {
@@ -485,6 +489,7 @@ export component MainWindow inherits Window {
                     session: root.session;
                     settings: root.settings;
                     reset-safe-mode => { root.reset-safe-mode(root.selected); }
+                    warm-shaders => { root.warm-shaders(root.selected); }
                     install => { root.install(root.selected); }
                     uninstall => { root.uninstall(root.selected); }
                     open-folder => { root.open-folder(root.selected); }

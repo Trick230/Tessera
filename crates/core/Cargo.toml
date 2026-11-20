@@ -5,10 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+flate2 = "1.1.11"
+lz4_flex = "0.14.2"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 object = { version = "0.41.0", default-features = false, features = ["read_core", "pe", "std"] }
 rayon = "1.12.0"
+ruzstd = "0.9.1"
 serde_json = "1.0.154"
 walkdir = "2.5.0"
 winreg = "0.56.0"

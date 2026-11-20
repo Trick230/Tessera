@@ -5,6 +5,7 @@ param([string]$Config = "Release")
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "build\tests\d3d11_smoke\$Config\d3d11_smoke.exe"
+$layer = Join-Path $root "target\release\examples\layer.exe"
 $data = Join-Path $root "build\smoke-data"
 if (Test-Path $data) { Remove-Item -Recurse -Force $data }
 $env:TESSERA_DATA_DIR = $data
@@ -38,13 +39,23 @@ try {
     # S6: two shaders stored once each across both runs (header 24 + 2 index entries of 16).
     $idx = Get-ChildItem "$data\shaders\d3d11_smoke.exe-*.tshi"
     Check "shader store has 2 shaders" ($idx.Count -eq 1 -and $idx[0].Length -eq 56)
+    # S5: the warm-up compiles both, then a second run finds nothing left to do.
+    $warm = Join-Path $root "build\src\warm\$Config\tessera_warm.exe"
+    $base = $idx[0].FullName -replace '\.tshi$', ''
+    $w1 = & $warm $base
+    Check "warm-up compiles 2 shaders" ($LASTEXITCODE -eq 0 -and "$w1" -match "compiled now 2, failed now 0")
+    $w2 = & $warm $base
+    Check "warm-up resumes with nothing left" ($LASTEXITCODE -eq 0 -and "$w2" -match "compiled now 0, failed now 0, skipped now 0, total ok 2")
+    # The app path: copy under the game's exe name, run, read the log back.
+    $w3 = & $layer warm $exe $warm
+    Check "app warm-up reads the log" ($LASTEXITCODE -eq 0 -and "$w3" -match "warm log: ok 2 failed 0")
+    Check "warm copy has the game's exe name" (@(Get-ChildItem "$data\warm\*\d3d11_smoke.exe").Count -eq 1)
 } finally { Remove-Item $ini; Remove-Item Env:TESSERA_SMOKE_CAP_MB }
 
 & $exe --crash | Out-Null
 & $exe --crash | Out-Null
 Check "counter after two crashes" ((Get-Content $counter) -eq "2")
 # The app computes the same path key (crates/core/src/session.rs).
-$layer = Join-Path $root "target\release\examples\layer.exe"
 Check "app reads the same counter" ((& $layer crashes $exe) -eq "2")
 $before = (Get-ChildItem "$data\sessions\*.tsess").Count
 & $exe | Write-Host

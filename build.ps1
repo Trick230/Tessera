@@ -20,6 +20,7 @@ try {
     & $cmake --build build --config Release
     if ($LASTEXITCODE) { throw "cmake build failed" }
     Copy-Item build\src\dll\Release\tessera_d3d11.dll target\release\tessera_d3d11.dll -Force
+    Copy-Item build\src\warm\Release\tessera_warm.exe target\release\tessera_warm.exe -Force
     if ($Test) {
         cargo test -q -p tessera-core
         if ($LASTEXITCODE) { throw "core tests failed" }

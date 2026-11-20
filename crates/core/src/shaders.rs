@@ -74,6 +74,12 @@ fn index_entries(index: &[u8], store_len: u64) -> Vec<(u64, u64, u64)> {
     out
 }
 
+/// Hashes in the index (cheap: 16 bytes per shader).
+pub fn hashes_at(store: &Path, index: &Path) -> Vec<u64> {
+    let (Ok(meta), Ok(idx)) = (fs::metadata(store), fs::read(index)) else { return Vec::new() };
+    index_entries(&idx, meta.len()).iter().map(|e| e.0).collect()
+}
+
 /// Reads the index only (cheap: 16 bytes per shader).
 pub fn stats_at(store: &Path, index: &Path) -> StoreStats {
     let (Ok(meta), Ok(idx)) = (fs::metadata(store), fs::read(index)) else { return StoreStats::default() };
@@ -114,6 +120,58 @@ pub fn read_at(store: &Path, index: &Path) -> Vec<Shader> {
 
 pub fn read(exe: &Path) -> Vec<Shader> {
     store_paths(exe).map(|(s, i)| read_at(&s, &i)).unwrap_or_default()
+}
+
+fn header(magic: &[u8; 8], entry: usize) -> Vec<u8> {
+    let mut b = magic.to_vec();
+    for v in [VERSION, HEADER as u32, entry as u32, 0] {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+/// Store and index bytes in the layer's format, entries padded to 8.
+pub fn encode(shaders: &[Shader]) -> (Vec<u8>, Vec<u8>) {
+    let (mut s, mut i) = (header(STORE_MAGIC, ENTRY), header(INDEX_MAGIC, INDEX_ENTRY));
+    for sh in shaders {
+        s.extend_from_slice(&sh.hash.to_le_bytes());
+        s.extend_from_slice(&(sh.code.len() as u32).to_le_bytes());
+        s.extend_from_slice(&sh.stage.to_le_bytes());
+        s.extend_from_slice(&sh.flags.to_le_bytes());
+        s.extend_from_slice(&sh.code);
+        s.resize((s.len() + 7) & !7, 0);
+        i.extend_from_slice(&sh.hash.to_le_bytes());
+        i.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    }
+    (s, i)
+}
+
+/// Writes `<base>.tshd` and `<base>.tshi` whole (temp file, then rename):
+/// for stores the app owns, never the layer's live one.
+pub fn write_base(base: &Path, shaders: &[Shader]) -> std::io::Result<()> {
+    let (s, i) = encode(shaders);
+    if let Some(dir) = base.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    for (ext, bytes) in [("tshd", &s), ("tshi", &i)] {
+        let mut p = base.as_os_str().to_owned();
+        p.push(".");
+        p.push(ext);
+        let path = PathBuf::from(p);
+        let tmp = path.with_extension(format!("{ext}.tmp"));
+        fs::write(&tmp, bytes)?;
+        fs::rename(&tmp, &path)?;
+    }
+    Ok(())
+}
+
+pub fn read_base(base: &Path) -> Vec<Shader> {
+    let with = |ext: &str| {
+        let mut p = base.as_os_str().to_owned();
+        p.push(ext);
+        PathBuf::from(p)
+    };
+    read_at(&with(".tshd"), &with(".tshi"))
 }
 
 #[cfg(test)]

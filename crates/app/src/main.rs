@@ -69,6 +69,13 @@ fn row(g: &GameInfo) -> GameRow {
         installed: g.install.is_installed(),
         blocked: !g.anticheat.is_empty(),
         can_install: g.can_install(),
+        // S1/S5 only read the install and run outside the game: anti-cheat games too.
+        // A game that also has D3D12 gains nothing unless it runs on D3D11:
+        // shown once the layer has stored shaders it created.
+        d3d11: g.exe.as_ref().is_some_and(|e| {
+            let all = g.scan.all();
+            all.has(tessera_core::pe::ApiSet::D3D11) && (!all.has(tessera_core::pe::ApiSet::D3D12) || tessera_core::shaders::stats(e).shaders > 0)
+        }),
     }
 }
 
@@ -115,11 +122,43 @@ fn gb(mb: u32) -> String {
     format!("{} GB", num(mb as f64 / 1024.0, 1))
 }
 
+/// The coverage meter (S6): shaders the last session created and how many
+/// were already known, shaders stored (layer + install scan), and how the
+/// last warm-up went.
+fn shader_text(exe: &Path, sum: Option<&session::Summary>) -> String {
+    let mut parts = Vec::new();
+    if let Some(sum) = sum.filter(|s| s.shaders > 0) {
+        parts.push(format!(
+            "{} criados em {} · {} % já conhecidos",
+            sum.shaders,
+            duration(sum.shader_create_ms / 1000.0),
+            (sum.shaders - sum.shaders_new) * 100 / sum.shaders
+        ));
+    }
+    let store = tessera_core::warm::stored(exe);
+    if store.shaders > 0 {
+        parts.push(format!("{} guardados ({})", store.shaders, size(store.bytes)));
+    }
+    let w = tessera_core::warm::stats(exe);
+    if w.ok + w.failed > 0 {
+        let mut t = format!("{} aquecidos", w.ok);
+        if w.failed > 0 {
+            t += &format!(", {} falharam", w.failed);
+        }
+        parts.push(t);
+    }
+    parts.join(" · ")
+}
+
 /// Fills the panel for the last session. Also returns the real VRAM budget
 /// seen in it (MB, 0 if unknown) for the budget cap choices.
 fn session_info(exe: &Path) -> (SessionInfo, u32) {
     let s = |v: String| SharedString::from(v);
-    let mut info = SessionInfo { safe_mode: session::safe_mode_active(exe), ..Default::default() };
+    let mut info = SessionInfo {
+        safe_mode: session::safe_mode_active(exe),
+        shaders: s(shader_text(exe, None)),
+        ..Default::default()
+    };
     let Some(path) = session::latest(exe) else { return (info, 0) };
     info.present = true;
     let sum = match session::summarize_file(&path) {
@@ -232,20 +271,7 @@ fn session_info(exe: &Path) -> (SessionInfo, u32) {
         size(sum.buffer_bytes),
         sum.prioritized
     ));
-    if sum.shaders > 0 {
-        // Coverage: shaders of this session that were already stored (what a
-        // warm-up can compile before the game asks for them).
-        let known = sum.shaders - sum.shaders_new;
-        let store = tessera_core::shaders::stats(exe);
-        info.shaders = s(format!(
-            "{} criados em {} · {} % já conhecidos · {} guardados ({})",
-            sum.shaders,
-            duration(sum.shader_create_ms / 1000.0),
-            known * 100 / sum.shaders,
-            store.shaders,
-            size(store.bytes)
-        ));
-    }
+    info.shaders = s(shader_text(exe, Some(&sum)));
     let fl = sum.feature_level;
     info.display = s(match sum.swapchain {
         Some((w, h)) => format!("{w}×{h} · D3D feature level {}_{}", fl >> 12, (fl >> 8) & 0xF),
@@ -397,12 +423,70 @@ fn refresh(ui: &MainWindow, state: &Shared) {
     });
 }
 
+fn app_dir() -> PathBuf {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default()
+}
+
 fn payload_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_default()
-        .join(PAYLOAD_D3D11)
+    app_dir().join(PAYLOAD_D3D11)
+}
+
+/// S1 + S5: finds shader bytecode in the install files (again only when the
+/// install changed), then compiles everything stored in the driver, off the
+/// UI thread.
+fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
+    let Some((exe, root)) = ({
+        let st = state.lock().unwrap();
+        st.view.get(view_idx as usize).and_then(|&gi| {
+            let g = &st.games[gi];
+            g.exe.clone().map(|e| (e, g.entry.root.clone()))
+        })
+    }) else {
+        return;
+    };
+    ui.set_busy(true);
+    ui.set_status_text("A preparar shaders…".into());
+    let (weak, state) = (ui.as_weak(), state.clone());
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        let status = |m: &'static str| {
+            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
+        };
+        let mut found = String::new();
+        let running = tessera_core::warm::is_running(&exe);
+        if !running && !tessera_core::scan::up_to_date(&exe, &root) {
+            status("A procurar shaders nos ficheiros do jogo (só leitura)…");
+            match tessera_core::scan::scan_game(&exe, &root) {
+                Ok(st) => found = format!("{} encontrados nos ficheiros · ", st.usable),
+                Err(e) => found = format!("procura falhou ({e}) · "),
+            }
+        }
+        status("A aquecer shaders (fora do jogo)…");
+        let result = tessera_core::warm::run(&exe, &app_dir().join(tessera_core::warm::WARM_EXE));
+        let msg = match result {
+            Ok(_) => {
+                let w = tessera_core::warm::stats(&exe);
+                format!(
+                    "Shaders: {found}{} prontos, {} falharam ({:.1} s)",
+                    w.ok,
+                    w.failed,
+                    t0.elapsed().as_secs_f64()
+                )
+            }
+            Err(e) => format!("Shaders: {found}{e}"),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_busy(false);
+            ui.set_status_text(msg.into());
+            // The selection may have moved while this ran: reload only this game.
+            let mut st = state.lock().unwrap();
+            let sel = ui.get_selected();
+            let same = st.view.get(sel as usize).is_some_and(|&gi| st.games[gi].exe.as_deref() == Some(&exe));
+            if same {
+                load_session(&ui, &mut st, sel, true);
+            }
+        });
+    });
 }
 
 /// Runs install/uninstall on the selected game and refreshes its row.
@@ -485,6 +569,10 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_status_text(msg.into());
             load_session(&ui, &mut st, i, true);
         });
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_warm_shaders(move |i| warm_action(&w.unwrap(), &s, i));
     }
     {
         let w = ui.as_weak();
