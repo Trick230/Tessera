@@ -3,8 +3,12 @@
 #include "hooks.h"
 
 #include <windows.h>
+#include <intrin.h>
 
+#include "config.h"
 #include "log.h"
+#include "module.h"
+#include "pacing.h"
 #include "session.h"
 #include "vtable.h"
 
@@ -71,8 +75,23 @@ F orig(const VtHook& h, void* self) {
     return reinterpret_cast<F>(vt_orig(h, self));
 }
 
+constexpr UINT kSharedMisc = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                              D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+
+// M2: render targets, depth, UAVs and GPU buffers of the game go to maximum
+// eviction priority, so under VRAM pressure the OS pages out sampled
+// textures first. Shared, staging and dynamic resources are left alone.
+// Returns TESSERA_FLAG_PRIORITY when applied.
+uint32_t raise_priority(ID3D11Resource* res, D3D11_USAGE usage, UINT misc, bool target) {
+    if (!config().residency || !target || (misc & kSharedMisc)) return 0;
+    if (usage != D3D11_USAGE_DEFAULT && usage != D3D11_USAGE_IMMUTABLE) return 0;
+    res->SetEvictionPriority(DXGI_RESOURCE_PRIORITY_MAXIMUM);
+    return TESSERA_FLAG_PRIORITY;
+}
+
 HRESULT STDMETHODCALLTYPE hk_CreateBuffer(ID3D11Device* self, const D3D11_BUFFER_DESC* d,
                                           const D3D11_SUBRESOURCE_DATA* init, ID3D11Buffer** out) {
+    void* const ret = _ReturnAddress();
     Depth depth;
     using F = decltype(&hk_CreateBuffer);
     const HRESULT hr = orig<F>(g_create_buffer, self)(self, d, init, out);
@@ -81,6 +100,12 @@ HRESULT STDMETHODCALLTYPE hk_CreateBuffer(ID3D11Device* self, const D3D11_BUFFER
         r.qpc = now_qpc();
         r.kind = TESSERA_REC_BUFFER;
         r.flags = d->BindFlags;
+        if (!is_game_code(ret))
+            r.flags |= TESSERA_FLAG_FOREIGN;
+        else
+            // Small buffers (constants, per-draw data) are many and suballocated
+            // by the driver: skip them, the call is a kernel round trip.
+            r.flags |= raise_priority(*out, d->Usage, d->MiscFlags, d->ByteWidth >= 64 * 1024);
         r.a = d->ByteWidth;
         r.d = static_cast<uint32_t>(d->Usage) | (d->MiscFlags << 8);
         r.bytes = d->ByteWidth;
@@ -91,6 +116,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateBuffer(ID3D11Device* self, const D3D11_BUFFER
 
 HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEXTURE2D_DESC* d,
                                              const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out) {
+    void* const ret = _ReturnAddress();
     Depth depth;
     using F = decltype(&hk_CreateTexture2D);
     const HRESULT hr = orig<F>(g_create_tex2d, self)(self, d, init, out);
@@ -100,6 +126,11 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
         r.kind = TESSERA_REC_TEXTURE2D;
         r.format = static_cast<uint16_t>(d->Format);
         r.flags = d->BindFlags;
+        constexpr UINT kTargetBinds = D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS;
+        if (!is_game_code(ret))
+            r.flags |= TESSERA_FLAG_FOREIGN;
+        else
+            r.flags |= raise_priority(*out, d->Usage, d->MiscFlags, (d->BindFlags & kTargetBinds) != 0);
         r.a = d->Width;
         r.b = d->Height;
         r.c = d->MipLevels | (d->ArraySize << 8);
@@ -201,7 +232,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForComposition(IDXGIFactory2* self, 
 
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
     Depth depth;
-    if (depth.outer() && !(flags & DXGI_PRESENT_TEST)) session_frame();
+    if (depth.outer() && !(flags & DXGI_PRESENT_TEST)) session_frame(pace_before_present(self));
     using F = decltype(&hk_Present);
     return orig<F>(g_present, self)(self, sync, flags);
 }
@@ -209,7 +240,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT flags,
                                       const DXGI_PRESENT_PARAMETERS* params) {
     Depth depth;
-    if (depth.outer() && !(flags & DXGI_PRESENT_TEST)) session_frame();
+    if (depth.outer() && !(flags & DXGI_PRESENT_TEST)) session_frame(pace_before_present(self));
     using F = decltype(&hk_Present1);
     return orig<F>(g_present1, self)(self, sync, flags, params);
 }
@@ -283,6 +314,7 @@ void on_swapchain(IDXGISwapChain* sc) {
         sc1->Release();
     }
     if (!ok) logf("present hook failed");
+    pacing_on_swapchain(sc);
 }
 
 void on_device(ID3D11Device* dev, UINT create_flags) {

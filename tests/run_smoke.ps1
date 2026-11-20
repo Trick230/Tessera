@@ -22,6 +22,19 @@ Check "one counter keyed by path" ($counter.Count -eq 1)
 $counter = $counter[0].FullName
 Check "counter cleared on clean exit" ((Get-Content $counter) -eq "0")
 
+$log = "$data\logs\d3d11_smoke.exe.log"
+Check "process tweaks logged" ((Select-String -Path $log -Pattern "process:" -Quiet))
+
+# Frame limiter (P1) from tessera.ini next to the layer.
+$ini = Join-Path (Split-Path $exe) "tessera.ini"
+Set-Content -Path $ini -Value "[tessera]`nfps_limit=60" -Encoding ascii
+try {
+    & $exe | Write-Host
+    Check "limited run" ($LASTEXITCODE -eq 0)
+    & $exe --verify "$data\sessions" 60 | Write-Host
+    Check "limiter holds 60 fps" ($LASTEXITCODE -eq 0)
+} finally { Remove-Item $ini }
+
 & $exe --crash | Out-Null
 & $exe --crash | Out-Null
 Check "counter after two crashes" ((Get-Content $counter) -eq "2")

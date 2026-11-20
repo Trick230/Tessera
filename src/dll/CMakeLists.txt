@@ -8,6 +8,10 @@ add_library(tessera_d3d11 SHARED
   vtable.cpp
   session.cpp
   log.cpp
+  config.cpp
+  module.cpp
+  process.cpp
+  pacing.cpp
   exports_d3d11.asm
   exports_d3d11.def)
 
@@ -16,3 +20,5 @@ target_include_directories(tessera_d3d11 PRIVATE ${PROJECT_SOURCE_DIR}/include $
 target_compile_definitions(tessera_d3d11 PRIVATE _HAS_EXCEPTIONS=0)
 target_compile_options(tessera_d3d11 PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHs-c- /GR- /Zi>)
 target_link_options(tessera_d3d11 PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+# winmm: timeBeginPeriod (P5). Only system libraries.
+target_link_libraries(tessera_d3d11 PRIVATE winmm)

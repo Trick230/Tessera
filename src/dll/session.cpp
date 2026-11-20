@@ -10,7 +10,10 @@
 #include <cstdio>
 #include <cwchar>
 
+#include "config.h"
 #include "log.h"
+#include "pacing.h"
+#include "process.h"
 
 namespace tessera {
 namespace {
@@ -155,8 +158,10 @@ void flush(bool final) {
 // TerminateProcess (no DLL detach) do not trip safe mode.
 DWORD WINAPI writer_main(void*) {
     bool stable = false;
+    unsigned tick = 0;
     while (WaitForSingleObject(g_stop, 250) == WAIT_TIMEOUT) {
         flush(false);
+        if ((++tick & 7) == 0) pacing_background_tick();  // every 2 s
         if (!stable) {
             const int64_t last = g_last_present.load(std::memory_order_relaxed);
             if (last && static_cast<uint64_t>(last) - g_init_qpc > 60 * static_cast<uint64_t>(g_freq.QuadPart)) {
@@ -234,6 +239,8 @@ BOOL CALLBACK init_once(PINIT_ONCE, void*, void**) {
         g_init_qpc = static_cast<uint64_t>(now.QuadPart);
     }
     g_started = true;
+    config_load();
+    if (config().process) apply_process_tweaks();
 
     g_ring = static_cast<Slot*>(VirtualAlloc(nullptr, kRing * sizeof(Slot), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     g_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -273,13 +280,14 @@ void session_push(TesseraRecord& r) {
     s.seq.store(i + 1, std::memory_order_release);
 }
 
-void session_frame() {
+void session_frame(uint32_t wait_us) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     const int64_t prev = g_last_present.exchange(now.QuadPart, std::memory_order_relaxed);
     TesseraRecord r = {};
     r.qpc = static_cast<uint64_t>(now.QuadPart);
     r.kind = TESSERA_REC_FRAME;
+    r.b = wait_us;
     // prev > now: two threads presenting (secondary swapchain); report 0.
     if (prev && prev <= now.QuadPart) {
         const uint64_t us = static_cast<uint64_t>(now.QuadPart - prev) * 1000000u / static_cast<uint64_t>(g_freq.QuadPart);

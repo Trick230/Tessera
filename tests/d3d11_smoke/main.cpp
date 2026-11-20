@@ -2,11 +2,13 @@
 // Smoke test for the d3d11 layer.
 //   d3d11_smoke            render through both creation paths, then exit cleanly
 //   d3d11_smoke --crash    create a device and die without DLL detach
-//   d3d11_smoke --verify <sessions dir>   check the newest session file
+//   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
+//       with fps, also check that the frame limiter held that rate
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -102,7 +104,20 @@ int run(bool crash) {
     render(dev, ctx, sc_comp, 30, false);
     sc_comp->Release();
 
-    // 10 BC7 1024^2 textures with full mip chains, 5 buffers, one SRV.
+    // 10 BC7 1024^2 textures with full mip chains, 5 buffers, one SRV,
+    // one render target (gets raised eviction priority, M2).
+    {
+        D3D11_TEXTURE2D_DESC rd = {};
+        rd.Width = rd.Height = 256;
+        rd.MipLevels = rd.ArraySize = 1;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.SampleDesc.Count = 1;
+        rd.BindFlags = D3D11_BIND_RENDER_TARGET;
+        ID3D11Texture2D* rt = nullptr;
+        hr = dev->CreateTexture2D(&rd, nullptr, &rt);
+        if (FAILED(hr)) return fail("CreateTexture2D rt", hr);
+        rt->Release();
+    }
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = td.Height = 1024;
     td.MipLevels = 0;
@@ -172,7 +187,7 @@ int run(bool crash) {
     return 0;
 }
 
-int verify(const wchar_t* dir) {
+int verify(const wchar_t* dir, int fps) {
     wchar_t pattern[MAX_PATH], path[MAX_PATH] = {};
     swprintf_s(pattern, L"%s\\*.tsess", dir);
     WIN32_FIND_DATAW fd;
@@ -197,12 +212,27 @@ int verify(const wchar_t* dir) {
     int frames = 0, tex = 0, bc7_full = 0, buffers = 0, srvs = 0, devices = 0, swapchains = 0, sc_comp = 0,
         end = 0;
     uint32_t dropped = 0, max_frame_us = 0;
+    int prio_buffers = 0, prio_tex = 0, foreign = 0;
+    std::vector<uint32_t> paced;  // frame times of frames the limiter waited for
     TesseraRecord r;
     while (fread(&r, sizeof r, 1, f) == 1) {
         switch (r.kind) {
-            case TESSERA_REC_FRAME: ++frames; if (r.a > max_frame_us) max_frame_us = r.a; break;
-            case TESSERA_REC_TEXTURE2D: ++tex; if (r.bytes == 1398128) ++bc7_full; break;
-            case TESSERA_REC_BUFFER: ++buffers; break;
+            case TESSERA_REC_FRAME:
+                ++frames;
+                if (r.a > max_frame_us) max_frame_us = r.a;
+                if (r.b && r.a) paced.push_back(r.a);
+                break;
+            case TESSERA_REC_TEXTURE2D:
+                ++tex;
+                if (r.bytes == 1398128) ++bc7_full;
+                if (r.flags & TESSERA_FLAG_PRIORITY) ++prio_tex;
+                if (r.flags & TESSERA_FLAG_FOREIGN) ++foreign;
+                break;
+            case TESSERA_REC_BUFFER:
+                ++buffers;
+                if (r.flags & TESSERA_FLAG_PRIORITY) ++prio_buffers;
+                if (r.flags & TESSERA_FLAG_FOREIGN) ++foreign;
+                break;
             case TESSERA_REC_SRV: ++srvs; break;
             case TESSERA_REC_DEVICE: ++devices; break;
             case TESSERA_REC_SWAPCHAIN:
@@ -219,12 +249,26 @@ int verify(const wchar_t* dir) {
     const bool ok = frames >= 210 && bc7_full == 10 && buffers >= 5 && srvs >= 1 && devices == 2 &&
                     swapchains >= 2 && sc_comp == 1 && end == 1 && dropped == 0;
     if (!ok) return fail("unexpected counts");
+    // M2: the 5 DEFAULT buffers and the render target, not the sampled BC7
+    // textures. C3: everything here is created by the exe, nothing foreign.
+    std::printf("priority buffers %d tex %d, foreign %d, paced frames %zu\n", prio_buffers, prio_tex, foreign,
+                paced.size());
+    if (prio_buffers < 5 || prio_tex != 1 || foreign != 0) return fail("residency / module flags");
+    if (fps > 0) {
+        if (paced.size() < 100) return fail("limiter did not wait");
+        std::sort(paced.begin(), paced.end());
+        const double median = paced[paced.size() / 2], target = 1e6 / fps;
+        std::printf("limiter: median %.0f us, target %.0f us\n", median, target);
+        if (median < target * 0.95 || median > target * 1.05) return fail("limiter off target");
+    } else if (!paced.empty()) {
+        return fail("limiter waited with no fps_limit");
+    }
     std::printf("OK: session verified\n");
     return 0;
 }
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc >= 3 && wcscmp(argv[1], L"--verify") == 0) return verify(argv[2]);
+    if (argc >= 3 && wcscmp(argv[1], L"--verify") == 0) return verify(argv[2], argc >= 4 ? _wtoi(argv[3]) : 0);
     return run(argc >= 2 && wcscmp(argv[1], L"--crash") == 0);
 }

@@ -10,7 +10,8 @@ bool session_init();
 
 // Lock-free; callable from any thread. Never blocks, never allocates.
 void session_push(TesseraRecord& r);
-void session_frame();
+// wait_us: time the frame limiter waited before this Present.
+void session_frame(uint32_t wait_us);
 
 // DllMain(DLL_PROCESS_DETACH): final flush, END record, clears the crash counter.
 void session_shutdown();

@@ -11,8 +11,15 @@
 #define TESSERA_SESSION_MAGIC "TSRSESS"  // 8 bytes with the terminator
 #define TESSERA_SESSION_VERSION 1u
 
+// Bit in `flags` of TEXTURE2D / BUFFER records: created by code outside the
+// game's folder (overlay, SDK, runtime); never managed by Tessera.
+#define TESSERA_FLAG_FOREIGN 0x80000000u
+// Bit in `flags` of TEXTURE2D / BUFFER records: eviction priority raised (M2).
+#define TESSERA_FLAG_PRIORITY 0x40000000u
+
 enum TesseraRecordKind {
-    TESSERA_REC_FRAME = 1,      // a = CPU frame time in us (0 on the first frame)
+    TESSERA_REC_FRAME = 1,      // a = CPU frame time in us (0 on the first frame),
+                                // b = frame limiter wait before this Present in us
     TESSERA_REC_TEXTURE2D = 2,  // a = width, b = height, c = mips | array << 8,
                                 // d = usage | misc << 8, flags = bind, bytes = estimate
     TESSERA_REC_BUFFER = 3,     // a = byte width, d = usage | misc << 8, flags = bind, bytes = a
