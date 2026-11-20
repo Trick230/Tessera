@@ -89,9 +89,25 @@ pub fn install(dir: &Path, payload: &Path, proxy: &str) -> io::Result<InstallSta
     }
 
     let next = chained.clone().unwrap_or_default();
-    fs::write(dir.join(INI), format!("[tessera]\nnext={next}\n"))?;
+    write_ini(dir, &next)?;
     fs::write(dir.join(MARKER), format!("proxy={proxy}\nchained={next}\n"))?;
     Ok(InstallState::Installed { proxy: proxy.to_string(), chained })
+}
+
+/// Writes `next=` into tessera.ini and keeps the other settings (the
+/// per-optimization switches) across reinstalls.
+fn write_ini(dir: &Path, next: &str) -> io::Result<()> {
+    let old = fs::read_to_string(dir.join(INI)).unwrap_or_default();
+    let mut out = format!("[tessera]\nnext={next}\n");
+    for line in old.lines().map(str::trim) {
+        let key = line.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+        if line.is_empty() || line.starts_with('[') || key == "next" {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    fs::write(dir.join(INI), out)
 }
 
 /// Removes our layer and restores a chained DLL to its original name.
@@ -148,9 +164,13 @@ mod tests {
         assert_eq!(fs::read(game.join("d3d11.next.dll")).unwrap(), b"reshade");
         assert!(fs::read_to_string(game.join(INI)).unwrap().contains("next=d3d11.next.dll"));
 
-        // Reinstall must not chain our own DLL.
+        // Reinstall must not chain our own DLL, and keeps the user's settings.
+        let ini = fs::read_to_string(game.join(INI)).unwrap();
+        fs::write(game.join(INI), format!("{ini}fps_limit=141\n")).unwrap();
         install(&game, &payload, PROXY_D3D11).unwrap();
         assert_eq!(fs::read(game.join("d3d11.next.dll")).unwrap(), b"reshade");
+        let ini = fs::read_to_string(game.join(INI)).unwrap();
+        assert_eq!(ini, "[tessera]\nnext=d3d11.next.dll\nfps_limit=141\n");
 
         uninstall(&game).unwrap();
         assert_eq!(fs::read(game.join("d3d11.dll")).unwrap(), b"reshade");
