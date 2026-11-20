@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Session log written by tessera.dll during play and read by the app on the
+// next launch. Source of truth for the format; the Rust side mirrors it.
+//
+// File: header, then fixed-size records until EOF. A file without a
+// TESSERA_REC_END record was cut short (crash or kill) and is still valid
+// up to its last whole record.
+#pragma once
+#include <stdint.h>
+
+#define TESSERA_SESSION_MAGIC "TSRSESS"  // 8 bytes with the terminator
+#define TESSERA_SESSION_VERSION 1u
+
+enum TesseraRecordKind {
+    TESSERA_REC_FRAME = 1,      // a = CPU frame time in us (0 on the first frame)
+    TESSERA_REC_TEXTURE2D = 2,  // a = width, b = height, c = mips | array << 8,
+                                // d = usage | misc << 8, flags = bind, bytes = estimate
+    TESSERA_REC_BUFFER = 3,     // a = byte width, d = usage | misc << 8, flags = bind, bytes = a
+    TESSERA_REC_SRV = 4,        // a = view dimension (0 if no desc)
+    TESSERA_REC_DEVICE = 5,     // a = feature level, d = create flags
+    TESSERA_REC_SWAPCHAIN = 6,  // a = width, b = height, c = buffers, d = swap effect, flags = desc flags
+    TESSERA_REC_END = 0xFFFF,   // a = records dropped (ring overrun), bytes = records written
+};
+
+#pragma pack(push, 1)
+typedef struct TesseraSessionHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t header_size;
+    uint32_t record_size;
+    uint32_t pid;
+    uint64_t qpc_frequency;
+    uint64_t start_qpc;
+    uint64_t start_filetime;   // UTC FILETIME
+    uint16_t exe_path[260];    // UTF-16, NUL-terminated
+} TesseraSessionHeader;
+
+typedef struct TesseraRecord {
+    uint64_t qpc;
+    uint16_t kind;
+    uint16_t format;  // DXGI_FORMAT where it applies
+    uint32_t flags;
+    uint32_t a, b, c, d;
+    uint64_t bytes;
+} TesseraRecord;
+#pragma pack(pop)
+
+#ifdef __cplusplus
+static_assert(sizeof(TesseraSessionHeader) == 568, "header layout");
+static_assert(sizeof(TesseraRecord) == 40, "record layout");
+#endif

@@ -42,7 +42,8 @@ impl GameInfo {
 
     /// Phase 0 layer only supports D3D11, and never with anti-cheat.
     pub fn can_install(&self) -> bool {
-        self.anticheat.is_empty() && self.exe.is_some() && self.scan.all().has(ApiSet::D3D11)
+        // The layer is x64 only.
+        self.anticheat.is_empty() && self.exe.is_some() && self.scan.is_64bit && self.scan.all().has(ApiSet::D3D11)
     }
 }
 
