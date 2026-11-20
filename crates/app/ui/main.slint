@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { Button, LineEdit, ListView } from "std-widgets.slint";
+import { Button, LineEdit, ListView, ScrollView } from "std-widgets.slint";
 
 export struct GameRow {
     name: string,
@@ -14,6 +14,19 @@ export struct GameRow {
     installed: bool,
     blocked: bool,
     can-install: bool,
+}
+
+// Last session recorded by the layer for the selected game.
+export struct SessionInfo {
+    present: bool,
+    when: string,
+    frames: string,
+    frametime: string,
+    hitches: string,
+    vram: string,
+    display: string,
+    note: string,
+    safe-mode: bool,
 }
 
 global Theme {
@@ -91,9 +104,11 @@ component InfoRow inherits HorizontalLayout {
 component Detail inherits VerticalLayout {
     in property <GameRow> game;
     in property <bool> busy;
+    in property <SessionInfo> session;
     callback install();
     callback uninstall();
     callback open-folder();
+    callback reset-safe-mode();
     padding: 32px;
     spacing: 20px;
     alignment: start;
@@ -137,6 +152,32 @@ component Detail inherits VerticalLayout {
         Button { text: "Desinstalar"; enabled: game.installed && !busy; clicked => { root.uninstall(); } }
         Button { text: "Abrir pasta"; clicked => { root.open-folder(); } }
     }
+    if session.safe-mode: HorizontalLayout {
+        spacing: 12px;
+        Text {
+            text: "Modo seguro ativo: a camada desligou-se depois de dois arranques que não terminaram bem.";
+            color: #fca5a5; font-size: 13px; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1;
+        }
+        Button { text: "Reativar camada"; clicked => { root.reset-safe-mode(); } }
+    }
+    if session.present: Rectangle {
+        background: Theme.card;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.line;
+        VerticalLayout {
+            padding: 18px;
+            spacing: 12px;
+            Text { text: "Última sessão"; color: Theme.text; font-size: 14px; font-weight: 600; }
+            InfoRow { label: "Quando"; value: session.when; }
+            InfoRow { label: "Frames"; value: session.frames; }
+            InfoRow { label: "Frametime"; value: session.frametime; }
+            InfoRow { label: "Stutters"; value: session.hitches; }
+            InfoRow { label: "VRAM (estim.)"; value: session.vram; }
+            InfoRow { label: "Ecrã"; value: session.display; }
+            if session.note != "": InfoRow { label: "Nota"; value: session.note; }
+        }
+    }
 }
 
 export component MainWindow inherits Window {
@@ -152,7 +193,10 @@ export component MainWindow inherits Window {
     in-out property <int> selected: -1;
     in property <string> status-text;
     in property <bool> busy;
+    in property <SessionInfo> session;
     callback refresh();
+    callback select(int);
+    callback reset-safe-mode(int);
     callback add-folder();
     callback filter-changed(string);
     callback install(int);
@@ -187,7 +231,7 @@ export component MainWindow inherits Window {
                     for g[i] in root.games: GameItem {
                         game: g;
                         selected: i == root.selected;
-                        clicked => { root.selected = i; }
+                        clicked => { root.selected = i; root.select(i); }
                     }
                 }
                 Button { text: "Adicionar pasta…"; clicked => { root.add-folder(); } }
@@ -195,13 +239,18 @@ export component MainWindow inherits Window {
         }
         VerticalLayout {
             horizontal-stretch: 1;
-            if root.selected >= 0 && root.selected < root.games.length: Detail {
+            if root.selected >= 0 && root.selected < root.games.length: ScrollView {
                 vertical-stretch: 1;
-                game: root.games[root.selected];
-                busy: root.busy;
-                install => { root.install(root.selected); }
-                uninstall => { root.uninstall(root.selected); }
-                open-folder => { root.open-folder(root.selected); }
+                Detail {
+                    width: parent.visible-width;
+                    game: root.games[root.selected];
+                    busy: root.busy;
+                    session: root.session;
+                    reset-safe-mode => { root.reset-safe-mode(root.selected); }
+                    install => { root.install(root.selected); }
+                    uninstall => { root.uninstall(root.selected); }
+                    open-folder => { root.open-folder(root.selected); }
+                }
             }
             if root.selected < 0 || root.selected >= root.games.length: Text {
                 vertical-stretch: 1;

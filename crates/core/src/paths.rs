@@ -17,8 +17,14 @@ pub fn is_bulk_dir(e: &DirEntry) -> bool {
     )
 }
 
-/// `%LOCALAPPDATA%\Tessera`
+/// `%LOCALAPPDATA%\Tessera`, or `TESSERA_DATA_DIR` when set (same rule as the layer).
 pub fn data_dir() -> PathBuf {
+    // The layer ignores values of MAX_PATH (260) UTF-16 units or more; do the same.
+    if let Some(d) = std::env::var_os("TESSERA_DATA_DIR")
+        .filter(|d| !d.is_empty() && std::os::windows::ffi::OsStrExt::encode_wide(d.as_os_str()).count() < 260)
+    {
+        return PathBuf::from(d);
+    }
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     base.join("Tessera")
 }

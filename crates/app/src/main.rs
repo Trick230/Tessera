@@ -6,9 +6,10 @@
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tessera_core::install::{self, InstallState};
-use tessera_core::{paths, GameInfo};
+use tessera_core::{paths, session, GameInfo};
 
 slint::include_modules!();
 
@@ -22,6 +23,8 @@ struct State {
     view: Vec<usize>,
     filter: String,
     folders: Vec<PathBuf>,
+    /// Executable whose last session the detail panel shows (or is loading).
+    shown_exe: Option<PathBuf>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -69,6 +72,122 @@ fn row(g: &GameInfo) -> GameRow {
     }
 }
 
+/// Decimal comma, as a Portuguese reader expects.
+fn num(v: f64, decimals: usize) -> String {
+    format!("{v:.decimals$}").replace('.', ",")
+}
+
+fn size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{} GB", num(b / (1024.0 * 1024.0 * 1024.0), 2))
+    } else {
+        format!("{} MB", num(b / (1024.0 * 1024.0), 1))
+    }
+}
+
+fn duration(s: f64) -> String {
+    if s < 10.0 {
+        return format!("{} s", num(s, 1));
+    }
+    let s = s.round() as u64;
+    match (s / 3600, s / 60 % 60, s % 60) {
+        (0, 0, sec) => format!("{sec} s"),
+        (0, m, sec) => format!("{m} min {sec} s"),
+        (h, m, _) => format!("{h} h {m} min"),
+    }
+}
+
+/// `<exe>_YYYYMMDD-HHMMSS_<pid>.tsess`: the layer names files by local start time.
+fn session_when(path: &Path) -> String {
+    let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut parts = name.rsplit('_');
+    let (_pid, stamp) = (parts.next(), parts.next().unwrap_or(""));
+    let d = stamp.as_bytes();
+    if stamp.is_ascii() && d.len() == 15 && d[8] == b'-' {
+        format!("{}/{}/{} {}:{}", &stamp[6..8], &stamp[4..6], &stamp[0..4], &stamp[9..11], &stamp[11..13])
+    } else {
+        name
+    }
+}
+
+fn session_info(exe: &Path) -> SessionInfo {
+    let s = |v: String| SharedString::from(v);
+    let mut info = SessionInfo { safe_mode: session::safe_mode_active(exe), ..Default::default() };
+    let Some(path) = session::latest(exe) else { return info };
+    let sum = match session::summarize_file(&path) {
+        Ok(v) => v,
+        Err(e) => {
+            info.present = true;
+            info.when = s(session_when(&path));
+            info.note = s(format!("Não foi possível ler {}: {e}", path.display()));
+            return info;
+        }
+    };
+    info.present = true;
+    info.when = s(format!(
+        "{} · {} · {}",
+        session_when(&path),
+        duration(sum.duration_s),
+        if sum.clean { "terminou bem" } else { "interrompida (crash ou fecho forçado)" }
+    ));
+    info.frames = s(if sum.frame_avg_ms > 0.0 {
+        format!("{} · média {} ms ({} fps)", sum.frames, num(sum.frame_avg_ms, 1), num(1000.0 / sum.frame_avg_ms, 0))
+    } else {
+        format!("{}", sum.frames)
+    });
+    info.frametime = s(format!(
+        "p50 {} ms · p99 {} ms · p99,9 {} ms · pior {} ms",
+        num(sum.frame_p50_ms, 1),
+        num(sum.frame_p99_ms, 1),
+        num(sum.frame_p999_ms, 1),
+        num(sum.frame_max_ms, 1)
+    ));
+    info.hitches = s(format!("{} frames acima do dobro da mediana", sum.hitches));
+    info.vram = s(format!(
+        "≈ {} criados ({} texturas, {}; {} buffers, {})",
+        size(sum.vram_bytes()),
+        sum.textures,
+        size(sum.texture_bytes),
+        sum.buffers,
+        size(sum.buffer_bytes)
+    ));
+    let fl = sum.feature_level;
+    info.display = s(match sum.swapchain {
+        Some((w, h)) => format!("{w}×{h} · D3D feature level {}_{}", fl >> 12, (fl >> 8) & 0xF),
+        None => "sem swapchain registada".into(),
+    });
+    if sum.dropped > 0 {
+        info.note = s(format!("{} registos perdidos (buffer cheio)", sum.dropped));
+    }
+    info
+}
+
+/// Loads the selected game's last session off the UI thread; a 1 h log is tens of MB.
+/// Skipped when the selected game did not change, unless `force`.
+fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
+    let exe = st.view.get(view_idx as usize).and_then(|&gi| st.games[gi].exe.clone());
+    if !force && exe == st.shown_exe {
+        return;
+    }
+    st.shown_exe = exe.clone();
+    // A newer load supersedes any still running, even for the same view index.
+    let gen = SESSION_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+    ui.set_session(SessionInfo::default());
+    let Some(exe) = exe else { return };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let info = session_info(&exe);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if SESSION_GEN.load(Ordering::Relaxed) == gen {
+                ui.set_session(info);
+            }
+        });
+    });
+}
+
+static SESSION_GEN: AtomicU64 = AtomicU64::new(0);
+
 fn apply_view(ui: &MainWindow, st: &mut State) {
     let f = st.filter.to_lowercase();
     st.view = (0..st.games.len()).filter(|&i| f.is_empty() || st.games[i].entry.name.to_lowercase().contains(&f)).collect();
@@ -78,6 +197,7 @@ fn apply_view(ui: &MainWindow, st: &mut State) {
     if sel >= st.view.len() as i32 {
         ui.set_selected(-1);
     }
+    load_session(ui, st, ui.get_selected(), false);
 }
 
 fn refresh(ui: &MainWindow, state: &Shared) {
@@ -94,6 +214,7 @@ fn refresh(ui: &MainWindow, state: &Shared) {
             let mut st = state.lock().unwrap();
             let n = games.len();
             st.games = games;
+            st.shown_exe = None; // a session may have been written since the last load
             apply_view(&ui, &mut st);
             ui.set_busy(false);
             ui.set_status_text(format!("{n} jogos analisados em {ms} ms").into());
@@ -170,6 +291,24 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_uninstall(move |i| layer_action(&w.unwrap(), &s, i, false));
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_select(move |i| load_session(&w.unwrap(), &mut s.lock().unwrap(), i, false));
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_reset_safe_mode(move |i| {
+            let ui = w.unwrap();
+            let mut st = s.lock().unwrap();
+            let Some(exe) = st.view.get(i as usize).and_then(|&gi| st.games[gi].exe.clone()) else { return };
+            let msg = match session::reset_safe_mode(&exe) {
+                Ok(()) => "Modo seguro desligado: a camada volta a carregar no próximo arranque".to_string(),
+                Err(e) => format!("Erro: {e}"),
+            };
+            ui.set_status_text(msg.into());
+            load_session(&ui, &mut st, i, true);
+        });
     }
     {
         let s = state.clone();

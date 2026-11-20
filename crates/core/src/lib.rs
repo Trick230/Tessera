@@ -9,6 +9,7 @@ pub mod install;
 pub mod library;
 pub mod pe;
 pub mod paths;
+pub mod session;
 
 pub use game::{analyze, analyze_all, GameInfo};
 pub use library::{discover, GameEntry, Store};
