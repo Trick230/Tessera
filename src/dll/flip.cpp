@@ -2,6 +2,7 @@
 #include "flip.h"
 
 #include <windows.h>
+#include <dxgi1_3.h>
 #include <dxgi1_5.h>
 
 #include <atomic>
@@ -24,6 +25,7 @@ struct Entry : IUnknown {
     std::atomic<unsigned> resizes{0};    // ResizeBuffers count: render targets saved before are stale
     ID3D11DeviceContext* ctx = nullptr;  // not owned: the swapchain keeps its device alive
     bool tearing = false;
+    HANDLE latency = nullptr;            // P3: frame latency waitable object, owned
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override {
         if (!out) return E_POINTER;
@@ -38,7 +40,11 @@ struct Entry : IUnknown {
     ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(++refs); }
     ULONG STDMETHODCALLTYPE Release() override {
         const long n = --refs;
-        if (n == 0) sc.store(nullptr, std::memory_order_release);
+        if (n == 0) {
+            if (latency) CloseHandle(latency);
+            latency = nullptr;
+            sc.store(nullptr, std::memory_order_release);
+        }
         return static_cast<ULONG>(n);
     }
 };
@@ -132,6 +138,7 @@ bool flip_convert(IUnknown* dev, bool game, const DXGI_SWAP_CHAIN_DESC& in, DXGI
     if (out->BufferCount < 2) out->BufferCount = 2;
     *tearing = tearing_supported();
     if (*tearing) out->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    if (config().max_frame_latency > 0) out->Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     return true;
 }
 
@@ -146,6 +153,7 @@ bool flip_convert1(IUnknown* dev, bool game, HWND wnd, const DXGI_SWAP_CHAIN_DES
     if (out->BufferCount < 2) out->BufferCount = 2;
     *tearing = tearing_supported();
     if (*tearing) out->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    if (config().max_frame_latency > 0) out->Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     return true;
 }
 
@@ -175,6 +183,18 @@ void flip_track(IDXGISwapChain* sc, IUnknown* dev, bool converted, bool tearing)
         if (!ok) e->sc.store(nullptr, std::memory_order_release);
     }
     ReleaseSRWLockExclusive(&g_lock);
+    // P3: the layer asked for a waitable swap chain; Present waits on it after
+    // the real Present, where the game's next frame starts.
+    const int lat = config().max_frame_latency;
+    IDXGISwapChain2* sc2 = nullptr;
+    DXGI_SWAP_CHAIN_DESC desc;
+    if (ok && lat > 0 && SUCCEEDED(sc->GetDesc(&desc)) && (desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) &&
+        SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc2)))) {
+        const bool set = SUCCEEDED(sc2->SetMaximumFrameLatency(static_cast<UINT>(lat)));
+        e->latency = set ? sc2->GetFrameLatencyWaitableObject() : nullptr;
+        sc2->Release();
+        logf("flip: max frame latency %d through the waitable object: %s", lat, e->latency ? "ok" : "failed");
+    }
     if (ok)
         logf("flip: swapchain converted to flip model%s", tearing ? " with tearing" : "");
     else  // another thread took the last slot between convert and track
@@ -194,6 +214,7 @@ UINT flip_before_present(IDXGISwapChain* sc, UINT sync, UINT flags, FlipFrame& f
         BOOL full = FALSE;
         if (SUCCEEDED(sc->GetFullscreenState(&full, nullptr)) && !full) flags |= DXGI_PRESENT_ALLOW_TEARING;
     }
+    if (!(flags & DXGI_PRESENT_TEST)) f.latency = e->latency;
     if (e->ctx && !(flags & DXGI_PRESENT_TEST)) {
         f.ctx = e->ctx;
         f.entry = e;
@@ -204,6 +225,8 @@ UINT flip_before_present(IDXGISwapChain* sc, UINT sync, UINT flags, FlipFrame& f
 }
 
 void flip_after_present(FlipFrame& f) {
+    // Bounded: a frame held up past this is a stall the wait must not add to.
+    if (f.latency) WaitForSingleObjectEx(f.latency, 100, FALSE);
     if (!f.ctx) return;
     UINT n = 0;
     for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
@@ -225,5 +248,6 @@ void flip_resize(IDXGISwapChain* sc, UINT* buffers, UINT* flags) {
     e->resizes.fetch_add(1, std::memory_order_acq_rel);
     if (*buffers == 1) *buffers = 2;
     if (e->tearing) *flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    if (e->latency) *flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;  // must match creation
 }
 }  // namespace tessera

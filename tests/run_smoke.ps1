@@ -27,10 +27,10 @@ $log = "$data\logs\d3d11_smoke.exe.log"
 Check "process tweaks logged" ((Select-String -Path $log -Pattern "process:" -Quiet))
 Check "above-normal priority (P5)" ((Select-String -Path $log -Pattern "above-normal priority ok" -Quiet))
 
-# Frame limiter (P1), budget cap (M1) and flip model (P2) from tessera.ini next to the layer.
+# Frame limiter (P1), budget cap (M1), flip model (P2) and frame latency (P3) from tessera.ini next to the layer.
 # ext_fps_limit: another tool limits to 50 below our 60, so ours runs just under 50.
 $ini = Join-Path (Split-Path $exe) "tessera.ini"
-Set-Content -Path $ini -Value "[tessera]`nfps_limit=60`next_fps_limit=50`nvram_budget_mb=2048`nflip_model=1" -Encoding ascii
+Set-Content -Path $ini -Value "[tessera]`nfps_limit=60`next_fps_limit=50`nvram_budget_mb=2048`nflip_model=1`nmax_frame_latency=1" -Encoding ascii
 $env:TESSERA_SMOKE_CAP_MB = "2048"
 try {
     & $exe | Write-Host
@@ -38,6 +38,7 @@ try {
     & $exe --verify "$data\sessions" 50 | Write-Host
     Check "limiter holds just under the other tool's 50 fps, budget capped, flip model" ($LASTEXITCODE -eq 0)
     Check "flip conversion logged" ((Select-String -Path $log -Pattern "converted to flip model" -Quiet))
+    Check "frame latency through the waitable object (P3)" ((Select-String -Path $log -Pattern "latency 1 through the waitable object: ok" -Quiet))
     # S6: two shaders stored once each across both runs (header 24 + 2 index entries of 16).
     $idx = Get-ChildItem "$data\shaders\d3d11_smoke.exe-*.tshi"
     Check "shader store has 2 shaders" ($idx.Count -eq 1 -and $idx[0].Length -eq 56)

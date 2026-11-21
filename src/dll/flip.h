@@ -30,6 +30,7 @@ struct FlipFrame {
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* dsv = nullptr;
     void* entry = nullptr;
+    HANDLE latency = nullptr;  // P3: waited on after the real Present
     unsigned resizes = 0;
     bool skip = false;  // DO_NOT_SEQUENCE on a converted swapchain: return S_OK, present nothing
 };
