@@ -346,7 +346,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
         if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
             managed = residency_present(self);
             session_frame(pace_before_present(self));
-            rtpool_frame();
+            rtpool_frame(self);
         }
         flags = flip_before_present(self, sync, flags, ff);
         if (ff.skip) return S_OK;
@@ -367,7 +367,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
         if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
             managed = residency_present(self);
             session_frame(pace_before_present(self));
-            rtpool_frame();
+            rtpool_frame(self);
         }
         flags = flip_before_present(self, sync, flags, ff);
         if (ff.skip) return S_OK;
@@ -384,7 +384,9 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* self, UINT buffers, U
     Depth depth;
     flip_resize(self, &buffers, &flags);  // also nested: DXGI resizes inside Present on fullscreen exit
     using F = decltype(&hk_ResizeBuffers);
-    return orig<F>(g_resize, self)(self, buffers, w, h, fmt, flags);
+    const HRESULT hr = orig<F>(g_resize, self)(self, buffers, w, h, fmt, flags);
+    if (SUCCEEDED(hr) && depth.outer()) rtpool_resize();
+    return hr;
 }
 
 void hook_factory(IDXGIFactory* f) {

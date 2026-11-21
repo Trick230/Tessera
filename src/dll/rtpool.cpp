@@ -134,11 +134,22 @@ void rtpool_stop(const char* why) {
     if (config().rt_recycle && !g_stop.exchange(true, std::memory_order_acq_rel)) logf("rtpool: off, %s", why);
 }
 
-void rtpool_frame() {
+namespace {
+// The device that presents through sc, compared by address only.
+ID3D11Device* device_of(IDXGISwapChain* sc) {
+    ID3D11Device* d = nullptr;
+    if (!sc || FAILED(sc->GetDevice(IID_PPV_ARGS(&d))) || !d) return nullptr;
+    d->Release();
+    return d;
+}
+}  // namespace
+
+void rtpool_frame(IDXGISwapChain* sc) {
     if (g_count.load(std::memory_order_relaxed) == 0 || !TryAcquireSRWLockExclusive(&g_lock)) return;
     Slot& s = g_slots[g_next];
     g_next = (g_next + 1) % kSlots;
     ID3D11Texture2D* drop = nullptr;
+    ID3D11Texture2D* over = nullptr;
     if (s.tex) {
         const ULONGLONG now = GetTickCount64();
         if (!released(s)) {
@@ -151,12 +162,35 @@ void rtpool_frame() {
                 s.idle_since = now;
                 g_idle_bytes += s.bytes;
             }
-            if (now - s.idle_since >= kIdleMs || g_idle_bytes > kMaxIdle || g_stop.load(std::memory_order_relaxed))
+            // A spare of a device that no longer presents (replaced) is not
+            // asked for again: freed now rather than after kIdleMs.
+            if (now - s.idle_since >= kIdleMs || g_stop.load(std::memory_order_relaxed) || s.dev != device_of(sc))
                 drop = empty(s);
         }
     }
+    // Over the cap: the spare unused the longest goes.
+    if (g_idle_bytes > kMaxIdle) {
+        Slot* oldest = nullptr;
+        for (Slot& o : g_slots)
+            if (o.tex && o.idle_since && (!oldest || o.idle_since < oldest->idle_since)) oldest = &o;
+        if (oldest) over = empty(*oldest);
+    }
     ReleaseSRWLockExclusive(&g_lock);
-    if (drop) drop->Release();  // outside the lock: the driver frees it
+    // Outside the lock: the driver frees them.
+    if (drop) drop->Release();
+    if (over) over->Release();
+}
+
+void rtpool_resize() {
+    if (g_count.load(std::memory_order_relaxed) == 0) return;
+    // Spares sized for the old resolution: the next creates will not match them.
+    ID3D11Texture2D* drop[kSlots];
+    int n = 0;
+    AcquireSRWLockExclusive(&g_lock);
+    for (Slot& s : g_slots)
+        if (s.tex && released(s)) drop[n++] = empty(s);
+    ReleaseSRWLockExclusive(&g_lock);
+    for (int i = 0; i < n; ++i) drop[i]->Release();
 }
 
 namespace {
@@ -245,8 +279,14 @@ TESSERA_VIEW_HOOK(hk_RTV1, g_rtv1, ID3D11Device3, D3D11_RENDER_TARGET_VIEW_DESC1
 
 void rtpool_on_device(ID3D11Device* dev, bool srv_ok) {
     if (!config().rt_recycle || g_stop.load(std::memory_order_acquire)) return;
-    // M3-M5 hooks CreateShaderResourceView1 itself: one hook per slot.
-    if (config().mip_residency) return rtpool_stop("while mip_residency is on");
+    // M3-M5 hooks CreateShaderResourceView1 itself: one hook per slot. It only
+    // runs on tiled resources tier 2 (residency.cpp); below that, no clash.
+    if (config().mip_residency) {
+        D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
+        if (SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) &&
+            o1.TiledResourcesTier >= D3D11_TILED_RESOURCES_TIER_2)
+            return rtpool_stop("while mip_residency is on");
+    }
     bool ok = srv_ok && vt_hook(g_uav, dev) && vt_hook(g_rtv, dev) && vt_hook(g_dsv, dev);
     ID3D11Device3* dev3 = nullptr;
     if (ok && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev3)))) {

@@ -28,6 +28,9 @@ void rtpool_on_view(ID3D11Resource* res, ID3D11View* view);
 // Kept ones are still watched and freed.
 void rtpool_stop(const char* why);
 // Present (outer, once per frame): looks at one kept texture; frees it when
-// the game has not used it for 30 s or the unused ones exceed 512 MB.
-void rtpool_frame();
+// the game has not used it for 30 s or its device is not the one presenting
+// through sc. Over 512 MB unused, the one unused longest goes.
+void rtpool_frame(IDXGISwapChain* sc);
+// ResizeBuffers succeeded: the unused ones are freed (sized for the old mode).
+void rtpool_resize();
 }  // namespace tessera
