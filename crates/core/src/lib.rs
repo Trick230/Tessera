@@ -16,6 +16,7 @@ pub mod scan;
 pub mod session;
 pub mod shader_check;
 pub mod shaders;
+pub mod uecvars;
 pub mod warm;
 
 pub use game::{analyze, analyze_all, GameInfo};

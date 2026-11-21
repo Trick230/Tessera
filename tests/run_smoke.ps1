@@ -75,6 +75,17 @@ try {
     Check "released render target reused, held ones and initial data left alone (R1)" ($LASTEXITCODE -eq 0)
 } finally { Remove-Item $ini }
 
+# U1: Unreal console variables from cvar.* lines (the mode writes tessera.ini with its own RVAs).
+try {
+    & $exe --uecvars | Write-Host
+    Check "console variables set, checked and restored (U1)" ($LASTEXITCODE -eq 0)
+    Check "bad console variable slots logged" ((Select-String -Path $log -Pattern "r.Test.Bad: object at" -Quiet) -and
+        (Select-String -Path $log -Pattern "r.Test.ReadOnly: slot" -Quiet) -and (Select-String -Path $log -Pattern "r.Test.Garbage: bad value" -Quiet) -and (Select-String -Path $log -Pattern "r.Test.Float moved" -Quiet))
+    & $exe --uecvars stale | Write-Host
+    Check "console variables left alone on another build (U1)" ($LASTEXITCODE -eq 0 -and
+        (Select-String -Path $log -Pattern "not the scanned build" -Quiet))
+} finally { if (Test-Path $ini) { Remove-Item $ini } }
+
 # M3-M5: managed textures lose their top mip while unbound and get it back before any read.
 Set-Content -Path $ini -Value "[tessera]`nmip_residency=1`nmip_force_evict=1" -Encoding ascii
 try {

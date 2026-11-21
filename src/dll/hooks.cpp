@@ -15,6 +15,7 @@
 #include "pacing.h"
 #include "residency.h"
 #include "rtpool.h"
+#include "uecvars.h"
 #include "session.h"
 #include "vtable.h"
 #include "workset.h"
@@ -378,6 +379,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
             managed = residency_present(self);
             session_frame(pace_before_present(self));
             rtpool_frame(self);
+            uecvars_frame();
         }
         flags = flip_before_present(self, sync, flags, ff);
         if (ff.skip) return S_OK;
@@ -400,6 +402,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
             managed = residency_present(self);
             session_frame(pace_before_present(self));
             rtpool_frame(self);
+            uecvars_frame();
         }
         flags = flip_before_present(self, sync, flags, ff);
         if (ff.skip) return S_OK;
@@ -565,6 +568,7 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
         residency_on_context(nullptr);
     }
     shaders_on_device(dev);
+    uecvars_on_device();
 
     IDXGIDevice* dxgi = nullptr;
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dxgi)))) {

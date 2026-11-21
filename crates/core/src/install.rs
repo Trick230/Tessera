@@ -162,15 +162,18 @@ pub struct Settings {
     pub flip_model: bool,
     /// R1: big render targets the game releases come back on its next create; off by default.
     pub rt_recycle: bool,
+    /// U1: Unreal texture streaming values (streaming_profile) set in the engine; off by default.
+    pub ue_streaming: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { process: true, residency: false, fps_limit: 0, vram_budget_mb: 0, flip_model: false, rt_recycle: false }
+        Settings { process: true, residency: false, fps_limit: 0, vram_budget_mb: 0, flip_model: false, rt_recycle: false, ue_streaming: false }
     }
 }
 
-const SETTING_KEYS: [&str; 6] = ["process", "residency", "fps_limit", "vram_budget_mb", "flip_model", "rt_recycle"];
+const SETTING_KEYS: [&str; 7] =
+    ["process", "residency", "fps_limit", "vram_budget_mb", "flip_model", "rt_recycle", "ue_streaming"];
 
 pub fn settings(dir: &Path) -> Settings {
     let mut s = Settings::default();
@@ -185,6 +188,7 @@ pub fn settings(dir: &Path) -> Settings {
             "vram_budget_mb" => s.vram_budget_mb = v,
             "flip_model" => s.flip_model = v != 0,
             "rt_recycle" => s.rt_recycle = v != 0,
+            "ue_streaming" => s.ue_streaming = v != 0,
             _ => {}
         }
     }
@@ -205,10 +209,78 @@ pub fn save_settings(dir: &Path, s: &Settings) -> io::Result<()> {
         out.push('\n');
     }
     out.push_str(&format!(
-        "process={}\nresidency={}\nfps_limit={}\nvram_budget_mb={}\nflip_model={}\nrt_recycle={}\n",
-        s.process as u8, s.residency as u8, s.fps_limit, s.vram_budget_mb, s.flip_model as u8, s.rt_recycle as u8
+        "process={}\nresidency={}\nfps_limit={}\nvram_budget_mb={}\nflip_model={}\nrt_recycle={}\nue_streaming={}\n",
+        s.process as u8,
+        s.residency as u8,
+        s.fps_limit,
+        s.vram_budget_mb,
+        s.flip_model as u8,
+        s.rt_recycle as u8,
+        s.ue_streaming as u8
     ));
     fs::write(dir.join(INI), out)
+}
+
+fn is_ue_key(key: &str) -> bool {
+    key == "ue_image" || key.starts_with("cvar.")
+}
+
+/// What `apply_ue_cvars` wrote: variables set and those left out (with why).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UeCvars {
+    pub set: usize,
+    pub skipped: Vec<String>,
+}
+
+/// U1: rewrites the `ue_image`/`cvar.*` lines of tessera.ini for `exe` (the
+/// process the layer loads in) from the ue_streaming setting. Off: the lines
+/// go. On: the executable is scanned again (~0.1 s), so an updated game gets
+/// fresh slots, never stale ones.
+pub fn apply_ue_cvars(dir: &Path, exe: &Path, vram_mb: u32) -> io::Result<UeCvars> {
+    let mut lines = Vec::new();
+    let mut report = UeCvars::default();
+    let s = settings(dir);
+    if s.ue_streaming {
+        // The cap the user set for this game counts as its memory.
+        let vram_mb = if s.vram_budget_mb > 0 { vram_mb.min(s.vram_budget_mb) } else { vram_mb };
+        let wanted = crate::uecvars::streaming_profile(vram_mb);
+        let names: Vec<&str> = wanted.iter().map(|w| w.0).collect();
+        match crate::uecvars::find_cvars(exe, &names)? {
+            Ok((id, slots)) => {
+                let (l, skipped) = crate::uecvars::ini_lines(id, &wanted, &slots);
+                report.set = l.len().saturating_sub(1);
+                report.skipped = skipped;
+                lines = l;
+            }
+            Err(e) => report.skipped = names.iter().map(|n| format!("{n} ({e:?})")).collect(),
+        }
+    }
+    let _g = INI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(old) = fs::read_to_string(dir.join(INI)) else {
+        return Ok(report); // not installed: nothing to keep in step
+    };
+    // Turned off while this scan ran (saves run on their own threads): no lines.
+    if !settings(dir).ue_streaming {
+        lines.clear();
+        report = UeCvars::default();
+    }
+    let mut out = String::new();
+    for line in old.lines().map(str::trim) {
+        let key = line.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+        if line.is_empty() || is_ue_key(&key) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    for l in &lines {
+        out.push_str(l);
+        out.push('\n');
+    }
+    if out != old {
+        fs::write(dir.join(INI), out)?;
+    }
+    Ok(report)
 }
 
 /// Removes our layer and restores a chained DLL to its original name.
@@ -286,10 +358,32 @@ mod tests {
         assert_eq!(settings(t.path()), Settings::default());
         fs::write(t.path().join(INI), "[tessera]\nnext=d3d11.next.dll\nfps_limit=30\nmax_frame_latency=1\n").unwrap();
         assert_eq!(settings(t.path()).fps_limit, 30);
-        let s = Settings { process: false, residency: true, fps_limit: 141, vram_budget_mb: 6144, flip_model: true, rt_recycle: true };
+        let s = Settings { process: false, residency: true, fps_limit: 141, vram_budget_mb: 6144, flip_model: true, rt_recycle: true, ue_streaming: true };
         save_settings(t.path(), &s).unwrap();
         assert_eq!(settings(t.path()), s);
         let ini = fs::read_to_string(t.path().join(INI)).unwrap();
         assert!(ini.starts_with("[tessera]\nnext=d3d11.next.dll\nmax_frame_latency=1\n"), "{ini}");
+    }
+    #[test]
+    fn ue_cvar_lines_follow_the_setting() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("game.exe");
+        fs::write(&exe, b"not a PE").unwrap();
+        // Not installed: nothing written.
+        assert_eq!(apply_ue_cvars(t.path(), &exe, 8192).unwrap().set, 0);
+        assert!(!t.path().join(INI).exists());
+        let stale = "[tessera]\nnext=x.dll\nue_streaming=1\nue_image=1 2\ncvar.r.Old=1 i p 10\n";
+        fs::write(t.path().join(INI), stale).unwrap();
+        // On, but nothing placed (not a PE): old slots go, other lines stay.
+        let r = apply_ue_cvars(t.path(), &exe, 8192).unwrap();
+        assert_eq!(r.set, 0);
+        assert_eq!(r.skipped.len(), 2);
+        assert_eq!(fs::read_to_string(t.path().join(INI)).unwrap(), "[tessera]\nnext=x.dll\nue_streaming=1\n");
+        // save_settings keeps cvar lines; turning the setting off and applying drops them.
+        fs::write(t.path().join(INI), stale).unwrap();
+        save_settings(t.path(), &Settings::default()).unwrap();
+        assert!(fs::read_to_string(t.path().join(INI)).unwrap().contains("cvar.r.Old"));
+        apply_ue_cvars(t.path(), &exe, 8192).unwrap();
+        assert!(!fs::read_to_string(t.path().join(INI)).unwrap().contains("ue_image"));
     }
 }

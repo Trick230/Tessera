@@ -450,8 +450,18 @@ const FPS_CHOICES: [u32; 9] = [0, 30, 40, 60, 90, 120, 144, 165, 240];
 /// Values behind the settings card's choices, for the game it shows.
 struct SettingsLists {
     dir: PathBuf,
+    /// U1: the Unreal executable the layer loads in (None: not an Unreal game).
+    ue_exe: Option<PathBuf>,
+    /// U1: memory the streaming profile sizes for (ue_vram_mb).
+    ue_vram_mb: u32,
     fps: Vec<u32>,
     vram: Vec<u32>,
+}
+
+/// U1: the DXGI budget the game had last session (what it can really use);
+/// before any session, the size of the biggest card the driver lists.
+fn ue_vram_mb(budget_mb: u32) -> u32 {
+    if budget_mb > 0 { budget_mb } else { tessera_core::driver::vram_mb() }
 }
 
 /// The settings card shown now (None while loading or not installed).
@@ -459,7 +469,11 @@ static SETTINGS: Mutex<Option<SettingsLists>> = Mutex::new(None);
 
 /// Choice lists for the settings card; a value set by hand in tessera.ini is
 /// kept as an extra entry so the card never rewrites it by accident.
-fn game_settings(dir: &Path, (budget_mb, suggest_mb): (u32, Option<u32>)) -> (GameSettings, SettingsLists) {
+fn game_settings(
+    dir: &Path,
+    ue_exe: Option<PathBuf>,
+    (budget_mb, suggest_mb): (u32, Option<u32>),
+) -> (GameSettings, SettingsLists) {
     let cur = install::settings(dir);
     let mut fps: Vec<u32> = FPS_CHOICES.to_vec();
     // Caps from 3 GB up to the real budget (or 12 GB when no session measured it).
@@ -496,6 +510,7 @@ fn game_settings(dir: &Path, (budget_mb, suggest_mb): (u32, Option<u32>)) -> (Ga
         residency: cur.residency,
         flip_model: cur.flip_model,
         rt_recycle: cur.rt_recycle,
+        ue_streaming: cur.ue_streaming,
         fps_options: labels(&fps, "Off", &|x| format!("{x} fps")),
         fps_index: idx(&fps, cur.fps_limit),
         vram_options: labels(&vram, "Off", &|x| {
@@ -504,7 +519,7 @@ fn game_settings(dir: &Path, (budget_mb, suggest_mb): (u32, Option<u32>)) -> (Ga
         vram_index: idx(&vram, cur.vram_budget_mb),
         vram_hint: hint.into(),
     };
-    (gs, SettingsLists { dir: dir.to_path_buf(), fps, vram })
+    (gs, SettingsLists { dir: dir.to_path_buf(), ue_exe, ue_vram_mb: ue_vram_mb(budget_mb), fps, vram })
 }
 
 /// Loads the selected game's last session off the UI thread; a 1 h log is tens of MB.
@@ -527,6 +542,7 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
     let Some(exe) = exe else { return };
     let root = game.map(|g| g.entry.root.clone());
     let prepare = game.is_some_and(can_prepare);
+    let ue_exe = game.filter(|g| matches!(g.engine, tessera_core::engine::Engine::Unreal { .. })).map(|_| exe.clone());
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         // P1: before the settings card reads tessera.ini (NVAPI DRS takes tens of ms).
@@ -534,13 +550,17 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
             let _ = install::note_external_limit(d, name);
         }
         let (info, budget, run) = session_info(&exe);
+        // U1: slots from this build of the executable (an update moves them).
+        if let (Some(d), Some(e)) = (&dir, &ue_exe) {
+            let _ = install::apply_ue_cvars(d, e, ue_vram_mb(budget.0));
+        }
         // GameSettings holds models (not Send); tessera.ini is tiny, read it on the UI thread.
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if SESSION_GEN.load(Ordering::Relaxed) != gen {
                 return;
             }
             ui.set_session(info);
-            if let Some((gs, lists)) = dir.map(|d| game_settings(&d, budget)) {
+            if let Some((gs, lists)) = dir.map(|d| game_settings(&d, ue_exe, budget)) {
                 *SETTINGS.lock().unwrap() = Some(lists);
                 ui.set_settings(gs);
             }
@@ -805,7 +825,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let w = ui.as_weak();
-        ui.on_settings_changed(move |_i, process, residency, flip_model, rt_recycle, fps_i, vram_i| {
+        ui.on_settings_changed(move |_i, process, residency, flip_model, rt_recycle, ue_streaming, fps_i, vram_i| {
             let ui = w.unwrap();
             let slot = SETTINGS.lock().unwrap();
             let Some(l) = slot.as_ref() else { return };
@@ -817,12 +837,33 @@ fn main() -> Result<(), slint::PlatformError> {
                 vram_budget_mb: pick(&l.vram, vram_i),
                 flip_model,
                 rt_recycle,
+                ue_streaming,
             };
             let msg = match install::save_settings(&l.dir, &new) {
                 Ok(()) => "Saved. Applies the next time the game starts".to_string(),
                 Err(e) => format!("Could not save tessera.ini: {e}"),
             };
             ui.set_status_text(msg.into());
+            // U1: scanning the executable takes up to a second; off the UI thread.
+            if let Some(exe) = l.ue_exe.clone() {
+                let (dir, vram, weak) = (l.dir.clone(), l.ue_vram_mb, ui.as_weak());
+                std::thread::spawn(move || {
+                    let r = install::apply_ue_cvars(&dir, &exe, vram);
+                    let msg = match r {
+                        Ok(r) if !ue_streaming => return drop(r),
+                        Ok(r) if r.skipped.is_empty() => {
+                            format!("Saved. {} Unreal variables apply the next time the game starts", r.set)
+                        }
+                        Ok(r) => format!(
+                            "Saved. {} Unreal variables apply next start; not found in this game: {}",
+                            r.set,
+                            r.skipped.join(", ")
+                        ),
+                        Err(e) => format!("Could not set Unreal variables: {e}"),
+                    };
+                    let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(msg.into()));
+                });
+            }
         });
     }
     {

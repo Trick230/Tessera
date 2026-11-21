@@ -12,6 +12,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 namespace tessera {
 namespace {
 Config g_config;
+wchar_t g_ini[MAX_PATH];
 
 int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
@@ -45,7 +46,9 @@ BOOL CALLBACK load_once(PINIT_ONCE, void*, void**) {
     c.mip_ram_mb = clamp_int(get(L"mip_ram_mb", 0), 0, 1 << 20);
     c.mip_force_evict = get(L"mip_force_evict", 0) != 0;
     c.rt_recycle = get(L"rt_recycle", 0) != 0;
+    c.ue_cvars = get(L"ue_cvars", 1) != 0;
     g_config = c;
+    wcscpy_s(g_ini, ini);
     return TRUE;
 }
 }  // namespace
@@ -56,10 +59,11 @@ void config_load() { InitOnceExecuteOnce(&g_once, load_once, nullptr, nullptr); 
 void config_log() {
     const Config& c = g_config;
     logf("config: process %d priority %d residency %d fps_limit %d ext_fps_limit %d max_frame_latency %d vram_budget_mb %d "
-         "flip_model %d workset %d mip_residency %d mip_ram_mb %d mip_force_evict %d rt_recycle %d",
+         "flip_model %d workset %d mip_residency %d mip_ram_mb %d mip_force_evict %d rt_recycle %d ue_cvars %d",
          c.process, c.priority, c.residency, c.fps_limit, c.ext_fps_limit, c.max_frame_latency, c.vram_budget_mb,
-         c.flip_model, c.workset, c.mip_residency, c.mip_ram_mb, c.mip_force_evict, c.rt_recycle);
+         c.flip_model, c.workset, c.mip_residency, c.mip_ram_mb, c.mip_force_evict, c.rt_recycle, c.ue_cvars);
 }
 
 const Config& config() { return g_config; }
+const wchar_t* config_ini_path() { return g_ini; }
 }  // namespace tessera

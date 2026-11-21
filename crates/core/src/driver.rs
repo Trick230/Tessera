@@ -124,6 +124,27 @@ pub fn gpus() -> Vec<Gpu> {
     out
 }
 
+/// Dedicated memory of the largest display adapter in MB (0 when unknown),
+/// from the driver's HardwareInformation.qwMemorySize.
+pub fn vram_mb() -> u32 {
+    let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+    let Ok(class) =
+        hklm.open_subkey(r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}")
+    else {
+        return 0;
+    };
+    class
+        .enum_keys()
+        .flatten()
+        .filter(|k| k.len() == 4 && k.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|k| class.open_subkey(&k).ok())
+        .filter_map(|k| k.get_raw_value("HardwareInformation.qwMemorySize").ok())
+        .filter_map(|v| v.bytes.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())))
+        .map(|b| (b >> 20).min(u32::MAX as u64) as u32)
+        .max()
+        .unwrap_or(0)
+}
+
 fn dir_size(p: &Path) -> u64 {
     walkdir::WalkDir::new(p)
         .into_iter()

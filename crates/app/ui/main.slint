@@ -79,6 +79,7 @@ export struct GameSettings {
     residency: bool,
     flip-model: bool,
     rt-recycle: bool,
+    ue-streaming: bool,
     fps-options: [string],
     fps-index: int,
     vram-options: [string],
@@ -584,7 +585,7 @@ component Detail inherits Rectangle {
     in property <image> hero;
     property <bool> has-hero: root.hero.width > 0;
     callback reset-safe-mode();
-    callback settings-changed(bool, bool, bool, bool, int, int);
+    callback settings-changed(bool, bool, bool, bool, bool, int, int);
 
     VerticalLayout {
         // The game and what Tessera knows about it at a glance, over its
@@ -747,7 +748,7 @@ component Detail inherits Rectangle {
                             width: 170px;
                             model: root.settings.fps-options;
                             current-index: root.settings.fps-index;
-                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, fps.current-index, vram.current-index); }
+                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -757,7 +758,7 @@ component Detail inherits Rectangle {
                             width: 170px;
                             model: root.settings.vram-options;
                             current-index: root.settings.vram-index;
-                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, fps.current-index, vram.current-index); }
+                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -765,7 +766,7 @@ component Detail inherits Rectangle {
                         help: "Keeps render targets and large buffers in VRAM when memory runs short.";
                         residency := Toggle {
                             checked: root.settings.residency;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -773,7 +774,7 @@ component Detail inherits Rectangle {
                         help: "High-resolution timer and moderate priority, game process only.";
                         process := Toggle {
                             checked: root.settings.process;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -781,7 +782,7 @@ component Detail inherits Rectangle {
                         help: "Experimental. Lower latency and G-Sync/FreeSync in borderless windows. Turn off if the screen flickers.";
                         flip := Toggle {
                             checked: root.settings.flip-model;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -789,7 +790,15 @@ component Detail inherits Rectangle {
                         help: "Hands big render targets the game drops back on its next matching create. Cuts hitches in games that recreate them.";
                         recycle := Toggle {
                             checked: root.settings.rt-recycle;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
+                        }
+                    }
+                    PropRow {
+                        label: "Unreal texture streaming";
+                        help: "Unreal Engine games. Sets the engine's streaming pool to fit this card and streams fewer textures per frame, as players do by hand. Experimental.";
+                        ue := Toggle {
+                            checked: root.settings.ue-streaming;
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
                         }
                     }
                     Text { text: "Changes apply the next time the game starts."; color: Theme.faint; font-size: 13px; }
@@ -850,7 +859,7 @@ export component MainWindow inherits Window {
     callback install(int);
     callback uninstall(int);
     callback open-folder(int);
-    callback settings-changed(int, bool, bool, bool, bool, int, int);
+    callback settings-changed(int, bool, bool, bool, bool, bool, int, int);
 
     property <length> row-h: 40px;
     property <bool> has-sel: root.selected >= 0 && root.selected < root.games.length;
@@ -950,7 +959,7 @@ export component MainWindow inherits Window {
                 shaders: root.shader-state;
                 tab <=> root.tab;
                 reset-safe-mode => { root.reset-safe-mode(root.selected); }
-                settings-changed(p, r, fl, rc, f, v) => { root.settings-changed(root.selected, p, r, fl, rc, f, v); }
+                settings-changed(p, r, fl, rc, u, f, v) => { root.settings-changed(root.selected, p, r, fl, rc, u, f, v); }
             }
             if !root.has-sel: VerticalLayout {
                 horizontal-stretch: 1;

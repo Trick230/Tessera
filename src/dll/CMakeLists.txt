@@ -19,6 +19,7 @@ add_library(tessera_d3d11 SHARED
   workset.cpp
   residency.cpp
   rtpool.cpp
+  uecvars.cpp
   exports_d3d11.asm
   exports_d3d11.def)
 

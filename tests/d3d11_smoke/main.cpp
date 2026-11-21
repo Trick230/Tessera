@@ -990,7 +990,109 @@ int recycle_mode() {
     return 0;
 }
 
+// U1: fake Unreal console variables laid out as the engine's, set by the layer
+// from cvar.* lines this mode writes to tessera.ini (the RVAs are only known here).
+struct FakeAutoCvar {
+    const void* vtable;  // FAutoConsoleObject vtable, in .rdata
+    void* target;        // IConsoleObject* (heap object whose vtable is in .rdata)
+    void* ref;           // TConsoleVariableData<T>*: T[2] on the heap
+};
+extern const void* const kFakeVtable[2];
+const void* const kFakeVtable[2] = {&kFakeVtable[0], &kFakeVtable[1]};
+FakeAutoCvar g_cvar_int, g_cvar_float, g_cvar_bad;
+float g_cvar_ref = 0.25f;
+
+int uecvars_mode(bool stale) {
+    auto* page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!page) return fail("VirtualAlloc");
+    auto* exe = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto set_up = [&](FakeAutoCvar& c, size_t at, const void* object_vtable) {
+        c.vtable = kFakeVtable;
+        c.target = page + at;
+        *reinterpret_cast<const void**>(page + at) = object_vtable;
+        c.ref = page + at + 64;
+    };
+    set_up(g_cvar_int, 0, kFakeVtable);
+    set_up(g_cvar_float, 128, kFakeVtable);
+    set_up(g_cvar_bad, 256, page);  // target's vtable on the heap: not a console variable
+    int* vi = static_cast<int*>(g_cvar_int.ref);
+    float* vf = static_cast<float*>(g_cvar_float.ref);
+    int* vb = static_cast<int*>(g_cvar_bad.ref);
+    vi[0] = vi[1] = -1;
+    vf[0] = vf[1] = 1.0f;
+    vb[0] = vb[1] = -1;
+    auto rva = [&](const void* p) { return static_cast<unsigned long>(static_cast<const uint8_t*>(p) - exe); };
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(exe);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(exe + dos->e_lfanew);
+    wchar_t ini[MAX_PATH];
+    GetModuleFileNameW(nullptr, ini, MAX_PATH);
+    wcscpy_s(wcsrchr(ini, L'\\') + 1, 32, L"tessera.ini");
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, ini, L"w") || !f) return fail("write tessera.ini");
+    std::fprintf(f, "[tessera]\nue_image=%lx %lx\n", static_cast<unsigned long>(nt->FileHeader.TimeDateStamp),
+                 static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage) + (stale ? 0x1000ul : 0ul));
+    std::fprintf(f, "cvar.r.Test.Int=2850 i p %lx\n", rva(&g_cvar_int.ref));
+    std::fprintf(f, "cvar.r.Test.Float=0.5 f p %lx\n", rva(&g_cvar_float.ref));
+    std::fprintf(f, "cvar.s.Test.Ref=8.5 f d %lx\n", rva(&g_cvar_ref));
+    std::fprintf(f, "cvar.r.Test.Bad=7 i p %lx\n", rva(&g_cvar_bad.ref));
+    std::fprintf(f, "cvar.r.Test.ReadOnly=7 i d %lx\n", rva(&kFakeVtable[0]));
+    std::fprintf(f, "cvar.r.Test.Garbage=x i p %lx\n", rva(&g_cvar_int.ref));
+    std::fclose(f);
+
+    HWND wnd = make_window();
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferDesc.Width = 320;
+    sd.BufferDesc.Height = 180;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 1;
+    sd.OutputWindow = wnd;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    IDXGISwapChain* sc = nullptr;
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                               D3D11_SDK_VERSION, &sd, &sc, &dev, nullptr, &ctx);
+    if (FAILED(hr)) return fail("D3D11CreateDeviceAndSwapChain", hr);
+    int rc = 0;
+    auto expect = [&](bool ok, const char* what) {
+        if (!ok) rc = fail(what);
+    };
+    const bool untouched_bad = vb[0] == -1 && vb[1] == -1 && kFakeVtable[0] == &kFakeVtable[0];
+    if (stale) {
+        expect(vi[0] == -1 && vi[1] == -1 && vf[0] == 1.0f && g_cvar_ref == 0.25f, "stale image: values changed");
+    } else {
+        expect(vi[0] == 2850 && vi[1] == 2850, "int variable not set in both copies");
+        expect(vf[0] == 0.5f && vf[1] == 0.5f, "float variable not set in both copies");
+        expect(g_cvar_ref == 8.5f, "referenced variable not set");
+        expect(untouched_bad, "a slot that failed the checks was written");
+        // The game sets them again (scalability, settings menu): restored within about a second.
+        vi[0] = 5;
+        vf[1] = 2.0f;
+        g_cvar_ref = 1.0f;
+        const ULONGLONG until = GetTickCount64() + 1500;
+        while (GetTickCount64() < until) render(dev, ctx, sc, 5, false);
+        expect(vi[0] == 2850 && vf[1] == 0.5f && g_cvar_ref == 8.5f, "changed values not restored");
+        expect(vb[0] == -1, "bad slot written later");
+        // The engine frees or replaces a variable (shutdown): the old memory is left alone.
+        g_cvar_float.ref = page + 128 + 96;
+        vf[0] = 3.0f;
+        const ULONGLONG until2 = GetTickCount64() + 1500;
+        while (GetTickCount64() < until2) render(dev, ctx, sc, 5, false);
+        expect(vf[0] == 3.0f, "a moved variable's old memory was written");
+    }
+    sc->Release();
+    ctx->Release();
+    dev->Release();
+    DestroyWindow(wnd);
+    std::printf("console variables (%s): %s\n", stale ? "stale image" : "applied", rc ? "FAIL" : "ok");
+    return rc;
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 2 && wcscmp(argv[1], L"--uecvars") == 0) return uecvars_mode(argc >= 3 && wcscmp(argv[2], L"stale") == 0);
     if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0) return bench();
     if (argc >= 2 && wcscmp(argv[1], L"--imports") == 0) return imports_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--recycle") == 0) return recycle_mode();
