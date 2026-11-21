@@ -4,8 +4,10 @@
 #pragma once
 
 namespace tessera {
-// From DllMain (attach): points the game executable's GetProcAddress import
-// at ours. Only memory writes and VirtualProtect, safe under the loader lock.
-// Games that resolve NVAPI from another module are not seen.
+// From DllMain (attach), unless safe mode is on: points the GetProcAddress
+// imports of the game exe and of the DLLs in its folder at ours, now and as
+// more load (loader notifications). Only memory writes and VirtualProtect,
+// safe under the loader lock. NVAPI resolved from modules outside the game
+// folder (overlays, SDKs) is left alone.
 void nvapi_patch_imports();
 }  // namespace tessera

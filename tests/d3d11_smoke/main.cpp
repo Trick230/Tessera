@@ -727,9 +727,36 @@ int tiled() {
     return 0;
 }
 
+// --nvapi: is nvapi_QueryInterface handed back wrapped, both to the exe and
+// to a game DLL loaded later (nvapi_probe.dll)? 0 both, 3 neither (safe
+// mode), 1 mixed, 4 no NVAPI on this machine.
+int nvapi_mode() {
+    HMODULE probe = LoadLibraryW(L"nvapi_probe.dll");
+    if (!probe) return fail("nvapi_probe.dll");
+    using Probe = void*(*)();
+    const auto probe_qi = reinterpret_cast<Probe>(GetProcAddress(probe, "probe_qi"));
+    void* const from_dll = probe_qi ? probe_qi() : nullptr;
+    HMODULE nv = GetModuleHandleW(L"nvapi64.dll");
+    if (!nv) {
+        std::printf("no NVAPI, skipped\n");
+        return 4;
+    }
+    void* const from_exe = reinterpret_cast<void*>(GetProcAddress(nv, "nvapi_QueryInterface"));
+    auto wrapped = [nv](void* p) {
+        HMODULE owner = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(p), &owner);
+        return p && owner != nv;
+    };
+    const bool e = wrapped(from_exe), d = wrapped(from_dll);
+    std::printf("nvapi_QueryInterface wrapped: exe %d, game DLL %d\n", e, d);
+    return e && d ? 0 : !e && !d ? 3 : 1;
+}
+
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0) return bench();
     if (argc >= 2 && wcscmp(argv[1], L"--tiled") == 0) return tiled();
+    if (argc >= 2 && wcscmp(argv[1], L"--nvapi") == 0) return nvapi_mode();
     if (argc >= 3 && wcscmp(argv[1], L"--verify") == 0) return verify(argv[2], argc >= 4 ? _wtoi(argv[3]) : 0);
     return run(argc >= 2 && wcscmp(argv[1], L"--crash") == 0);
 }

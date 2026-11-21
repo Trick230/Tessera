@@ -27,6 +27,11 @@ $log = "$data\logs\d3d11_smoke.exe.log"
 Check "process tweaks logged" ((Select-String -Path $log -Pattern "process:" -Quiet))
 Check "above-normal priority (P5)" ((Select-String -Path $log -Pattern "above-normal priority ok" -Quiet))
 
+# NVAPI resolved by the exe and by a game DLL loaded later (4: no NVAPI here).
+& $exe --nvapi | Write-Host
+$nv = $LASTEXITCODE
+if ($nv -ne 4) { Check "NVAPI wrapped for the exe and a game DLL" ($nv -eq 0) }
+
 # Frame limiter (P1), budget cap (M1), flip model (P2) and frame latency (P3) from tessera.ini next to the layer.
 # ext_fps_limit: another tool limits to 50 below our 60, so ours runs just under 50.
 $ini = Join-Path (Split-Path $exe) "tessera.ini"
@@ -74,6 +79,8 @@ Check "app reads the same counter" ((& $layer crashes $exe) -eq "2")
 $before = (Get-ChildItem "$data\sessions\*.tsess").Count
 & $exe | Write-Host
 Check "game still runs in safe mode" ($LASTEXITCODE -eq 0)
+& $exe --nvapi | Write-Host
+if ($nv -ne 4) { Check "imports untouched in safe mode" ($LASTEXITCODE -eq 3) }
 $after = (Get-ChildItem "$data\sessions\*.tsess").Count
 Check "no session in safe mode" ($after -eq $before)
 Check "safe mode logged" ((Select-String -Path "$data\logs\d3d11_smoke.exe.log" -Pattern "safe mode" -Quiet))

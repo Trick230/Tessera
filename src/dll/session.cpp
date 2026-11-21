@@ -88,8 +88,8 @@ uint64_t path_key(const wchar_t* p) {
     return h;
 }
 
-int read_counter() {
-    HANDLE f = CreateFileW(g_safe_path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+int read_counter(const wchar_t* path = g_safe_path) {
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return 0;
     char buf[16] = {};
     DWORD r = 0;
@@ -270,6 +270,24 @@ BOOL CALLBACK init_once(PINIT_ONCE, void*, void**) {
     return TRUE;
 }
 }  // namespace
+
+bool session_safe_mode() {
+    // Same paths as init_once, without creating anything: no data dir means
+    // no counter, so not tripped.
+    wchar_t dir[MAX_PATH], exe[MAX_PATH], path[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"TESSERA_DATA_DIR", dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        wchar_t base[MAX_PATH];
+        n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH || _snwprintf_s(dir, _TRUNCATE, L"%s\\Tessera", base) < 0) return false;
+    }
+    n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    const wchar_t* name = wcsrchr(exe, L'\\');
+    name = name ? name + 1 : exe;
+    if (_snwprintf_s(path, _TRUNCATE, L"%s\\safemode\\%s-%016llx.count", dir, name, path_key(exe)) < 0) return false;
+    return read_counter(path) >= kSafeModeCrashes;
+}
 
 bool session_data_path(const wchar_t* sub, const wchar_t* ext, wchar_t* out) {
     if (!g_started) return false;

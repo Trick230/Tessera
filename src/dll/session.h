@@ -8,6 +8,10 @@ namespace tessera {
 // off (safe mode tripped or setup failed). Thread-safe, idempotent.
 bool session_init();
 
+// Safe mode tripped for this exe (the counter session_init checks), without
+// opening the log or creating anything: for DllMain, before any patch.
+bool session_safe_mode();
+
 // Lock-free; callable from any thread. Never blocks, never allocates.
 void session_push(TesseraRecord& r);
 // wait_us: time the frame limiter waited before this Present.

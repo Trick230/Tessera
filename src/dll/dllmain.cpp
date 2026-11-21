@@ -7,8 +7,9 @@
 #include "session.h"
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
-    // Before the game's code runs: it resolves NVAPI early.
-    if (reason == DLL_PROCESS_ATTACH) tessera::nvapi_patch_imports();
+    // Before the game's code runs: it resolves NVAPI early. Safe mode keeps
+    // the game's imports untouched as well.
+    if (reason == DLL_PROCESS_ATTACH && !tessera::session_safe_mode()) tessera::nvapi_patch_imports();
     if (reason == DLL_PROCESS_DETACH) tessera::session_shutdown();
     return TRUE;
 }

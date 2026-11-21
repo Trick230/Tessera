@@ -8,3 +8,5 @@ target_compile_options(d3d11_smoke PRIVATE /EHsc)
 add_dependencies(d3d11_smoke tessera_d3d11)
 add_custom_command(TARGET d3d11_smoke POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:tessera_d3d11> $<TARGET_FILE_DIR:d3d11_smoke>/d3d11.dll)
+add_library(nvapi_probe SHARED nvapi_probe.cpp)
+add_dependencies(d3d11_smoke nvapi_probe)
