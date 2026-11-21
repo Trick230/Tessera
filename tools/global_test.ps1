@@ -117,7 +117,7 @@ try {
         if ($on) {
             & $layer install $GameDir $payload | Out-Null
             if (-not $LASTEXITCODE) { Write-TestIni }
-        } else { & $layer uninstall $GameDir | Out-Null }
+        } elseif (((& $layer status $GameDir) -join "") -notmatch "NotInstalled") { & $layer uninstall $GameDir | Out-Null }
         if ($LASTEXITCODE) { throw "layer $mode failed" }
         $start = Get-Date
         Start-Process $Steam -ArgumentList "-applaunch $AppId $LaunchArgs"
@@ -163,8 +163,14 @@ try {
         if (Test-Path $csv) { Log "run ${i}: recorded $csv" } else { Log "run ${i}: NO CSV (PresentMon exit $($pm.ExitCode), see $pmlog)" }
         # A clean exit keeps the session file whole and the safe-mode counter at zero.
         if (-not $Auto) { [console]::Beep(660, 300); [console]::Beep(660, 300) }
-        $p.Refresh()
-        [Tessera.W]::PostMessage($p.MainWindowHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        if ($p.HasExited) {
+            # A crash: keep going, the summary marks the run.
+            Log ("run ${i}: CRASHED during the run (exit code 0x{0:X8})" -f $p.ExitCode)
+            Set-Content (Join-Path $OutDir "run${i}_$mode.crashed") "" -Encoding ascii
+        } else {
+            $p.Refresh()
+            [Tessera.W]::PostMessage($p.MainWindowHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        }
         if (-not $p.WaitForExit(60000)) { Log "run ${i}: the game did not exit, killing (unclean: counts toward safe mode)"; $p.Kill(); $p.WaitForExit() }
         if ($on) {
             $glog = Join-Path $data "logs\$ExeName.log"
@@ -196,7 +202,7 @@ $rows = Get-ChildItem (Join-Path $OutDir "run*_*.csv") | Sort-Object { [int]($_.
     $p50 = Pct $v 50
     $secs = ($v | Measure-Object -Sum).Sum / 1000
     [pscustomobject]@{
-        Run = $_.BaseName; Mode = ($_.BaseName -split "_")[1]; Frames = $v.Count; Fps = 1000 / $avg
+        Run = $_.BaseName + $(if (Test-Path ($_.FullName -replace ".csv$", ".crashed")) { "!" } else { "" }); Mode = ($_.BaseName -split "_")[1]; Frames = $v.Count; Fps = 1000 / $avg
         P50 = $p50; P99 = (Pct $v 99); P999 = (Pct $v 99.9); Max = $v[-1]
         # Stutters a player notices: over twice the median, and over 50 ms; per minute.
         Hitches = 60 * @($v | Where-Object { $_ -gt 2 * $p50 }).Count / $secs
@@ -204,13 +210,13 @@ $rows = Get-ChildItem (Join-Path $OutDir "run*_*.csv") | Sort-Object { [int]($_.
     }
 }
 $out = @()
-$out += "Frame times (ms; hitches = frames over 2x the median, per minute)"
+$out += "Frame times (ms; hitches = frames over 2x the median, per minute; ! = the game crashed, left out of the means)"
 foreach ($r in $rows) {
     $out += "{0,-8} n={1,6}  fps {2,6:N1}  p50 {3,6:N2}  p99 {4,6:N2}  p99.9 {5,6:N2}  max {6,7:N1}  hitches/min {7,6:N1}  >50ms/min {8,5:N1}" -f `
         $r.Run, $r.Frames, $r.Fps, $r.P50, $r.P99, $r.P999, $r.Max, $r.Hitches, $r.Over50
 }
 foreach ($m in "off", "on") {
-    $g = @($rows | Where-Object Mode -eq $m)
+    $g = @($rows | Where-Object { $_.Mode -eq $m -and $_.Run -notmatch "!$" })
     if ($g.Count -eq 0) { continue }
     $mean = { param($k) ($g | Measure-Object -Property $k -Average).Average }
     $out += "{0,-8} runs={1}  fps {2,6:N1}  p50 {3,6:N2}  p99 {4,6:N2}  p99.9 {5,6:N2}  hitches/min {6,6:N1}  >50ms/min {7,5:N1}" -f `
