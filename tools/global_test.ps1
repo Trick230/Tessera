@@ -1,13 +1,11 @@
 ﻿# SPDX-License-Identifier: GPL-3.0-or-later
 # Global test of the D3D11 layer on a real game: does it help, and does every
 # module work? Interleaved runs without/with the layer (off, on, off, on, ...).
-# The script starts the game for every run and closes it after. In the first
-# run the player loads the save (keyboard), presses F10 (-Key) at the start
-# of the route and plays it for -Record seconds; tools/input_replay.cs records
-# the keyboard and mouse to -Route (<OutDir>\route.txt) and every later run
-# replays them, menus included, while PresentMon records. An existing route is
-# reused (-NewRoute records a new one). Run 0 is a warm-up left out of the
-# means (-NoWarmup skips it). The "on" runs also keep the layer's log and session
+# The script starts the game for every run and closes it after. In every run
+# the player loads the save, presses F10 (-Key) at the start of the route and
+# plays it for -Record seconds while PresentMon records. Run 0 is a warm-up
+# left out of the means (-NoWarmup skips it). -Variants "a=0;b=0" runs only
+# "on" runs, one per set of tessera.ini overrides (bisecting a module). The "on" runs also keep the layer's log and session
 # summary (shaders, VRAM, working set, mip residency) and list what each
 # module reported. Needs an elevated shell (PresentMon uses ETW) and a fresh
 # build (build.ps1: target\release\tessera_d3d11.dll and the layer/session
@@ -27,18 +25,21 @@ param(
     [Parameter(Mandatory)][string]$ExeName,
     [Parameter(Mandatory)][string]$PresentMon,
     [int]$Runs = 4,
-    [int]$Record = 100,
-    [int]$Key = 0x79,  # F10: marks the start of the route from inside the game
-    [string]$Route = "",
-    [switch]$NewRoute,
+    [int]$Record = 30,
+    [int]$Key = 0x79,  # F10: starts the recording from inside the game
     [switch]$NoWarmup,
     [int]$Settle = 60,
     [int]$FpsLimit = 0,
     [switch]$Auto,
     [string]$Steam = "C:\Program Files (x86)\Steam\steam.exe",
-    [string]$OutDir = ""
+    [string]$OutDir = "",
+    # Bisect mode: only "on" runs, one per variant, each variant a list of
+    # tessera.ini overrides like "workset=0" or "workset=0,flip_model=0".
+    [string[]]$Variants = @()
 )
 $ErrorActionPreference = "Stop"
+# -File passes "a;b" as one string; split variants on ";".
+$Variants = @($Variants -join ";" -split ";" | Where-Object { $_.Trim() })
 # $PSScriptRoot is still empty in Windows PowerShell's parameter defaults.
 $root = Split-Path $PSScriptRoot -Parent
 if (-not $OutDir) { $OutDir = Join-Path $root "build\global" }
@@ -57,20 +58,17 @@ if (Get-Process $procName -ErrorAction SilentlyContinue) { throw "$ExeName is al
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 Get-ChildItem $OutDir -Filter "run*" -ErrorAction SilentlyContinue | Remove-Item
 $log = Join-Path $OutDir "global.log"
-function Log($m) { $l = "{0:HH:mm:ss} {1}" -f (Get-Date), $m; $l; Add-Content -Path $log -Value $l -Encoding utf8 }
-Set-Content -Path $log -Value "" -Encoding utf8
-Add-Type -Name W -Namespace Tessera -MemberDefinition `
-    '[DllImport("user32.dll")] public static extern bool PostMessage(System.IntPtr h, uint m, System.IntPtr w, System.IntPtr l);'
-Add-Type -TypeDefinition (Get-Content (Join-Path $PSScriptRoot "input_replay.cs") -Raw) -ReferencedAssemblies System.Windows.Forms
-if (-not $Route) { $Route = Join-Path $OutDir "route.txt" }
-$routeFile = $Route
-$routeData = $null
-$recording = $false
-if ((Test-Path $routeFile) -and -not $NewRoute) {
-    $routeData = [TesseraInput.Route]::Load($routeFile)
-    Log ("route: replaying $routeFile, {0} inputs, {1:N0} s after F10" -f $routeData.Events.Count, $routeData.RouteSeconds())
-    if ($routeData.RouteSeconds() -lt $Record - 5) { Log "route: shorter than -Record $Record; the rest of each run stands still" }
+function Log($m) {
+    $l = "{0:HH:mm:ss} {1}" -f (Get-Date), $m; $l
+    # Another reader may hold the log briefly; retry instead of losing the line.
+    for ($t = 0; $t -lt 10; $t++) {
+        try { Add-Content -Path $log -Value $l -Encoding utf8 -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 200 }
+    }
 }
+Set-Content -Path $log -Value "" -Encoding utf8
+Add-Type -Name W -Namespace Tessera -MemberDefinition (
+    '[DllImport("user32.dll")] public static extern bool PostMessage(System.IntPtr h, uint m, System.IntPtr w, System.IntPtr l);' +
+    '[DllImport("user32.dll")] public static extern short GetAsyncKeyState(int k);')
 
 # The layer's state and tessera.ini as found, also on disk: an "off" run
 # uninstalls the layer (which deletes tessera.ini), and a test stopped by
@@ -94,7 +92,9 @@ if (Test-Path $saveLayer) {
 $iniBackup = $null
 if (Test-Path $ini) { $iniBackup = Get-Content $ini -Raw; Set-Content -Path $saveIni -Value $iniBackup -NoNewline -Encoding ascii }
 function Write-TestIni {
+    param([string]$extra = "")
     $want = [ordered]@{ mip_residency = "1"; fps_limit = "$FpsLimit" }
+    foreach ($kv in ($extra -split "," | Where-Object { $_ -match "=" })) { $k, $v = $kv -split "=", 2; $want[$k.Trim()] = $v.Trim() }
     $lines = if ($iniBackup) { @($iniBackup -split "`r?`n" | Where-Object { $_ -ne "" }) } else { @("[tessera]") }
     foreach ($k in $want.Keys) {
         $i = [array]::FindIndex([string[]]$lines, [Predicate[string]] { param($l) $l -match "^\s*$k\s*=" })
@@ -110,13 +110,15 @@ try {
     # Run 0 (without the layer, left out of the means) warms the driver's
     # shader cache and the file cache, so the first counted run is not the
     # only one paying for the first time through the route.
-    $first = if ($NoWarmup) { 1 } else { 0 }
+    $first = if ($NoWarmup -or $Variants.Count) { 1 } else { 0 }
+    if ($Variants.Count) { $Runs = $Variants.Count }
     for ($i = $first; $i -le $Runs; $i++) {
-        $on = $i -gt 0 -and ($i % 2) -eq 0
-        $mode = if ($i -eq 0) { "warm" } elseif ($on) { "on" } else { "off" }
+        $on = $i -gt 0 -and (($i % 2) -eq 0 -or $Variants.Count)
+        $variant = if ($Variants.Count) { $Variants[$i - 1] } else { "" }
+        $mode = if ($i -eq 0) { "warm" } elseif ($variant) { "on-" + ($variant -replace "\W+", "_") } elseif ($on) { "on" } else { "off" }
         if ($on) {
             & $layer install $GameDir $payload | Out-Null
-            if (-not $LASTEXITCODE) { Write-TestIni }
+            if (-not $LASTEXITCODE) { Write-TestIni $variant }
         } elseif (((& $layer status $GameDir) -join "") -notmatch "NotInstalled") { & $layer uninstall $GameDir | Out-Null }
         if ($LASTEXITCODE) { throw "layer $mode failed" }
         $start = Get-Date
@@ -125,22 +127,14 @@ try {
         for ($t = 0; $t -lt 180 -and -not $p; $t++) { Start-Sleep 1; $p = Get-Process $procName -ErrorAction SilentlyContinue | Select-Object -First 1 }
         if (-not $p) { throw "run ${i}: $ExeName did not start" }
         Log "run $i ($mode): pid $($p.Id)"
-        $replay = -not $Auto -and $null -ne $routeData
         if ($Auto) { Start-Sleep $Settle }
-        elseif ($replay) {
-            # Menus and loading the save, with gaps longer than recorded.
-            Log ("run ${i}: " + [TesseraInput.Player]::Lead($routeData, $p))
-            if ($p.HasExited) { throw "run ${i}: the game exited before the route" }
-        } else {
-            # The player's run: everything from now to the end of the route
-            # becomes the route the next runs replay.
-            [TesseraInput.Recorder]::Start($Key)
-            $recording = $true
-            if ([TesseraInput.Recorder]::Error) { throw [TesseraInput.Recorder]::Error }
-            Write-Host "run $i ($mode): load the save with the keyboard, stand at the start of the route, press F10 and play it for $Record s; don't touch anything after that"
+        else {
+            Write-Host "run $i ($mode): load the save, stand at the start of the route, press F10 and play it for $Record s"
             [console]::Beep(880, 300)
-            while (-not [TesseraInput.Recorder]::Marked.WaitOne(200)) {
+            [Tessera.W]::GetAsyncKeyState($Key) | Out-Null
+            while (-not ([Tessera.W]::GetAsyncKeyState($Key) -band 0x8000)) {
                 if ($p.HasExited) { throw "run ${i}: the game exited before F10" }
+                Start-Sleep -Milliseconds 50
             }
             [console]::Beep(1200, 150)
         }
@@ -149,17 +143,7 @@ try {
         $pm = Start-Process $PresentMon -PassThru -NoNewWindow -RedirectStandardOutput $pmlog -RedirectStandardError "$pmlog.err" -ArgumentList (
             "--process_id $($p.Id) --output_file `"$csv`" --timed $Record --terminate_after_timed " +
             "--no_console_stats --stop_existing_session --session_name TesseraGlobal")
-        if ($replay) {
-            Start-Sleep 1  # PresentMon's ETW session starts
-            Log ("run ${i}: " + [TesseraInput.Player]::Play($routeData, $p, $Record))
-        }
         if (-not $pm.WaitForExit(($Record + 30) * 1000)) { $pm.Kill() }
-        if ($recording) {
-            $routeData = [TesseraInput.Recorder]::Stop()
-            $recording = $false
-            $routeData.Save($routeFile)
-            Log ("run ${i}: route saved to $routeFile, {0} inputs, {1:N0} s after F10" -f $routeData.Events.Count, $routeData.RouteSeconds())
-        }
         if (Test-Path $csv) { Log "run ${i}: recorded $csv" } else { Log "run ${i}: NO CSV (PresentMon exit $($pm.ExitCode), see $pmlog)" }
         # A clean exit keeps the session file whole and the safe-mode counter at zero.
         if (-not $Auto) { [console]::Beep(660, 300); [console]::Beep(660, 300) }
@@ -185,7 +169,6 @@ try {
 } catch {
     Log "error: $_"
 } finally {
-    if ($recording) { [TesseraInput.Recorder]::Stop() | Out-Null }
     Restore-Game ($initial -notmatch "NotInstalled") $iniBackup
     Log "layer restored: $((& $layer status $GameDir) -join ''), tessera.ini restored"
 }
