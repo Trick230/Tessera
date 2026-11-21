@@ -1,12 +1,12 @@
 # Tessera
 
-**A game optimizer for Windows that makes 8 GB GPUs hold up in modern games: less VRAM, no stutters, no visible quality loss and no pop-in.**
+**A game optimizer for Windows: less VRAM, no stutters, a flat frame time, no visible quality loss and no pop-in.**
 
-Many current games want more video memory than a mid-range card has. When they run out, you get hitches, textures that load late, or settings you have to lower. Shader compilation, asset streaming while you move through the world, and uneven frame pacing cause stutters of their own.
+Many current games want more video memory than the card has. When they run out, you get hitches, textures that load late, or settings you have to lower. Shader compilation, asset streaming while you move through the world, and uneven frame pacing cause stutters of their own.
 
 Tessera tackles these problems in two steps. A preparation app does the heavy work **before** you play. A small graphics layer that the game loads itself manages memory and pacing **while** you play. It does not inject anything, it does not run in the background, and it touches nothing outside the game.
 
-> **Status:** early development (Phase 0, foundations). The app and the Direct3D 11 layer work and are tested. The layer only measures for now; the optimizations described below come in later phases. See [Roadmap](#roadmap).
+> **Status:** early development. The app and the Direct3D 11 layer work and are tested on real games. Memory, shader, pacing and Unreal Engine features exist but most are off by default until measurements show they help. Direct3D 12 comes later. See [Status](#status) and [Roadmap](#roadmap).
 
 ---
 
@@ -54,16 +54,20 @@ Quality is never traded silently. Any lossy step, such as recompressing a textur
 - **Only the game process is affected,** and only while the game runs: CPU sets, timer resolution, EcoQoS and a moderate priority. Nothing system-wide is changed.
 - **Uninstalling is clean.** The layer is removed and any DLL it chained to gets its original name back.
 
-## Current features (Phase 0)
+## Status
 
-- Game discovery from Steam and Epic, plus folders you add manually.
-- Graphics API detection from the executable's imports, including games that switch API with a launch flag such as `-dx11`.
-- Engine and anti-cheat detection.
-- One-click install and uninstall of the Direct3D 11 layer, chaining to any DLL already there.
-- Direct3D 11 proxy layer that forwards every export to the system DLL or to the next layer in the chain. It hooks device, factory and swap chain creation.
-- Session recording: frame times plus every texture and buffer created. The layer writes it from a separate thread through a lock-free ring buffer.
-- Safe mode with a crash counter. You can reset it from the app.
-- A "Last session" panel showing frame time percentiles, stutter count, VRAM estimate and display mode.
+**Works today (Direct3D 11):**
+
+- **App:** game discovery from Steam, Epic and folders you add; graphics API, engine and anti-cheat detection; one-click install and uninstall of the layer, chaining to any DLL already there; per-game settings; a session panel with frame time percentiles, stutters per minute, VRAM peak against the budget, and the likely causes.
+- **Layer basics:** proxy DLL that forwards every export; session recording through a lock-free ring buffer (frame times, every texture, buffer and shader created, slow creates); safe mode after two crashes in a row.
+- **Pacing:** precise frame limiter that respects RTSS and NVIDIA limits and backs off for Reflex and frame generation; frame latency control; flip model for borderless windows (off by default); process tweaks (timer resolution, EcoQoS off).
+- **Memory:** VRAM budget reporting and an optional cap, also through NVAPI and before the game creates its device; working-set meter; mip residency with tiled textures and pop-in-free restore (needs tiled resources tier 2, off by default); render target reuse (off by default).
+- **Shaders:** scans the whole install for shader bytecode (including Oodle, zlib, zstd and LZ4 archives) and warms the driver cache in a separate process before you play; records new shaders during play for the next preparation; a coverage meter in the app.
+- **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
+
+**Being measured:** Unreal variants (dynamic resolution off, render targets that only grow, pool limits, shader creation on load, level streaming time limits) in Final Fantasy VII Remake.
+
+**Next:** promote what the measurements confirm, prediction and I/O prefetch, then Direct3D 12.
 
 ## Roadmap
 
@@ -78,7 +82,7 @@ Quality is never traded silently. Any lossy step, such as recompressing a textur
 | 6. D3D12 | The same features for D3D12, PSO capture at startup | Lower VRAM and no PSO stutters in D3D12 games |
 | 7. Expansion | System test, RTSS stats, AMD-specific shader paths | Works alongside popular mods and overlays |
 
-The full design notes are in [`docs/PLAN.md`](docs/PLAN.md) (Portuguese).
+The full design notes, the detailed status and what is left are in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Building
 
@@ -98,12 +102,14 @@ This produces `target\release\tessera.exe` and `target\release\tessera_d3d11.dll
 ## Repository layout
 
 ```
-crates/core      Rust: discovery, PE analysis, install/uninstall, session reader
+crates/core      Rust: discovery, PE analysis, install/uninstall, session reader,
+                 shader scan and warming, Unreal cvar scanner
 crates/app       Rust + Slint: the preparation app
 src/dll          C++20: the Direct3D 11 proxy layer
+src/warm         C++20: tessera_warm.exe (out-of-process shader warming)
 include/tessera  Binary formats shared by the layer and the app
-tests            D3D11 smoke test (clean run, session contents, safe mode)
-tools            Export stub generator
+tests            D3D11 smoke test (every layer module, session contents, safe mode)
+tools            Export stub generator, overhead and A/B test scripts
 docs             Design plan
 ```
 

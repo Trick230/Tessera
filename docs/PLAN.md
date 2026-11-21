@@ -1,265 +1,308 @@
-# Tessera — plano completo
+# Tessera — full plan
 
-Documento de design. Resume todas as decisões e ideias discutidas até agora.
-Sempre que algo for medido e se revelar diferente do que aqui está, atualizar este ficheiro.
-
----
-
-## 1. Objetivo
-
-Permitir que GPUs de 8 GB corram jogos pesados em VRAM:
-
-- **Memória:** reduzir a VRAM usada até perto do *working set* real (ex.: FF7 Remake nos sewers, de ~11 GB
-  para 7–8 GB realista; 6 GB como melhor caso), sem perda de qualidade percetível.
-- **Zero stutters** de: falta de VRAM, compilação de shaders/PSOs e (na parte que é possível) traversal.
-- **Zero pop-in** (garantido em D3D11; impercetível em D3D12).
-- Tudo genérico: **sem trabalho manual por jogo**. No máximo, regras por motor (UE, Unity, …).
-
-### Limite físico a ter sempre presente
-
-O mínimo de VRAM "invisível" é o working set: texturas realmente vistas + render targets + geometria/BVH.
-Abaixo disso, ou há perda de qualidade, ou pop-in. O Tessera deve **medir e mostrar** esse mínimo por jogo/zona.
-
-A poupança vem de memória **residente mas não usada** (pools de streaming cheios de texturas fora do ecrã),
-VRAM de outros processos, duplicados e texturas sem compressão.
+Design document. It sums up every decision and idea discussed so far.
+Whenever something is measured and turns out different from what is written here, update this file.
 
 ---
 
-## 2. Arquitetura
+## 1. Goal
+
+Let GPUs with limited VRAM run games that are heavy on video memory, and remove stutter in general:
+
+- **Memory:** bring VRAM use down close to the real *working set* (e.g. FF7 Remake in the sewers, from
+  ~11 GB to a realistic 7–8 GB; 6 GB in the best case), with no perceptible quality loss.
+- **Zero stutters** from: running out of VRAM, shader/PSO compilation and (as far as possible) traversal.
+- **Zero pop-in** (guaranteed in D3D11; imperceptible in D3D12).
+- Everything generic: **no manual per-game work**. At most, per-engine rules (UE, Unity, …).
+
+### Physical limit to keep in mind
+
+The minimum "invisible" VRAM is the working set: textures actually seen + render targets + geometry/BVH.
+Below that there is either quality loss or pop-in. Tessera must **measure and show** that minimum per game/area.
+
+The savings come from memory that is **resident but unused** (streaming pools full of off-screen textures),
+VRAM taken by other processes, duplicates and uncompressed textures.
+
+---
+
+## 2. Architecture
 
 ```
-┌──────────────────────────┐   ficheiros   ┌───────────────────────────────┐
-│ tessera.exe (preparação) │ ───────────▶ │ tessera.dll (dentro do jogo)   │
-│ - deteta jogo/API/motor  │  caches       │ - proxy d3d11/d3d12/dxgi       │
-│ - processa registos      │ ◀─────────── │ - patch de vtables             │
-│ - chama ferramentas      │   registos    │ - memória, pacing, prefetch    │
-└──────────┬───────────────┘               └───────────────────────────────┘
-           │ processos separados
+┌──────────────────────────┐    files     ┌───────────────────────────────┐
+│ tessera.exe (preparation)│ ───────────▶ │ tessera layer (inside game)   │
+│ - detects game/API/engine│   caches     │ - d3d11/d3d12/dxgi proxy      │
+│ - processes session logs │ ◀─────────── │ - vtable patching             │
+│ - runs the helper tools  │   logs       │ - memory, pacing, prefetch    │
+└──────────┬───────────────┘              └───────────────────────────────┘
+           │ separate processes
            ▼
-  tessera_warm.exe (aquecimento de shaders, com o nome do exe do jogo)
-  tessera_instrument.exe (DXC / DXBC)
-  tessera_texcomp.exe (BC7/BC6H + FLIP)
+  tessera_warm.exe (shader warming, copied under the game's exe name)
+  tessera_instrument.exe (DXC / DXBC)          [planned]
+  tessera_texcomp.exe (BC7/BC6H + FLIP)         [planned]
 ```
 
-### Ciclo de uso
+Stack: the layer and the GPU tools are C++20 (CMake, VS 2022). The preparation app is Rust
+(`crates/core` for the logic, `crates/app` with a Slint UI). Binary formats: the C headers in
+`include/tessera` are the source of truth, mirrored in Rust.
 
-1. Utilizador abre o Tessera → "Preparar". A app:
-   - deteta API (imports do exe), motor, anti-cheat (recusa), hash do exe e versão do driver (invalida caches);
-   - processa os registos da sessão anterior (shaders, texturas, co-ocorrência, I/O);
-   - lê (só lê) configuração de outras ferramentas (RTSS, limite do painel NVIDIA);
-   - aquece shaders fora do processo; instala a DLL (encadeando a que existir); fecha.
-2. Utilizador lança o jogo normalmente (Steam, etc.).
-3. A DLL: abre caches por memory-mapping → cria o device real e patcha vtables → deteta funcionalidades
-   e componentes (Reflex, frame gen, streaming próprio, outras camadas) → pré-aloca o tile pool.
-4. Durante o jogo: hooks só trabalham em criações de recursos; trabalho por frame no `Present`;
-   thread de prefetch com prioridade de I/O baixa.
-5. Ao fechar: grava registos. Nada fica a correr.
+### Usage cycle
 
-### Instalação da DLL e encadeamento
+1. The user opens Tessera → "Prepare". The app:
+   - detects the API (exe imports), engine, anti-cheat (refuses), exe hash and driver version (invalidates caches);
+   - processes the previous session's logs (shaders, textures, co-occurrence, I/O);
+   - reads (only reads) other tools' settings (RTSS, NVIDIA control panel limit);
+   - warms shaders out of process; installs the DLL (chaining any existing one); closes.
+2. The user launches the game normally (Steam, etc.).
+3. The DLL: opens caches by memory-mapping → creates the real device and patches vtables → detects features
+   and components (Reflex, frame gen, own streaming, other layers) → preallocates the tile pool.
+4. During play: hooks only do work on resource creation; per-frame work in `Present`;
+   prefetch thread with low I/O priority.
+5. On exit: writes the logs. Nothing stays running.
 
-- D3D11 → proxy `d3d11.dll` (ou `dxgi.dll`). D3D12 → proxy `d3d12.dll` (uma `dxgi.dll` só vê o device a partir
-  da swapchain e pode perder recursos criados antes).
-- Se já existir uma DLL com o mesmo nome (ReShade, DXVK, Special K, OptiScaler, gravador do SCSKiller):
-  renomear para `<nome>.next.dll` e carregá-la como camada seguinte (`next=` em `tessera.ini`).
-  Desinstalar repõe o nome original.
-- Patchar as vtables da **implementação real** (obtida ao criar o device na proxy), não de wrappers
-  como o Streamline (`sl.interposer.dll`).
-- Agility SDK: o patch de vtables funciona; confirmar que se patcham os objetos que o jogo realmente recebe.
+### DLL installation and chaining
 
----
-
-## 3. Catálogo de otimizações
-
-Formato: **realista** (primeira versão) → **potencial** (versão máxima).
-
-### Memória (M)
-
-- **M1 Orçamento ajustado** — hooks a `DXGI_ADAPTER_DESC::DedicatedVideoMemory` e `QueryVideoMemoryInfo`
-  → também NVAPI/AGS; modo honesto automático para jogos com bom streaming (reporta o real menos o que o
-  Tessera usa).
-- **M2 Prioridades de residência** — D3D11 `SetEvictionPriority`, D3D12 `SetResidencyPriority`: render targets
-  e buffers no máximo → prioridades dinâmicas por LRU. Desligado por omissão (`residency=0`): no driver NVIDIA 621.14
-  `SetEvictionPriority` bloqueia a GPU ou faz crash no FF7R (7/7 runs) — nunca o chamar nesse driver.
-- **M3 Tile pool + texturas tiled/reserved** — D3D11.2 tiled resources para texturas só de leitura
-  (pedidas como `IMMUTABLE` → criadas `DEFAULT`, upload feito pelo Tessera); D3D12 reserved resources
-  para texturas committed → heaps D3D12 só com texturas fornecidos de forma virtual. Heaps com aliasing
-  ou render targets: nunca tocar.
-- **M4 Residência LRU sob pressão** — enquanto couber no orçamento, não fazer nada; quando aperta,
-  `SetResourceMinLOD`/`ResourceMinLODClamp` primeiro e só depois libertar tiles do mip maior das texturas
-  mais frias → remoção gradual, um mip de cada vez, com histerese.
-- **M5 Restauro sem pop-in** — mips removidos guardados em texturas STAGING (RAM legível pela GPU);
-  D3D11: no hook do bind (`*SetShaderResources`), copiar o mip **antes do draw** (a GPU executa por ordem);
-  limite de MB síncronos por frame (ex.: 32 MB); deferred contexts: restaurar antes do `ExecuteCommandList`.
-  D3D12: fila de cópia própria + `ID3D12CommandQueue::Wait` antes do `ExecuteCommandLists` do jogo.
-  Escritas do jogo em texturas geridas (`UpdateSubresource`, `CopySubresourceRegion`, `GenerateMips`)
-  exigem mapear os tiles antes (Tier 2 descarta escritas em tiles não mapeados).
-- **M6 Feedback de mips** — instrumentar shaders para registar (índice da textura, mip pedido):
-  DXBC em D3D11 (formato simples, checksum conhecido) → DXIL em D3D12 (DXC, reassinar com `dxil.dll`),
-  agregação por wave. Feito na preparação; shaders novos passam sem instrumentação.
-- **M7 Previsão** — conjuntos de material (texturas associadas juntas) → grafo de co-ocorrência aprendido
-  + margem de mip autoajustada pelas "atualizações atrasadas".
-- **M8 Deduplicação** — texturas `IMMUTABLE` com o mesmo hash partilham o objeto (`AddRef`)
-  → copy-on-write para `DEFAULT`.
-- **M9 Recompressão com controlo de qualidade** — RGBA8 → BC7, RGBA16F → BC6H, só texturas de leitura,
-  só se FLIP confirmar impercetível; feito offline na app, aplicado por hash na criação; hooks a `GetDesc`
-  e `CreateShaderResourceView` para mentir sobre o formato (incl. sRGB) → D3D12 com troca de descritores.
-  Nunca recomprimir saídas de NTC nem formatos não reconhecidos.
-- **M10 Orçamento de RAM** — os mips removidos vão para a RAM: limite fixo → dinâmico + LZ4 dos mips em RAM.
-- **M11 Medidor de working set** — mede o mínimo invisível por zona → sugere o orçamento ideal por jogo.
-- **R1 Reutilização de render targets** — RTs grandes que o jogo liberta ficam guardados (limite fixo) e
-  voltam no próximo create com o mesmo descritor; evita libertar+alocar perto do orçamento. Desligado por
-  omissão (`rt_recycle`). Corre abaixo de tiled tier 2; sem `SetEvictionPriority`. FF7R 4K: hitches
-  >50 ms/min 8,0 → 1,5.
-
-### Shaders (S) — objetivo: cobertura total sem o jogador ter de gravar
-
-Facto medido pelo SCSKiller: na NVIDIA em D3D12, a cache do driver é por **stage** e depende só dos shaders e
-dos bytes da root signature (estado sintetizado acerta; exceção: view instancing). Logo, na NVIDIA o problema
-é "todos os shaders + root signature certa", não uma explosão de combinações.
-
-- **S1 Procura exaustiva de bytecode** — todos os ficheiros da instalação, incluindo o exe e as DLLs;
-  tentar zlib, zstd, LZ4, Oodle, Brotli em blocos comprimidos; validar containers DXBC/DXIL. Arquivos
-  encriptados precisam de chave (pedir ao utilizador quando aplicável).
-- **S2 Caches de PSOs do motor** — Unreal: `.stable.upipelinecache` (empacotado nos containers IoStore),
-  com descrições completas de PSOs gravadas pelos developers. Formato próprio do Tessera alinhado com o
-  **SODB** (Advanced Shader Delivery, SQLite, especificação pública da Microsoft).
-- **S3 Root signatures** — embutidas (RTS0) → exatas; blobs serializados nos ficheiros/exe; regras por motor
-  (o SCSKiller tem regras para UE 4.20–5.7); **captura automática no arranque**: a app lança o jogo até ao
-  menu, a DLL regista as root signatures e PSOs globais, a app fecha-o. Motores bindless têm poucas root
-  signatures → cruzá-las com todos os shaders.
-- **S4 Pipelines válidos** — NVIDIA: cada stage num pipeline válido qualquer (emparelhar por assinaturas,
-  "cobertura por stage"). AMD: VS compilado conforme o PS e o estado → gerar variantes prováveis de formatos.
-- **S5 Aquecimento fora do processo** — `tessera_warm.exe` copiado com o nome do exe do jogo (a cache é
-  indexada pelo nome do exe). Fallback dentro do processo no arranque quando a chave não bate certo
-  (perfis AMD que trocam a chave, devices criados via AGS). D3D11 (NVIDIA): draw para um alvo 1×1 com
-  argumentos indiretos de contagem zero. Nunca matar o processo de aquecimento a meio; nunca correr ao
-  mesmo tempo que o jogo; relançar isolando itens suspeitos se o device for removido.
-- **S6 Autocorreção** — a DLL regista passivamente as compilações residuais durante o jogo normal;
-  a preparação seguinte compila-as. **Medidor de cobertura** na app (encontrados / compilados / falhados).
-- **S7 Cache do driver** — verificar que está em ilimitado (NVIDIA); respeitar o limite de 16 GiB no AMD;
-  recompilar após atualização do driver.
-- Impossível sem correr o jogo: shaders compilados em runtime a partir de HLSL, ray tracing no AMD (só
-  repetições exatas), arquivos encriptados sem chave, view instancing na NVIDIA.
-
-### Streaming e I/O (I)
-
-- **I1 Registo de leituras** — hooks a `CreateFileW`/`ReadFile` só na sessão de aprendizagem.
-- **I2 Prefetch pela lista** — thread na DLL com prioridade de I/O baixa → limitado à RAM disponível.
-- **I3 Prefetch previsivo** — ligar leituras ao grafo de texturas.
-- **I4 Alocações instantâneas** — criar textura = recurso virtual + tiles do pool pré-alocado.
-- **I5 Upload repartido** — mips pequenos primeiro; mip completo em partes.
-
-### Motor (U) — variáveis de consola do Unreal sem chamar o motor
-
-- **U1 Cvars UE4/UE5** — a app encontra offline, no executável, o slot do valor de cada cvar (registo
-  decodificado, tipo int/float/bool) e escreve `ue_image` + `cvar.<nome>=<valor> <tipo> <forma> <rva>` no
-  `tessera.ini`. A DLL valida a build e cada slot (VirtualQuery, vtable, ponteiro), só escreve valores e
-  repõe-os uma vez por segundo no `Present`. Regra: só escritas, nunca chamadas ao motor, scan sempre
-  offline. Cvars lidas só no arranque não funcionam (a escrita é após o primeiro device). Perfil
-  `ue_streaming` (pool pelo orçamento de VRAM, 3 texturas/frame) e variantes de teste no ini
-  (`ue_drs_off`, `ue_rt_grow`, `ue_pool_vram`, `ue_shaders_on_load`, `ue_load_limits`), todos desligados por
-  omissão até o A/B mostrar ganho.
-
-### Pacing e sistema (P) — tudo só ao nível do processo
-
-- **P1 Limitador preciso** — timer de alta resolução + espera ativa final. Regra: o limitador mais baixo
-  manda; o Tessera fica ligeiramente abaixo do limite mais baixo encontrado (RTSS, painel NVIDIA), a não
-  ser que o utilizador tenha posto de propósito um limite mais baixo noutra ferramenta.
-- **P2 Flip model + tearing** para D3D11 em janela sem bordas: converter swapchains blit (`DISCARD` →
-  `FLIP_DISCARD`, `SEQUENTIAL` → `FLIP_SEQUENTIAL`, mínimo 2 buffers) e, com VRR, `ALLOW_TEARING` em
-  `SyncInterval 0`. Só em janela, só swapchains do jogo (C3). Excluir: MSAA no back buffer, formatos
-  sRGB/não suportados pelo flip, janelas filhas/GDI. Manter a flag em `ResizeBuffers`; sem tearing em ecrã
-  inteiro exclusivo. O flip desliga o back buffer do OM em cada `Present`: repor os render targets do jogo
-  depois do `Present`. Desligado por omissão até ser validado em jogos reais.
-- **P3 Latência de frames** — `SetMaximumFrameLatency`, waitable object.
-- **P4 CPU sets** — thread que chama `Present` em P-cores (CPUs híbridos).
-- **P5 Processo** — resolução do timer, EcoQoS desligado (`SetProcessInformation`), prioridade moderada.
-- **P6 Recuo** — com Reflex ou frame generation, o limitador desliga-se (resto continua).
-
-### Diagnóstico (D)
-
-- **D1** Frametimes (QPC por `Present` mais exterior) + eventos da API, sempre ligado e barato.
-- **D2** Relatório de stutters por causa, feito na app: shaders, criação de recursos, VRAM acima do orçamento,
-  I/O, pacing, lógica do jogo.
-- **D3** Teste de sistema opcional, na app, fora do jogo: DPC, disco, throttling.
-- **D4** Estatísticas no OSD do RTSS (opcional; sem overlay próprio).
-
-### Infraestrutura e convivência (C)
-
-- **C1** DLL proxy, deteção de API, instalação/desinstalação limpas.
-- **C2** Encadeamento de DLLs existentes.
-- **C3** Exclusão por módulo (endereço de retorno + `GetModuleHandleEx` na criação de recursos).
-- **C4** Deteção de funcionalidades (`CheckFeatureSupport`) e degradação por módulo.
-- **C5** Modo seguro (contador de crashes).
-- **C6** Invalidação de caches por hash do exe e versão do driver.
-- **C7** Deteção de anti-cheat → recusa.
-- **C8** Deteção de streaming próprio do jogo / NTC → recuar nesses recursos e no orçamento.
+- D3D11 → `d3d11.dll` proxy (or `dxgi.dll`). D3D12 → `d3d12.dll` proxy (a `dxgi.dll` only sees the device through
+  the swapchain and may miss resources created earlier).
+- If a DLL with the same name already exists (ReShade, DXVK, Special K, OptiScaler, SCSKiller's recorder):
+  rename it to `<name>.next.dll` and load it as the next layer (`next=` in `tessera.ini`).
+  Uninstalling restores the original name.
+- Patch the vtables of the **real implementation** (obtained when the proxy creates the device), not of wrappers
+  such as Streamline (`sl.interposer.dll`).
+- Agility SDK: vtable patching works; confirm that the objects patched are the ones the game actually receives.
 
 ---
 
-## 4. Problemas fora de alcance (só avisar)
+## 3. Optimization catalogue
 
-Antivírus a analisar ficheiros, overlays de terceiros, tarefas de fundo, RAM do sistema esgotada e pagefile,
-DPC de drivers, throttling, overclocks/XMP instáveis, SSD lento, polling de rato muito alto,
-garbage collection, picos de lógica do jogo, DRM, a parte de CPU do traversal.
+Format: **realistic** (first version) → **potential** (full version).
+
+### Memory (M)
+
+- **M1 Adjusted budget** — hooks on `DXGI_ADAPTER_DESC::DedicatedVideoMemory` and `QueryVideoMemoryInfo`
+  → also NVAPI/AGS; automatic honest mode for games with good streaming (reports the real figure minus what
+  Tessera uses).
+- **M2 Residency priorities** — D3D11 `SetEvictionPriority`, D3D12 `SetResidencyPriority`: render targets
+  and buffers at maximum → dynamic LRU priorities. Off by default (`residency=0`): on NVIDIA driver 621.14
+  `SetEvictionPriority` hangs the GPU or crashes FF7R (7/7 runs) — never call it on that driver.
+- **M3 Tile pool + tiled/reserved textures** — D3D11.2 tiled resources for read-only textures
+  (requested as `IMMUTABLE` → created `DEFAULT`, upload done by Tessera); D3D12 reserved resources
+  for committed textures → D3D12 heaps holding only textures, backed virtually. Aliased heaps
+  or render targets: never touch.
+- **M4 LRU residency under pressure** — while everything fits the budget, do nothing; when it gets tight,
+  `SetResourceMinLOD`/`ResourceMinLODClamp` first and only then free the tiles of the largest mip of the
+  coldest textures → gradual removal, one mip at a time, with hysteresis.
+- **M5 Pop-in-free restore** — removed mips kept in STAGING textures (GPU-readable RAM);
+  D3D11: in the bind hook (`*SetShaderResources`), copy the mip **before the draw** (the GPU executes in order);
+  cap of synchronous MB per frame (e.g. 32 MB); deferred contexts: restore before `ExecuteCommandList`.
+  D3D12: own copy queue + `ID3D12CommandQueue::Wait` before the game's `ExecuteCommandLists`.
+  Game writes to managed textures (`UpdateSubresource`, `CopySubresourceRegion`, `GenerateMips`)
+  require mapping the tiles first (Tier 2 drops writes to unmapped tiles).
+- **M6 Mip feedback** — instrument shaders to record (texture index, requested mip):
+  DXBC in D3D11 (simple format, known checksum) → DXIL in D3D12 (DXC, re-sign with `dxil.dll`),
+  aggregated per wave. Done during preparation; new shaders pass through uninstrumented.
+- **M7 Prediction** — material sets (textures bound together) → learned co-occurrence graph
+  + mip margin self-tuned by "late updates".
+- **M8 Deduplication** — `IMMUTABLE` textures with the same hash share the object (`AddRef`)
+  → copy-on-write for `DEFAULT`.
+- **M9 Quality-checked recompression** — RGBA8 → BC7, RGBA16F → BC6H, read-only textures only,
+  only if FLIP confirms it is imperceptible; done offline in the app, applied by hash at creation; hooks on `GetDesc`
+  and `CreateShaderResourceView` to lie about the format (incl. sRGB) → D3D12 with descriptor swapping.
+  Never recompress NTC outputs or unrecognised formats.
+- **M10 RAM budget** — removed mips go to RAM: fixed cap → dynamic + LZ4 of the mips in RAM.
+- **M11 Working-set meter** — measures the invisible minimum per area → suggests the ideal budget per game.
+- **R1 Render target reuse** — big render targets the game releases are kept (fixed cap) and handed back
+  on the next create with the same descriptor; avoids free+alloc close to the budget. Off by default
+  (`rt_recycle`). Runs below tiled tier 2; no `SetEvictionPriority`. FF7R at 4K: hitches
+  >50 ms/min 8.0 → 1.5.
+
+### Shaders (S) — goal: full coverage without the player having to record
+
+Fact measured by SCSKiller: on NVIDIA in D3D12, the driver cache is per **stage** and depends only on the shaders and
+the root signature bytes (synthesised state hits; exception: view instancing). So on NVIDIA the problem
+is "all shaders + the right root signature", not an explosion of combinations.
+
+- **S1 Exhaustive bytecode search** — every file of the install, including the exe and DLLs;
+  try zlib, zstd, LZ4, Oodle, Brotli on compressed blocks; validate DXBC/DXIL containers. Encrypted
+  archives need a key (ask the user when applicable).
+- **S2 Engine PSO caches** — Unreal: `.stable.upipelinecache` (packed inside IoStore containers),
+  with full PSO descriptions recorded by the developers. Tessera's own format aligned with
+  **SODB** (Advanced Shader Delivery, SQLite, public Microsoft specification).
+- **S3 Root signatures** — embedded (RTS0) → exact; serialised blobs in files/exe; per-engine rules
+  (SCSKiller has rules for UE 4.20–5.7); **automatic capture at startup**: the app launches the game up to the
+  menu, the DLL records root signatures and global PSOs, the app closes it. Bindless engines have few root
+  signatures → cross them with every shader.
+- **S4 Valid pipelines** — NVIDIA: each stage in any valid pipeline (pair by signatures,
+  "per-stage coverage"). AMD: VS compiled according to the PS and the state → generate likely format variants.
+- **S5 Out-of-process warming** — `tessera_warm.exe` copied under the game's exe name (the cache is
+  keyed by the exe name). In-process fallback at startup when the key does not match
+  (AMD profiles that swap the key, devices created through AGS). D3D11 (NVIDIA): draw into a 1×1 target with
+  zero-count indirect arguments. Never kill the warming process midway; never run it at the
+  same time as the game; relaunch isolating suspect items if the device is removed.
+- **S6 Self-correction** — the DLL passively records the leftover compilations during normal play;
+  the next preparation compiles them. **Coverage meter** in the app (found / compiled / failed).
+- **S7 Driver cache** — check that it is set to unlimited (NVIDIA); respect the 16 GiB limit on AMD;
+  recompile after a driver update.
+- Impossible without running the game: shaders compiled at runtime from HLSL, ray tracing on AMD (only
+  exact repeats), encrypted archives without a key, view instancing on NVIDIA.
+
+### Streaming and I/O (I)
+
+- **I1 Read log** — hooks on `CreateFileW`/`ReadFile`, only in the learning session.
+- **I2 List prefetch** — thread in the DLL with low I/O priority → bounded by available RAM.
+- **I3 Predictive prefetch** — link reads to the texture graph.
+- **I4 Instant allocations** — creating a texture = virtual resource + tiles from the preallocated pool.
+- **I5 Split upload** — small mips first; full mip in parts.
+
+### Engine (U) — Unreal console variables without calling the engine
+
+- **U1 UE4/UE5 cvars** — the app finds offline, in the executable, the value slot of each cvar (decoded
+  registration, int/float/bool type) and writes `ue_image` + `cvar.<name>=<value> <type> <form> <rva>` into
+  `tessera.ini`. The DLL checks the build and every slot (VirtualQuery, vtable, pointer), only writes values and
+  restores them once a second in `Present`. Rule: writes only, never calls into the engine, scan always
+  offline. Cvars read only at startup do not work (the write happens after the first device). Profile
+  `ue_streaming` (pool from the VRAM budget, 3 textures/frame) and test variants in the ini
+  (`ue_drs_off`, `ue_rt_grow`, `ue_pool_vram`, `ue_shaders_on_load`, `ue_load_limits`), all off by
+  default until an A/B shows a gain.
+
+### Pacing and system (P) — all at process level only
+
+- **P1 Precise limiter** — high-resolution timer + final busy-wait. Rule: the lowest limiter
+  wins; Tessera sits slightly below the lowest limit found (RTSS, NVIDIA control panel), unless the
+  user deliberately set a lower limit in another tool.
+- **P2 Flip model + tearing** for D3D11 in borderless windows: convert blit swapchains (`DISCARD` →
+  `FLIP_DISCARD`, `SEQUENTIAL` → `FLIP_SEQUENTIAL`, at least 2 buffers) and, with VRR, `ALLOW_TEARING` at
+  `SyncInterval 0`. Windowed only, game swapchains only (C3). Exclude: MSAA back buffers,
+  sRGB/flip-unsupported formats, child/GDI windows. Keep the flag on `ResizeBuffers`; no tearing in exclusive
+  fullscreen. Flip unbinds the back buffer from the OM on every `Present`: restore the game's render targets
+  after `Present`. Off by default until validated in real games.
+- **P3 Frame latency** — `SetMaximumFrameLatency`, waitable object.
+- **P4 CPU sets** — the thread that calls `Present` on P-cores (hybrid CPUs).
+- **P5 Process** — timer resolution, EcoQoS off (`SetProcessInformation`), moderate priority.
+- **P6 Back-off** — with Reflex or frame generation, the limiter turns off (the rest keeps going).
+
+### Diagnostics (D)
+
+- **D1** Frame times (QPC per outermost `Present`) + API events, always on and cheap.
+- **D2** Stutter report by cause, built in the app: shaders, resource creation, VRAM over budget,
+  I/O, pacing, game logic.
+- **D3** Optional system test, in the app, outside the game: DPC, disk, throttling.
+- **D4** Stats in the RTSS OSD (optional; no own overlay).
+
+### Infrastructure and coexistence (C)
+
+- **C1** Proxy DLL, API detection, clean install/uninstall.
+- **C2** Chaining of existing DLLs.
+- **C3** Per-module exclusion (return address + `GetModuleHandleEx` at resource creation).
+- **C4** Feature detection (`CheckFeatureSupport`) and per-module degradation.
+- **C5** Safe mode (crash counter).
+- **C6** Cache invalidation by exe hash and driver version.
+- **C7** Anti-cheat detection → refuse.
+- **C8** Detection of the game's own streaming / NTC → back off on those resources and on the budget.
+
+---
+
+## 4. Out-of-reach problems (warn only)
+
+Antivirus scanning files, third-party overlays, background tasks, exhausted system RAM and pagefile,
+driver DPCs, throttling, unstable overclocks/XMP, slow SSD, very high mouse polling,
+garbage collection, game logic spikes, DRM, the CPU side of traversal.
 
 ---
 
 ## 5. Roadmap
 
-| Fase | Entra | Critério para avançar |
+| Phase | Includes | Exit criterion |
 |---|---|---|
-| 0. Fundações | C1, C2, C5, C6, C7, D1 (D3D11) | Jogo corre igual, custo < 1% |
-| 1. Ganhos seguros | M1, M2, P1–P3, P5, P6, S7, D2 básico | Pacing melhor, sem regressões |
-| 2. Shaders | S1, S2, S5 (D3D11 NVIDIA + D3D12), S6 + medidor | Já na 1.ª sessão: stutters de compilação e pop-in por PSOs por compilar a zero ou quase (só os casos impossíveis da secção S); zero na 2.ª |
-| 3. Memória D3D11 | M3, M4, M5, M10, M11, C3, C4 | VRAM a descer, zero restauros atrasados |
-| 4. Previsão e I/O | M7, M8, I1–I5, P4 | Menos stutters de traversal, pop-in ~0 |
-| 5. Qualidade fina | M6 (DXBC), M9 | Poupança extra sem diferença na FLIP |
-| 6. D3D12 | M1/M2/P/S → M3/M4 committed → C8 → M6 (DXIL) → M7; S3 captura no arranque | FF7 Remake: VRAM a descer, zero stutters de PSO |
-| 7. Expansão | D3, D4, M9 em D3D12, heaps virtuais, AMD (S4) | Funciona com mods/overlays populares |
+| 0. Foundations | C1, C2, C5, C6, C7, D1 (D3D11) | Game runs the same, cost < 1% |
+| 1. Safe wins | M1, M2, P1–P3, P5, P6, S7, basic D2 | Better pacing, no regressions |
+| 2. Shaders | S1, S2, S5 (D3D11 NVIDIA + D3D12), S6 + meter | Already in the 1st session: compilation stutters and pop-in from uncompiled PSOs at or near zero (only the impossible cases of section S); zero in the 2nd |
+| 3. D3D11 memory | M3, M4, M5, M10, M11, C3, C4 | VRAM going down, zero late restores |
+| 4. Prediction and I/O | M7, M8, I1–I5, P4 | Fewer traversal stutters, pop-in ~0 |
+| 5. Fine quality | M6 (DXBC), M9 | Extra savings with no FLIP difference |
+| 6. D3D12 | M1/M2/P/S → M3/M4 committed → C8 → M6 (DXIL) → M7; S3 startup capture | FF7 Remake: VRAM going down, zero PSO stutters |
+| 7. Expansion | D3, D4, M9 in D3D12, virtual heaps, AMD (S4) | Works with popular mods/overlays |
 
-Jogos de teste: um jogo D3D11 pesado em VRAM (fases 0–5); FF7 Remake (D3D12) na fase 6.
+Test games: a VRAM-heavy D3D11 game (phases 0–5) — FF7 Remake forced to D3D11 with `-dx11` so far;
+FF7 Remake (D3D12) in phase 6.
 
-### Fase 0 — tarefas concretas
+### Status (2026-11-21)
 
-1. Repositório: CMake raiz, `src/dll`, `src/app`, `src/common` (formatos, hashing), `tools/`, `tests/`.
-2. `tessera.dll` como proxy `d3d11.dll`: encaminhar todas as exports para a DLL do sistema
-   (`GetSystemDirectoryW`) ou para a `next=` do `tessera.ini`.
-3. Utilitário de patch de vtables (guardar original, `VirtualProtect`, proteção de reentrância).
-4. Hooks de registo: `CreateTexture2D`, `CreateBuffer`, `CreateShaderResourceView`, `Present`.
-5. Registo binário por sessão em `%LOCALAPPDATA%\Tessera\<jogo>\` (recursos, frametimes).
-6. Modo seguro: contador de arranques/crashes.
-7. App mínima: lista de jogos por pasta escolhida, deteção de API pelos imports, deteção de anti-cheat
-   (ficheiros conhecidos: EasyAntiCheat, BattlEye, etc.), instalar/desinstalar com encadeamento.
-8. Medir: overhead da DLL vs sem DLL; relatório de onde vem a VRAM.
+The user asked to start the optimizations before the Phase 0 gate was formally closed, so phases 0–3
+were built side by side. Everything below is on `master`.
+
+**Done (D3D11):**
+- Phase 0: C1, C2, C5, C6, C7, D1 — proxy with chaining, safe mode, session recording, app
+  (Rust + Slint) with discovery (Steam/Epic/folders), API/engine/anti-cheat detection, install/uninstall.
+  Overhead measured with `tools/measure_overhead.ps1`.
+- Phase 1: M1 (DXGI + NVAPI budget/description hooks, also before the first device), M2 (off by default),
+  P1 limiter with RTSS/NVIDIA limit detection, P2 flip model (off by default), P3, P5, P6, S7, basic D2.
+- Phase 2: S1 (install scan incl. Oodle, zlib, zstd, LZ4; FF7R: 11,319 shaders), S5 (`tessera_warm.exe`
+  with a watchdog that never kills), S6 (capture of new shaders in play), coverage meter in the app.
+- Phase 3: M3/M4/M5/M10 mip residency (tiled tier 2 only, off by default), M11 working-set meter,
+  C3 per-module exclusion, deferred-context support, device replacement takeover.
+- Extra: R1 render target reuse, U1 Unreal cvars (+ test variants), SLOW_CREATE session records,
+  `tools/global_test.ps1` A/B harness (interleaved Steam runs, PresentMon, per-variant means).
+
+**Findings that shape the next steps (FF7R, D3D11, RTX 4060, NVIDIA 621.14):**
+- The GPU is tiled tier 1 here → mip residency cannot run; FF7R stays under its budget and ignores the DXGI
+  budget (fixed UE streaming pool) and the user's `Engine.ini`.
+- `SetEvictionPriority` crashes or hangs the driver (M2 and an earlier R1 version).
+- Remaining stutter: streaming texture creates with initial data on 4 worker threads (100–240 ms each,
+  contention inside the driver; SLOW_CREATE + WPR), plus 4K render target churn every 10–12 s (R1 cut
+  >50 ms hitches from 8.0 to 1.5 per minute).
+
+**What is left:**
+1. U1 A/B in FF7R: base `ue_streaming` vs `ue_drs_off` vs `ue_rt_grow` (2 rounds), then `ue_pool_vram`,
+   `ue_shaders_on_load`, `ue_load_limits`. Promote what helps to defaults/app options; drop the rest.
+2. Open M1 design points: write `vram_budget_mb` only for D3D11 games; `g_other_api` is sticky
+   (a D3D11 game probing D3D12 loses M1); volk and `ID3D12DeviceFactory` are not detected.
+3. Phase 2 exit criterion still needs a first-session play test; S2 deferred (feeds D3D12 PSOs only).
+4. Deferred with reasons: mip-by-mip eviction (needs per-mip tile layout), LZ4 of evicted mips (decode on the
+   bind would stall; needs predictive restore first), AGS (AMD), safe mode does not cover a crash in the IAT
+   patch before the first device.
+5. Validate P2 in a real blit-model game and mip residency in a tier 2 game that runs over budget.
+6. Then phase 4 (prediction and I/O) and phase 6 (D3D12).
+
+### Phase 0 — concrete tasks
+
+1. Repository: root CMake, `src/dll`, `src/warm`, `include/tessera` (formats), `crates/` (app), `tools/`, `tests/`.
+2. `tessera.dll` as a `d3d11.dll` proxy: forward every export to the system DLL
+   (`GetSystemDirectoryW`) or to the `next=` of `tessera.ini`.
+3. Vtable patching utility (save the original, `VirtualProtect`, reentrancy guard).
+4. Logging hooks: `CreateTexture2D`, `CreateBuffer`, `CreateShaderResourceView`, `Present`.
+5. Binary session log in `%LOCALAPPDATA%\Tessera\` (resources, frame times).
+6. Safe mode: start/crash counter.
+7. Minimal app: game list from a chosen folder, API detection from imports, anti-cheat detection
+   (known files: EasyAntiCheat, BattlEye, etc.), install/uninstall with chaining.
+8. Measure: DLL overhead vs no DLL; report of where the VRAM goes.
 
 ---
 
-## 6. Hipóteses por validar (medir, não assumir)
+## 6. Hypotheses to validate (measure, don't assume)
 
-- Custo real de `UpdateTileMappings` e da amostragem de tiled resources em cada driver.
-- Custo da instrumentação de shaders (alvo: poucos %).
-- D3D11 no AMD: gravando combinações completas de estado, consegue-se aquecer? (o SCSKiller só aquece
-  D3D11 na NVIDIA).
-- Aceitação de DXIL modificado (reassinatura com `dxil.dll`).
-- Percentagem de texturas tiled-áveis em jogos D3D11 reais.
-- Quanto do pool de streaming do UE4 está fora do ecrã nos sewers do FF7 Remake.
-- FF7R (D3D11, NVIDIA 621.14): ignora o `Engine.ini` do utilizador e o orçamento DXGI (pool fixo). Stutter
-  restante: creates de texturas de streaming com dados iniciais em 4 threads de workers (100–240 ms cada,
-  contenção no driver; SLOW_CREATE + WPR) e churn de RTs 4K a cada 10–12 s. Hipótese: a DRS a mudar a
-  resolução com `r.SceneRenderTargetResizeMethod=0` causa a churn — testar `ue_drs_off` e `ue_rt_grow`.
+- Real cost of `UpdateTileMappings` and of sampling tiled resources on each driver.
+- Cost of shader instrumentation (target: a few %).
+- D3D11 on AMD: can it be warmed by recording full state combinations? (SCSKiller only warms
+  D3D11 on NVIDIA.)
+- Acceptance of modified DXIL (re-signing with `dxil.dll`).
+- Share of tileable textures in real D3D11 games.
+- How much of the UE4 streaming pool is off screen in FF7 Remake's sewers.
+- FF7R: does dynamic resolution resizing with `r.SceneRenderTargetResizeMethod=0` cause the 4K render target
+  churn? Test `ue_drs_off` and `ue_rt_grow`. Caveat: the recreated targets had the same descriptor.
 
 ---
 
-## 7. Referências
+## 7. References
 
-- **SCSKiller** (GPL-3.0-or-later, reutilizável): https://github.com/BlueHeisenberg/SCSKiller —
-  ler `ARCHITECTURE.md`. Copiar: planos só com hashes, aquecimento com cópia do exe, comportamento medido
-  (`selftest`), gravador com caixa de entrada e limite de tamanho, recuperação de device removido,
-  deteção de atualização do driver, só ler ficheiros em jogos com anti-cheat.
-- **CUE4Parse** (leitura de paks/IoStore do Unreal, C# — portar lógica), **ree-pak-rs** (RE Engine).
+- **SCSKiller** (GPL-3.0-or-later, reusable): https://github.com/BlueHeisenberg/SCSKiller —
+  read `ARCHITECTURE.md`. Copy: hash-only plans, warming with a copy of the exe, measured behaviour
+  (`selftest`), recorder with an inbox and a size cap, device-removed recovery,
+  driver update detection, read-only on anti-cheat games.
+- **CUE4Parse** (Unreal pak/IoStore reader, C# — port the logic), **ree-pak-rs** (RE Engine).
 - **Advanced Shader Delivery / SODB**: https://microsoft.github.io/DirectX-Specs/d3d/StateObjectDatabase.html
-- **Unreal bundled PSO caches**: documentação da Epic sobre `.upipelinecache` / `.spc` / `.shk`.
-- **NVIDIA RTX Neural Texture Compression** (RTX Kit): o Tessera convive, não substitui.
-- Bibliotecas: Dear ImGui, xxHash, bc7enc_rdo, NVIDIA FLIP, DXC, Catch2.
-- Referências de técnica (só estudo): DXVK, Special K, ReShade.
+- **Unreal bundled PSO caches**: Epic's documentation on `.upipelinecache` / `.spc` / `.shk`.
+- **NVIDIA RTX Neural Texture Compression** (RTX Kit): Tessera coexists, does not replace.
+- **Zenardi/ff7r-pc-optimization**: FF7R Engine.ini profiles (no measurements); useful parts are
+  `r.DynamicRes.OperationMode=0`, `r.Streaming.LimitPoolSizeToVRAM=1`, `r.CreateShadersOnLoad=1`.
+- Libraries: xxHash, Slint, bc7enc_rdo, NVIDIA FLIP, DXC, Catch2.
+- Technique references (study only): DXVK, Special K, ReShade.
