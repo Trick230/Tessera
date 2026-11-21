@@ -645,7 +645,25 @@ int tiled() {
     if (evicted + (96ull << 20) > before) return fail("top mips must leave VRAM");
     if (g.ctx->GetResourceMinLOD(tex[3]) != 0.0f) return fail("the game's min LOD must stay 0");
 
-    // M5: binding restores before the draw, immediate and deferred.
+    // M5: binding restores before the draw, immediate and deferred. The bind
+    // itself carries the restore: its CPU cost is what the frame pays.
+    {
+        LARGE_INTEGER f, t0, t1;
+        QueryPerformanceFrequency(&f);
+        double sum = 0, worst = 0;
+        for (UINT t = 0; t < kTiledCount; ++t) {
+            QueryPerformanceCounter(&t0);
+            g.ctx->PSSetShaderResources(0, 1, &srv[t]);
+            QueryPerformanceCounter(&t1);
+            const double us = double(t1.QuadPart - t0.QuadPart) * 1e6 / double(f.QuadPart);
+            sum += us;
+            if (us > worst) worst = us;
+        }
+        ID3D11ShaderResourceView* none = nullptr;
+        g.ctx->PSSetShaderResources(0, 1, &none);
+        std::printf("tiled: restore on bind %.0f us mean, %.0f us worst (%u textures)\n", sum / kTiledCount, worst,
+                    kTiledCount);
+    }
     for (UINT t = 0; t < kTiledCount; ++t)
         if (!probe_all_mips(g, srv[t], t)) return fail("content after restore");
     present_frames(g, 3);

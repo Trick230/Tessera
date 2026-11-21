@@ -335,6 +335,25 @@ bool repool(Res& r, bool with_top) {
     return true;
 }
 
+
+// Under g_op. Evicted -> whole, cheaply, for the bind that needs it: the
+// pool grows by mip 0's tiles (a new allocation behind the same pool, mips
+// 1.. untouched) and mip 0 is mapped there. Shrinking does not give memory
+// back, so evict() still moves the tail to a fresh pool, at Present.
+bool grow_top(Res& r) {
+    using ResizeFn = decltype(&hk_ResizePool);
+    const uint64_t bytes = uint64_t(r.tail + r.tiles0) * kTile;
+    HRESULT hr = orig<ResizeFn>(g_resize_pool, g_imm)(g_ctx2, r.pool, bytes);
+    residency_check_hooks(g_imm);
+    if (FAILED(hr)) return false;
+    D3D11_TILED_RESOURCE_COORDINATE c = {};
+    D3D11_TILE_REGION_SIZE s = {};
+    s.NumTiles = r.tiles0;
+    UINT flag = 0, start = r.tail, count = r.tiles0;
+    hr = orig<MapFn>(g_map, g_imm)(g_ctx2, r.tex, 1, &c, &s, r.pool, 1, &flag, &start, &count, 0);
+    residency_check_hooks(g_imm);
+    return SUCCEEDED(hr);  // a failed map leaves the grown pool: no harm, freed with it
+}
 // Under g_op on the immediate context's thread. Pending -> Resident.
 bool upload(Res& r) {
     if (FAILED(map_tiles(r.tex, r.pool, r.tiles0, r.tail, true))) return false;
@@ -349,7 +368,7 @@ bool upload(Res& r) {
 // Under g_op. Evicted -> Resident: a pool with room for the top mip, the
 // mip copied back, the clamp lifted. All queued before the caller's draw.
 bool restore(Res& r) {
-    if (!repool(r, true)) return false;
+    if (!grow_top(r)) return false;
     copy_top(r.tex, r.staging);
     set_lod(r.tex, r.lod);
     r.staging->Release();
