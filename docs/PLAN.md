@@ -78,7 +78,8 @@ Formato: **realista** (primeira versão) → **potencial** (versão máxima).
   → também NVAPI/AGS; modo honesto automático para jogos com bom streaming (reporta o real menos o que o
   Tessera usa).
 - **M2 Prioridades de residência** — D3D11 `SetEvictionPriority`, D3D12 `SetResidencyPriority`: render targets
-  e buffers no máximo → prioridades dinâmicas por LRU.
+  e buffers no máximo → prioridades dinâmicas por LRU. Desligado por omissão (`residency=0`): no driver NVIDIA 621.14
+  `SetEvictionPriority` bloqueia a GPU ou faz crash no FF7R (7/7 runs) — nunca o chamar nesse driver.
 - **M3 Tile pool + texturas tiled/reserved** — D3D11.2 tiled resources para texturas só de leitura
   (pedidas como `IMMUTABLE` → criadas `DEFAULT`, upload feito pelo Tessera); D3D12 reserved resources
   para texturas committed → heaps D3D12 só com texturas fornecidos de forma virtual. Heaps com aliasing
@@ -105,6 +106,10 @@ Formato: **realista** (primeira versão) → **potencial** (versão máxima).
   Nunca recomprimir saídas de NTC nem formatos não reconhecidos.
 - **M10 Orçamento de RAM** — os mips removidos vão para a RAM: limite fixo → dinâmico + LZ4 dos mips em RAM.
 - **M11 Medidor de working set** — mede o mínimo invisível por zona → sugere o orçamento ideal por jogo.
+- **R1 Reutilização de render targets** — RTs grandes que o jogo liberta ficam guardados (limite fixo) e
+  voltam no próximo create com o mesmo descritor; evita libertar+alocar perto do orçamento. Desligado por
+  omissão (`rt_recycle`). Corre abaixo de tiled tier 2; sem `SetEvictionPriority`. FF7R 4K: hitches
+  >50 ms/min 8,0 → 1,5.
 
 ### Shaders (S) — objetivo: cobertura total sem o jogador ter de gravar
 
@@ -143,6 +148,17 @@ dos bytes da root signature (estado sintetizado acerta; exceção: view instanci
 - **I3 Prefetch previsivo** — ligar leituras ao grafo de texturas.
 - **I4 Alocações instantâneas** — criar textura = recurso virtual + tiles do pool pré-alocado.
 - **I5 Upload repartido** — mips pequenos primeiro; mip completo em partes.
+
+### Motor (U) — variáveis de consola do Unreal sem chamar o motor
+
+- **U1 Cvars UE4/UE5** — a app encontra offline, no executável, o slot do valor de cada cvar (registo
+  decodificado, tipo int/float/bool) e escreve `ue_image` + `cvar.<nome>=<valor> <tipo> <forma> <rva>` no
+  `tessera.ini`. A DLL valida a build e cada slot (VirtualQuery, vtable, ponteiro), só escreve valores e
+  repõe-os uma vez por segundo no `Present`. Regra: só escritas, nunca chamadas ao motor, scan sempre
+  offline. Cvars lidas só no arranque não funcionam (a escrita é após o primeiro device). Perfil
+  `ue_streaming` (pool pelo orçamento de VRAM, 3 texturas/frame) e variantes de teste no ini
+  (`ue_drs_off`, `ue_rt_grow`, `ue_pool_vram`, `ue_shaders_on_load`, `ue_load_limits`), todos desligados por
+  omissão até o A/B mostrar ganho.
 
 ### Pacing e sistema (P) — tudo só ao nível do processo
 
@@ -228,6 +244,10 @@ Jogos de teste: um jogo D3D11 pesado em VRAM (fases 0–5); FF7 Remake (D3D12) n
 - Aceitação de DXIL modificado (reassinatura com `dxil.dll`).
 - Percentagem de texturas tiled-áveis em jogos D3D11 reais.
 - Quanto do pool de streaming do UE4 está fora do ecrã nos sewers do FF7 Remake.
+- FF7R (D3D11, NVIDIA 621.14): ignora o `Engine.ini` do utilizador e o orçamento DXGI (pool fixo). Stutter
+  restante: creates de texturas de streaming com dados iniciais em 4 threads de workers (100–240 ms cada,
+  contenção no driver; SLOW_CREATE + WPR) e churn de RTs 4K a cada 10–12 s. Hipótese: a DRS a mudar a
+  resolução com `r.SceneRenderTargetResizeMethod=0` causa a churn — testar `ue_drs_off` e `ue_rt_grow`.
 
 ---
 
