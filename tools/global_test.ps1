@@ -5,7 +5,8 @@
 # the player loads the save, presses F10 (-Key) at the start of the route and
 # plays it for -Record seconds while PresentMon records. Run 0 is a warm-up
 # left out of the means (-NoWarmup skips it). -Variants "a=0;b=0" runs only
-# "on" runs, one per set of tessera.ini overrides (bisecting a module). The "on" runs also keep the layer's log and session
+# runs, one per set of tessera.ini overrides (bisecting a module); a variant
+# "off" is a run without the layer. Means are per mode (off, on, on-<variant>). The "on" runs also keep the layer's log and session
 # summary (shaders, VRAM, working set, mip residency) and list what each
 # module reported. Needs an elevated shell (PresentMon uses ETW) and a fresh
 # build (build.ps1: target\release\tessera_d3d11.dll and the layer/session
@@ -113,9 +114,9 @@ try {
     $first = if ($NoWarmup -or $Variants.Count) { 1 } else { 0 }
     if ($Variants.Count) { $Runs = $Variants.Count }
     for ($i = $first; $i -le $Runs; $i++) {
-        $on = $i -gt 0 -and (($i % 2) -eq 0 -or $Variants.Count)
-        $variant = if ($Variants.Count) { $Variants[$i - 1] } else { "" }
-        $mode = if ($i -eq 0) { "warm" } elseif ($variant) { "on-" + ($variant -replace "\W+", "_") } elseif ($on) { "on" } else { "off" }
+        $variant = if ($Variants.Count) { $Variants[$i - 1].Trim() } else { "" }
+        $on = $i -gt 0 -and $(if ($Variants.Count) { $variant -ne "off" } else { ($i % 2) -eq 0 })
+        $mode = if ($i -eq 0) { "warm" } elseif (-not $on) { "off" } elseif ($variant) { "on-" + ($variant -replace "\W+", "_") } else { "on" }
         if ($on) {
             & $layer install $GameDir $payload | Out-Null
             if (-not $LASTEXITCODE) { Write-TestIni $variant }
@@ -195,7 +196,7 @@ $rows = Get-ChildItem (Join-Path $OutDir "run*_*.csv") | Sort-Object { [int]($_.
     $p50 = Pct $v 50
     $secs = ($v | Measure-Object -Sum).Sum / 1000
     [pscustomobject]@{
-        Run = $_.BaseName + $(if (Test-Path ($_.FullName -replace ".csv$", ".crashed")) { "!" } else { "" }); Mode = ($_.BaseName -split "_")[1]; Frames = $v.Count; Fps = 1000 / $avg
+        Run = $_.BaseName + $(if (Test-Path ($_.FullName -replace ".csv$", ".crashed")) { "!" } else { "" }); Mode = ($_.BaseName -replace "^run\d+_", ""); Frames = $v.Count; Fps = 1000 / $avg
         P50 = $p50; P99 = (Pct $v 99); P999 = (Pct $v 99.9); Max = $v[-1]
         # Stutters a player notices: over twice the median, and over 50 ms; per minute.
         Hitches = 60 * @($v | Where-Object { $_ -gt 2 * $p50 }).Count / $secs
@@ -205,14 +206,14 @@ $rows = Get-ChildItem (Join-Path $OutDir "run*_*.csv") | Sort-Object { [int]($_.
 $out = @()
 $out += "Frame times (ms; hitches = frames over 2x the median, per minute; ! = the game crashed, left out of the means)"
 foreach ($r in $rows) {
-    $out += "{0,-8} n={1,6}  fps {2,6:N1}  p50 {3,6:N2}  p99 {4,6:N2}  p99.9 {5,6:N2}  max {6,7:N1}  hitches/min {7,6:N1}  >50ms/min {8,5:N1}" -f `
+    $out += "{0,-30} n={1,6}  fps {2,6:N1}  p50 {3,6:N2}  p99 {4,6:N2}  p99.9 {5,6:N2}  max {6,7:N1}  hitches/min {7,6:N1}  >50ms/min {8,5:N1}" -f `
         $r.Run, $r.Frames, $r.Fps, $r.P50, $r.P99, $r.P999, $r.Max, $r.Hitches, $r.Over50
 }
-foreach ($m in "off", "on") {
+foreach ($m in @($rows | ForEach-Object { $_.Mode } | Select-Object -Unique)) {
     $g = @($rows | Where-Object { $_.Mode -eq $m -and $_.Run -notmatch "!$" })
     if ($g.Count -eq 0) { continue }
     $mean = { param($k) ($g | Measure-Object -Property $k -Average).Average }
-    $out += "{0,-8} runs={1}  fps {2,6:N1}  p50 {3,6:N2}  p99 {4,6:N2}  p99.9 {5,6:N2}  hitches/min {6,6:N1}  >50ms/min {7,5:N1}" -f `
+    $out += "{0,-30} runs={1}  fps {2,6:N1}  p50 {3,6:N2}  p99 {4,6:N2}  p99.9 {5,6:N2}  hitches/min {6,6:N1}  >50ms/min {7,5:N1}" -f `
         "mean $m", $g.Count, (& $mean Fps), (& $mean P50), (& $mean P99), (& $mean P999), (& $mean Hitches), (& $mean Over50)
 }
 if (-not $rows) { $out += "no PresentMon CSVs: nothing measured (see run*.pm.txt)" }
