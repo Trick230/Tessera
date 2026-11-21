@@ -15,7 +15,8 @@ struct Config {
     bool flip_model = false;    // P2: windowed blit swapchains become flip model (+ tearing)
     bool workset = true;        // M11: texture working-set meter (bind hooks)
     bool mip_residency = false; // M3-M5: cold top mips of sampled textures move to system memory
-    int mip_ram_mb = 0;         // M10: system memory for those mips, 0 = min(4 GB, RAM / 16)
+    int mip_ram_mb = 0;         // M10: system memory for those mips, 0 = min(4 GB, RAM / 16);
+                                // lower while less than RAM / 8 (at least 1 GB) is free
     bool mip_force_evict = false;  // tests: evict every texture not bound in the current frame
 };
 

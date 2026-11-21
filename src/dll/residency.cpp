@@ -63,6 +63,7 @@ struct Res {
     std::atomic<uint32_t> last;   // frame it was last bound or copied from
     std::atomic<uint32_t> flags;
     std::atomic<uint32_t> epoch;  // g_epoch when found bound at an eviction batch
+    std::atomic<uint32_t> restores;  // since it was created: each doubles the cold time before eviction (M4)
     std::atomic<std::atomic<int>*> views;  // its tracked views alive (workset)
     ID3D11Texture2D* tex;      // our own reference
     ID3D11Buffer* pool;        // tile pool: the tail (mips 1..) at 0, then mip 0 unless evicted
@@ -115,7 +116,8 @@ std::atomic<uint8_t> g_fmt[256];  // 0 unknown, 1 tiled, 2 not
 
 std::atomic<uint32_t> g_frame{1};
 std::atomic<uint64_t> g_pending{0}, g_ram{0};
-uint64_t g_ram_cap = 0;
+uint64_t g_ram_max = 0;                  // M10: the configured cap
+std::atomic<uint64_t> g_ram_cap{0};      // lowered while the system runs short (tick)
 std::atomic<uint32_t> g_live{0}, g_restores{0}, g_evictions{0}, g_late{0};
 std::atomic<bool> g_lists_reused{false}, g_evict_off{false}, g_restore_due{false};
 uint32_t g_epoch = 0;  // Present thread
@@ -384,6 +386,7 @@ bool restore(Res& r) {
     r.staging = nullptr;
     g_ram.fetch_sub(r.top_bytes, std::memory_order_relaxed);
     r.state.store(kResident, std::memory_order_release);
+    r.restores.fetch_add(1, std::memory_order_relaxed);
     g_restores.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -416,7 +419,7 @@ bool evict(uint32_t i, uint32_t cutoff) {
     const uint32_t f = r.flags.load(std::memory_order_relaxed);
     if ((f & kPinned) || ((f & kDeferredBound) && g_lists_reused.load(std::memory_order_relaxed))) return false;
     if (r.epoch.load(std::memory_order_relaxed) == g_epoch) return false;  // bound right now
-    if (g_ram.load(std::memory_order_relaxed) + r.top_bytes > g_ram_cap) return false;
+    if (g_ram.load(std::memory_order_relaxed) + r.top_bytes > g_ram_cap.load(std::memory_order_relaxed)) return false;
     D3D11_TEXTURE2D_DESC sd = {};
     sd.Width = r.width;
     sd.Height = r.height;
@@ -781,7 +784,8 @@ void residency_on_device(ID3D11Device* dev) {
         GlobalMemoryStatusEx(&ms);
         cap = std::min<uint64_t>(4096ull << 20, ms.ullTotalPhys / 16);
     }
-    g_ram_cap = cap;
+    g_ram_max = cap;
+    g_ram_cap.store(cap, std::memory_order_relaxed);
     g_imm = ctx2;
     g_ctx2 = ctx2;
     g_dev2 = dev2;
@@ -866,6 +870,7 @@ bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTU
         r.mips = got.MipLevels;
         r.format = d.Format;
         r.lod = 0.0f;
+        r.restores.store(0, std::memory_order_relaxed);
         r.views.store(views, std::memory_order_relaxed);
         r.epoch.store(0, std::memory_order_relaxed);
         r.last.store(g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -1078,7 +1083,9 @@ void residency_frame() { g_frame.fetch_add(1, std::memory_order_relaxed); }
 
 void residency_background_tick() {
     if (!g_on.load(std::memory_order_acquire)) return;
-    static uint32_t ring[10];
+    // The frame counter of each of the last 80 ticks (1 s apart).
+    constexpr unsigned kRing = 80;
+    static uint32_t ring[kRing];
     static unsigned ticks = 0;
     static uint32_t last_restores = 0, last_evictions = 0;
     static struct Cold {
@@ -1087,9 +1094,22 @@ void residency_background_tick() {
     const uint32_t now = g_frame.load(std::memory_order_relaxed);
     if (ticks == 0)
         for (uint32_t& r : ring) r = now;
-    const uint32_t cutoff = ring[ticks % 10];  // the frame counter 10 s ago
-    ring[ticks % 10] = now;
+    auto ago = [](unsigned s) { return ring[(ticks + kRing - s) % kRing]; };  // the frame counter s ticks ago
+    // M4 hysteresis: cold means unused for 10 s, doubled by each restore the
+    // texture needed (20, 40, 80 s), so one used now and then stays.
+    const uint32_t cutoffs[4] = {ago(10), ago(20), ago(40), ago(80)};
+    const uint32_t cutoff = cutoffs[0];
+    ring[ticks % kRing] = now;
     ++ticks;
+
+    // M10: evicted mips live in system memory; leave the system an eighth of
+    // RAM (at least 1 GB) free, or the game and others would start paging.
+    MEMORYSTATUSEX ms = {sizeof ms};
+    if (GlobalMemoryStatusEx(&ms)) {
+        const uint64_t reserve = std::max<uint64_t>(1ull << 30, ms.ullTotalPhys / 8);
+        const uint64_t room = ms.ullAvailPhys > reserve ? ms.ullAvailPhys - reserve : 0;
+        g_ram_cap.store(std::min(g_ram_max, g_ram.load(std::memory_order_relaxed) + room), std::memory_order_relaxed);
+    }
 
     // VRAM is short above 95% of the budget; evict down to 90%.
     uint64_t usage = 0, budget = 0, want = 0;
@@ -1106,7 +1126,9 @@ void residency_background_tick() {
         std::atomic<int>* views = r.views.load(std::memory_order_relaxed);
         if (views && views->load(std::memory_order_relaxed) == 0) push(g_drop, i);
         const uint32_t last = r.last.load(std::memory_order_relaxed);
-        if (want && st == kResident && last < cutoff && !(r.flags.load(std::memory_order_relaxed) & kPinned))
+        const uint32_t n = r.restores.load(std::memory_order_relaxed);
+        if (want && st == kResident && last < cutoffs[n < 3 ? n : 3] &&
+            !(r.flags.load(std::memory_order_relaxed) & kPinned))
             cold[nc++] = {last, i};
     }
     const uint32_t keep = nc < kCand ? nc : kCand;
