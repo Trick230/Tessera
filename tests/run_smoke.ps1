@@ -14,8 +14,13 @@ function Check($name, $ok) {
     if ($ok) { "PASS $name" } else { "FAIL $name"; $script:fails++ }
 }
 
-& $exe | Write-Host
-Check "clean run" ($LASTEXITCODE -eq 0)
+# M2 is off by default; the session check expects its priority flags.
+$ini = Join-Path (Split-Path $exe) "tessera.ini"
+Set-Content -Path $ini -Value "[tessera]`nresidency=1" -Encoding ascii
+try {
+    & $exe | Write-Host
+    Check "clean run" ($LASTEXITCODE -eq 0)
+} finally { Remove-Item $ini }
 & $exe --verify "$data\sessions" | Write-Host
 Check "session contents" ($LASTEXITCODE -eq 0)
 $counter = @(Get-ChildItem "$data\safemode\d3d11_smoke.exe-*.count")
@@ -35,7 +40,7 @@ if ($nv -ne 4) { Check "NVAPI wrapped for the exe and a game DLL" ($nv -eq 0) }
 # Frame limiter (P1), budget cap (M1), flip model (P2) and frame latency (P3) from tessera.ini next to the layer.
 # ext_fps_limit: another tool limits to 50 below our 60, so ours runs just under 50.
 $ini = Join-Path (Split-Path $exe) "tessera.ini"
-Set-Content -Path $ini -Value "[tessera]`nfps_limit=60`next_fps_limit=50`nvram_budget_mb=2048`nflip_model=1`nmax_frame_latency=1" -Encoding ascii
+Set-Content -Path $ini -Value "[tessera]`nresidency=1`nfps_limit=60`next_fps_limit=50`nvram_budget_mb=2048`nflip_model=1`nmax_frame_latency=1" -Encoding ascii
 $env:TESSERA_SMOKE_CAP_MB = "2048"
 try {
     & $exe | Write-Host

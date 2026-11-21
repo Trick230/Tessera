@@ -30,7 +30,9 @@ void config_load() {
     Config c;
     c.process = get(L"process", 1) != 0;
     c.priority = get(L"priority", 1) != 0;
-    c.residency = get(L"residency", 1) != 0;
+    // M2 off by default: in FF7R (NVIDIA 621.14) it crashed the driver (AV in
+    // nvwgf2umx, render thread hang, device removed) in 7 of 7 runs.
+    c.residency = get(L"residency", 0) != 0;
     c.fps_limit = clamp_int(get(L"fps_limit", 0), 0, 1000);
     if (c.fps_limit && c.fps_limit < 20) c.fps_limit = 0;  // nonsense values: off
     c.ext_fps_limit = clamp_int(get(L"ext_fps_limit", 0), 0, 1000);

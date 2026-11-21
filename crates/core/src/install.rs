@@ -164,7 +164,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { process: true, residency: true, fps_limit: 0, vram_budget_mb: 0, flip_model: false }
+        Settings { process: true, residency: false, fps_limit: 0, vram_budget_mb: 0, flip_model: false }
     }
 }
 
