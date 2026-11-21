@@ -13,6 +13,7 @@
 #include "config.h"
 #include "log.h"
 #include "memory.h"
+#include "nvapi.h"
 #include "pacing.h"
 #include "process.h"
 #include "shaders.h"
@@ -173,6 +174,7 @@ DWORD WINAPI writer_main(void*) {
         }
         if ((tick & 7) == 0) pacing_background_tick();  // every 2 s
         shaders_background_tick();
+        nvapi_background_tick();
         if (!stable) {
             const int64_t last = g_last_present.load(std::memory_order_relaxed);
             if (last && static_cast<uint64_t>(last) - g_init_qpc > 60 * static_cast<uint64_t>(g_freq.QuadPart)) {

@@ -10,4 +10,7 @@ namespace tessera {
 // safe under the loader lock. NVAPI resolved from modules outside the game
 // folder (overlays, SDKs) is left alone.
 void nvapi_patch_imports();
+// Writer thread: game DLLs whose imports were not bound when the loader
+// announced them, and no DLL loaded since, are patched here.
+void nvapi_background_tick();
 }  // namespace tessera

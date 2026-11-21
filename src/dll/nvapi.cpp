@@ -138,6 +138,11 @@ void write_slot(void* volatile* slot) {
     VirtualProtect(const_cast<void**>(slot), sizeof(void*), old, &old);
 }
 
+// Committed image memory: where a bound import resolved by the loader points.
+bool in_image(const void* p) {
+    MEMORY_BASIC_INFORMATION mi;
+    return VirtualQuery(p, &mi, sizeof mi) && mi.State == MEM_COMMIT && mi.Type == MEM_IMAGE;
+}
 // Points one module's GetProcAddress imports at ours. False while the
 // loader has not bound them yet (it announces a DLL before binding it).
 bool patch_module(uint8_t* base) {
@@ -150,6 +155,8 @@ bool patch_module(uint8_t* base) {
     bool bound = true;
     for (auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp) {
         if (!imp->OriginalFirstThunk) continue;  // no name table to match against
+        // Bound imports (old or new style) hold stale addresses until the loader checks them.
+        const bool prebound = imp->TimeDateStamp != 0;
         auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->OriginalFirstThunk);
         auto* iat = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->FirstThunk);
         for (; names->u1.AddressOfData; ++names, ++iat) {
@@ -157,7 +164,7 @@ bool patch_module(uint8_t* base) {
             auto* by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
             if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), "GetProcAddress") != 0) continue;
             void* const current = reinterpret_cast<void*>(iat->u1.Function);
-            if (iat->u1.Function == names->u1.AddressOfData) {
+            if (iat->u1.Function == names->u1.AddressOfData || (prebound && !in_image(current))) {
                 bound = false;  // still the name entry
                 continue;
             }
@@ -175,10 +182,33 @@ bool patch_module(uint8_t* base) {
 }
 
 // Game DLLs loaded later wait here until the loader has bound their imports;
-// each later load retries them. Only touched under the loader lock.
+// each later load retries them, and the writer tick those it saw already
+// (by then the loader is long done with their import table).
 constexpr int kPending = 64;
 uint8_t* g_pending[kPending];
 int g_npending = 0;
+uint8_t g_pending_seen[kPending];  // writer ticks that saw the entry
+// Notifications are serialised among themselves, not with the writer tick.
+SRWLOCK g_pending_lock = SRWLOCK_INIT;
+std::atomic<bool> g_any_pending{false};  // a hint for the writer tick
+
+void remove_pending(int i) {
+    --g_npending;
+    g_pending[i] = g_pending[g_npending];
+    g_pending_seen[i] = g_pending_seen[g_npending];
+}
+void add_pending(uint8_t* base) {
+    if (g_npending == kPending) return;
+    g_pending_seen[g_npending] = 0;
+    g_pending[g_npending++] = base;
+}
+void retry_pending(bool tick) {
+    for (int i = 0; i < g_npending; ++i) {
+        if (tick && !g_pending_seen[i]++) continue;
+        if (patch_module(g_pending[i])) remove_pending(i--);
+    }
+}
+void note_pending() { g_any_pending.store(g_npending != 0, std::memory_order_relaxed); }
 
 struct Unicode {
     USHORT len, max;  // bytes
@@ -197,20 +227,27 @@ constexpr ULONG kDllLoaded = 1, kDllUnloaded = 2;
 
 void CALLBACK on_dll(ULONG reason, const DllNotification* d, void*) {
     if (!d) return;
+    AcquireSRWLockExclusive(&g_pending_lock);
     if (reason == kDllUnloaded) {
         for (int i = 0; i < g_npending; ++i)
-            if (g_pending[i] == d->base) g_pending[i--] = g_pending[--g_npending];
+            if (g_pending[i] == d->base) remove_pending(i--);
+        note_pending();
+        ReleaseSRWLockExclusive(&g_pending_lock);
         return;
     }
-    if (reason != kDllLoaded) return;
+    if (reason != kDllLoaded) {
+        ReleaseSRWLockExclusive(&g_pending_lock);
+        return;
+    }
     // Loads announced earlier are bound by now (nvapi64.dll itself, loaded
     // by a game DLL, comes through here before that DLL resolves NVAPI).
-    for (int i = 0; i < g_npending; ++i)
-        if (patch_module(g_pending[i])) g_pending[i--] = g_pending[--g_npending];
+    retry_pending(false);
     const Unicode* n = d->full_name;
     if (n && n->s && in_game_dir(n->s, n->len / sizeof(wchar_t)) && d->base != g_self &&
-        !patch_module(static_cast<uint8_t*>(d->base)) && g_npending < kPending)
-        g_pending[g_npending++] = static_cast<uint8_t*>(d->base);
+        !patch_module(static_cast<uint8_t*>(d->base)))
+        add_pending(static_cast<uint8_t*>(d->base));
+    note_pending();
+    ReleaseSRWLockExclusive(&g_pending_lock);
 }
 }  // namespace
 
@@ -242,14 +279,23 @@ void nvapi_patch_imports() {
             const DWORD len = GetModuleFileNameW(mods[i], path, MAX_PATH);
             auto* base = reinterpret_cast<uint8_t*>(mods[i]);
             if (base == exe || mods[i] == g_self || !len || len >= MAX_PATH || !in_game_dir(path, len)) continue;
-            if (!patch_module(base) && g_npending < kPending) g_pending[g_npending++] = base;
+            if (!patch_module(base)) add_pending(base);
         }
     }
+    note_pending();
     // And those loaded later. The callback stays valid: the module is pinned.
     if (HMODULE nt = GetModuleHandleW(L"ntdll.dll")) {
         void* cookie = nullptr;
         if (auto reg = reinterpret_cast<LdrRegister>(GetProcAddress(nt, "LdrRegisterDllNotification")))
             reg(0, &on_dll, nullptr, &cookie);
     }
+}
+
+void nvapi_background_tick() {
+    if (!g_any_pending.load(std::memory_order_relaxed)) return;
+    AcquireSRWLockExclusive(&g_pending_lock);
+    retry_pending(true);
+    note_pending();
+    ReleaseSRWLockExclusive(&g_pending_lock);
 }
 }  // namespace tessera
