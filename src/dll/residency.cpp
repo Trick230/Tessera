@@ -928,7 +928,8 @@ void residency_check_hooks(ID3D11DeviceContext* imm) {
     // Also once evictions are off: what is still evicted needs its copies seen.
     if (!g_on.load(std::memory_order_acquire) || imm != g_imm) return;
     bool ok = binds;
-    for (VtHook* h : {&g_copy_sub, &g_copy_res, &g_set_lod, &g_get_lod, &g_exec, &g_copy_sub1, &g_swap_state})
+    for (VtHook* h : {&g_copy_sub, &g_copy_res, &g_set_lod, &g_get_lod, &g_exec, &g_map, &g_copy_map, &g_resize_pool,
+                     &g_flush, &g_copy_sub1, &g_swap_state})
         if (h->n) ok = vt_rehook(*h, g_imm) && ok;
     if (!ok && !g_evict_off.exchange(true)) {
         logf("residency: context hooks overwritten; evictions off");
