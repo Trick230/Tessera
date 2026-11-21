@@ -68,7 +68,10 @@ try {
     Check "mip residency run" ($LASTEXITCODE -eq 0)
     if ("$t" -notmatch "skipped") {
         Check "residency on logged" ((Select-String -Path $log -Pattern "residency: on" -Quiet))
-        Check "a replacing device takes over" ((Select-String -Path $log -Pattern "new device takes over" -Quiet) -and
+        $alive = Select-String -Path $log -Pattern "the managed one is still alive" | Select-Object -First 1
+        $over = Select-String -Path $log -Pattern "new device takes over" | Select-Object -First 1
+        Check "a second device waits while the first lives" ($alive -and (-not $over -or $alive.LineNumber -lt $over.LineNumber))
+        Check "a replacing device takes over once the first is gone" ($over -and
             @(Select-String -Path $log -Pattern "residency: on").Count -ge 2)
     }
 } finally { Remove-Item $ini }

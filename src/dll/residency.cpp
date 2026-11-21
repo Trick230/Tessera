@@ -721,21 +721,72 @@ void forget_device() {
     g_dxgi3 = nullptr;
     g_trim_after = 0;
 }
-}  // namespace
 
-void residency_on_device(ID3D11Device* dev) {
-    if (!config().mip_residency) return;
-    if (g_live.load(std::memory_order_acquire) != 0) {
-        // The previous device's textures still hold it: this one takes over
-        // once they are gone (residency_present, then residency_create).
+// Set when the managed device is destroyed: only then may another device
+// take over (a second one, such as a video decoder's, must not).
+std::atomic<bool> g_dev_gone{false};
+// Serialises the switch to a device (device creation and the takeover in
+// residency_create may run on two threads).
+SRWLOCK g_dev_lock = SRWLOCK_INIT;
+
+// Private data of the managed device: the runtime releases it when the
+// device is destroyed.
+// {8C4D2E71-3B5A-4F96-A0D8-6E1F9B27C534}
+constexpr GUID kDevGuid = {0x8c4d2e71, 0x3b5a, 0x4f96, {0xa0, 0xd8, 0x6e, 0x1f, 0x9b, 0x27, 0xc5, 0x34}};
+struct DevTracker final : IUnknown {
+    std::atomic<long> refs{1};
+    ID3D11Device* dev = nullptr;  // compared only
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        if (iid == __uuidof(IUnknown)) {
+            *out = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(refs.fetch_add(1) + 1); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const long n = refs.fetch_sub(1) - 1;
+        if (n == 0) {
+            if (g_dev.load(std::memory_order_acquire) == dev) g_dev_gone.store(true, std::memory_order_release);
+            this->~DevTracker();
+            HeapFree(GetProcessHeap(), 0, this);
+        }
+        return static_cast<ULONG>(n);
+    }
+};
+
+bool track_device(ID3D11Device* dev) {
+    void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(DevTracker));
+    if (!mem) return false;
+    auto* t = new (mem) DevTracker();
+    t->dev = dev;
+    const bool ok = SUCCEEDED(dev->SetPrivateDataInterface(kDevGuid, t));
+    if (!ok) t->dev = nullptr;  // its release below is not the device going
+    t->Release();  // the device's reference is the one left
+    return ok;
+}
+
+void on_device_locked(ID3D11Device* dev) {
+    if (g_on.load(std::memory_order_acquire) && !g_dev_gone.load(std::memory_order_acquire)) {
+        if (dev == g_dev.load(std::memory_order_relaxed)) return;
+        // The managed device is alive: this one takes over once it is
+        // destroyed and this one creates a texture (residency_create).
         if (g_next_dev.exchange(reinterpret_cast<uintptr_t>(dev)) != reinterpret_cast<uintptr_t>(dev))
-            logf("residency: new device, waiting for the previous one's textures to go");
+            logf("residency: new device, the managed one is still alive");
         return;
     }
     g_next_dev.store(0, std::memory_order_relaxed);
-    // No managed texture holds the previous device: forget it before trying
+    // The previous device is gone (or never managed): forget it before trying
     // this one, so a failure below leaves nothing pointing at a freed device.
     forget_device();
+    g_dev_gone.store(false, std::memory_order_relaxed);
+    // Its textures went with it: nothing is evicted, nothing is left to restore.
+    g_evict_off.store(false, std::memory_order_relaxed);
+    g_lists_reused.store(false, std::memory_order_relaxed);
+    g_restore_due.store(false, std::memory_order_relaxed);
     D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
     if (FAILED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) ||
         o1.TiledResourcesTier < D3D11_TILED_RESOURCES_TIER_2) {
@@ -765,6 +816,13 @@ void residency_on_device(ID3D11Device* dev) {
         g_up.items = q + kMaxRes;
         g_need.items = q + 2 * kMaxRes;
         g_drop.items = q + 3 * kMaxRes;
+    }
+    // A device that replaced the first: the meter's bind hooks go on its context too.
+    if (!workset_adopt(ctx2)) {
+        logf("residency: off, needs the working-set meter's bind hooks");
+        ctx2->Release();
+        dev2->Release();
+        return;
     }
     bool ok = hook_context(ctx2, true);
     ID3D11Device3* dev3 = nullptr;
@@ -796,6 +854,7 @@ void residency_on_device(ID3D11Device* dev) {
     }
     g_dev.store(dev, std::memory_order_release);
     g_present_sc.store(nullptr, std::memory_order_relaxed);
+    if (!track_device(dev)) logf("residency: device destruction not tracked, no other device will take over");
     // Weak from here on (see g_dev).
     ctx2->Release();
     dev2->Release();
@@ -803,14 +862,26 @@ void residency_on_device(ID3D11Device* dev) {
     logf("residency: on, system memory cap %llu MB%s", static_cast<unsigned long long>(cap >> 20),
          config().mip_force_evict ? ", force evict (test)" : "");
 }
+}  // namespace
+
+void residency_on_device(ID3D11Device* dev) {
+    if (!config().mip_residency) return;
+    AcquireSRWLockExclusive(&g_dev_lock);
+    on_device_locked(dev);
+    ReleaseSRWLockExclusive(&g_dev_lock);
+}
 
 bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTURE2D_DESC& d,
                       const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out, uint64_t bytes) {
-    // The device waiting to take over creates a texture: it is alive now.
+    // The device waiting to take over creates a texture (it is alive) once
+    // the managed one is destroyed.
     if (uintptr_t next = g_next_dev.load(std::memory_order_relaxed);
-        next == reinterpret_cast<uintptr_t>(dev) && !g_on.load(std::memory_order_acquire) &&
-        g_next_dev.compare_exchange_strong(next, 0))
+        next == reinterpret_cast<uintptr_t>(dev) &&
+        (!g_on.load(std::memory_order_acquire) || g_dev_gone.load(std::memory_order_acquire)) &&
+        g_next_dev.compare_exchange_strong(next, 0)) {
+        logf("residency: the managed device is gone, the new device takes over");
         residency_on_device(dev);
+    }
     if (!g_on.load(std::memory_order_acquire) || dev != g_dev.load(std::memory_order_relaxed) ||
         g_evict_off.load(std::memory_order_relaxed))
         return false;
@@ -920,17 +991,26 @@ void residency_on_use(uint32_t i, ID3D11DeviceContext* ctx) {
         make_whole(i);
 }
 
-void residency_after_present() { residency_check_hooks(g_imm); }
+void residency_after_present() {
+    // g_imm died with the managed device: nothing to check until another takes over.
+    if (!g_dev_gone.load(std::memory_order_acquire)) residency_check_hooks(g_imm);
+}
 
 void residency_check_hooks(ID3D11DeviceContext* imm) {
+    // The managed device is gone: its context (g_imm here and in the meter)
+    // is freed memory until another device takes over.
+    if (g_dev_gone.load(std::memory_order_acquire)) return;
     // Residency relies on the meter's bind hooks too.
     const bool binds = workset_check_hooks(imm);
     // Also once evictions are off: what is still evicted needs its copies seen.
-    if (!g_on.load(std::memory_order_acquire) || imm != g_imm) return;
+    ID3D11DeviceContext* const ours = g_imm;
+    if (!g_on.load(std::memory_order_acquire) || !ours || imm != ours) return;
     bool ok = binds;
     for (VtHook* h : {&g_copy_sub, &g_copy_res, &g_set_lod, &g_get_lod, &g_exec, &g_map, &g_copy_map, &g_resize_pool,
-                     &g_flush, &g_copy_sub1, &g_swap_state})
-        if (h->n) ok = vt_rehook(*h, g_imm) && ok;
+                     &g_copy_sub1, &g_swap_state})
+        if (h->n) ok = vt_rehook(*h, ours) && ok;
+    // Flush only re-checks the others: another tool chained over it stops nothing.
+    if (g_flush.n) vt_rehook(g_flush, ours);
     if (!ok && !g_evict_off.exchange(true)) {
         logf("residency: context hooks overwritten; evictions off");
         g_restore_due.store(true, std::memory_order_release);
@@ -975,12 +1055,6 @@ bool residency_present(IDXGISwapChain* sc) {
     // replaced (and that device with them) are freed once the game lets go.
     uint32_t i;
     for (int k = 0; k < kDropPerFrame && pop(g_drop, &i); ++k) drop(i);
-    if (g_live.load(std::memory_order_acquire) == 0 && g_next_dev.load(std::memory_order_relaxed)) {
-        // The last one is gone and the previous device may be with it.
-        forget_device();
-        logf("residency: previous device's textures gone, the new device takes over");
-        return false;
-    }
     if (!g_present_ours.load(std::memory_order_relaxed)) return false;
     trim_if_due();
 

@@ -19,6 +19,10 @@ void workset_on_context(ID3D11DeviceContext* ctx);
 // made): patches them again for imm if it is the hooked one. False if a hook
 // is gone.
 bool workset_check_hooks(ID3D11DeviceContext* imm);
+// Residency moves to a device that replaced the first: hooks its immediate
+// context too and makes it the checked one. False if the meter is off or a
+// hook failed.
+bool workset_adopt(ID3D11DeviceContext* imm);
 // A game texture that is only sampled (no target binds, not shared). res is
 // its M3 residency index + 1 (0 = not managed): binds of its views then
 // call residency_on_use. Returns the texture's live-view counter, nullptr

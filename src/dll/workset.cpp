@@ -199,6 +199,17 @@ void workset_on_device(ID3D11Device* dev) {
     if (ok) g_on.store(true, std::memory_order_release);
 }
 
+bool workset_adopt(ID3D11DeviceContext* imm) {
+    if (!g_on.load(std::memory_order_acquire)) return false;
+    if (imm == g_imm) return true;
+    // A device that replaced the first one: its binds are the ones that count now.
+    bool ok = true;
+    for (VtHook& h : g_set) ok = vt_hook(h, imm) && ok;
+    logf("workset: bind hooks on the new device %s", ok ? "ok" : "FAILED");
+    if (ok) g_imm = imm;
+    return ok;
+}
+
 bool workset_check_hooks(ID3D11DeviceContext* imm) {
     // g_imm is weak: compared, never followed unless it is imm (alive).
     if (!g_on.load(std::memory_order_acquire) || imm != g_imm) return true;

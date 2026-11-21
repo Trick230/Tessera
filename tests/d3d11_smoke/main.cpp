@@ -5,7 +5,7 @@
 //   d3d11_smoke --tiled    mip residency (M3-M5), with mip_residency=1 and mip_force_evict=1
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
-#include <d3d11_1.h>
+#include <d3d11_2.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <windows.h>
@@ -567,6 +567,9 @@ int tiled() {
     sd.BufferCount = 2;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     hr = factory->CreateSwapChainForHwnd(g.dev, make_window(), &sd, nullptr, nullptr, &g.sc);
+    factory->Release();
+    a->Release();
+    dxgi->Release();  // a reference to the device, which must go at the end
     if (FAILED(hr)) return fail("CreateSwapChainForHwnd", hr);
 
     static const char kSrc[] =
@@ -731,11 +734,35 @@ int tiled() {
     std::printf("tiled: local usage %llu MB -> %llu MB after release\n", held >> 20, now >> 20);
     if (now + (32ull << 20) > held) return fail("released textures must be freed");
     present_frames(g, 10);  // the rest of the drops
+    // The managed device is still alive: the second one must not take over.
     ID3D11Texture2D* on_next = nullptr;
     hr = next->CreateTexture2D(&td, init, &on_next);
     if (FAILED(hr)) return fail("texture on the second device", hr);
+    ID3D11Device2* next2 = nullptr;
+    if (FAILED(next->QueryInterface(IID_PPV_ARGS(&next2)))) return fail("ID3D11Device2");
+    // Managed textures are tiled: tiles to report.
+    auto managed = [next2](ID3D11Texture2D* t) {
+        UINT total = 0, n_sub = 0;
+        next2->GetResourceTiling(t, &total, nullptr, nullptr, &n_sub, 0, nullptr);
+        return total != 0;
+    };
+    if (managed(on_next)) return fail("the second device took over while the first lives");
     on_next->Release();
+    // The game lets go of the first device: now the second one takes over.
+    g.ctx->ClearState();
+    g.ctx->Flush();
+    for (IUnknown* u : {static_cast<IUnknown*>(g.ps), static_cast<IUnknown*>(g.vs), static_cast<IUnknown*>(g.cb),
+                        static_cast<IUnknown*>(g.readback), static_cast<IUnknown*>(g.rtv), static_cast<IUnknown*>(g.rt),
+                        static_cast<IUnknown*>(g.sc), static_cast<IUnknown*>(g.ctx)})
+        if (u) u->Release();
+    if (g.dev->Release() != 0) return fail("the first device is still referenced");
+    hr = next->CreateTexture2D(&td, init, &on_next);
+    if (FAILED(hr)) return fail("texture on the second device after the first is gone", hr);
+    const bool took_over = managed(on_next);
+    on_next->Release();
+    next2->Release();
     next->Release();
+    if (!took_over) return fail("the second device must take over once the first is gone");
     std::printf("tiled: ok\n");
     return 0;
 }
