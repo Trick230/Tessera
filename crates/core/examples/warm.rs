@@ -12,7 +12,7 @@ fn main() {
         std::process::exit(2);
     }
     let t0 = std::time::Instant::now();
-    match tessera_core::warm::run(Path::new(&args[0]), Path::new(&args[1])) {
+    match tessera_core::warm::run(Path::new(&args[0]), Path::new(&args[1]), &|s| eprintln!("warm: no progress for {s} s")) {
         Ok(s) => println!("{s}\n{:.1} s", t0.elapsed().as_secs_f64()),
         Err(e) => {
             eprintln!("error: {e}");

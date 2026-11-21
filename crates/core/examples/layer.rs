@@ -24,7 +24,7 @@ fn main() {
             println!("{}", session::crash_count(dir));
             return;
         }
-        "warm" => match tessera_core::warm::run(dir, Path::new(args.get(2).unwrap_or_else(|| usage()))) {
+        "warm" => match tessera_core::warm::run(dir, Path::new(args.get(2).unwrap_or_else(|| usage())), &|s| eprintln!("warm: no progress for {s} s")) {
             Ok(line) => {
                 let w = tessera_core::warm::stats(dir);
                 println!("{line}\nwarm log: ok {} failed {}", w.ok, w.failed);

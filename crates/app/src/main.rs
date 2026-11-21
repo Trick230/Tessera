@@ -645,7 +645,11 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
             }
         }
         status("Warming shaders (outside the game)…");
-        let result = tessera_core::warm::run(&exe, &app_dir().join(tessera_core::warm::WARM_EXE));
+        let stall = |s: u64| {
+            let m = format!("Warming shaders: the driver has been on one shader for {s} s (left running, it may finish)…");
+            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
+        };
+        let result = tessera_core::warm::run(&exe, &app_dir().join(tessera_core::warm::WARM_EXE), &stall);
         let msg = match result {
             Ok(_) => {
                 let w = tessera_core::warm::stats(&exe);

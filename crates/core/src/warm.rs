@@ -18,6 +18,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Crashes or device removals tolerated in one warm-up; each relaunch skips
 /// the shader that was being compiled.
 const MAX_RELAUNCHES: u32 = 8;
+/// Seconds without progress in the warm-up log before a stall is reported.
+/// Only reported: S5 never kills a warm-up mid-way (the driver may be
+/// writing its cache), so the user decides.
+const STALL_S: u64 = 60;
 
 /// Settled shaders in the warm-up logs. The logs restart on a new driver;
 /// until the next warm-up they describe the driver that wrote them.
@@ -144,8 +148,9 @@ pub fn is_running(exe: &Path) -> bool {
 }
 
 /// Warms every store of `exe` with `warm_exe`; returns the warm exe's summary
-/// lines. Blocks until done: call it off the UI thread.
-pub fn run(exe: &Path, warm_exe: &Path) -> io::Result<String> {
+/// lines. Blocks until done: call it off the UI thread. `on_stall` gets the
+/// seconds the log has not moved, from STALL_S on, every 10 s.
+pub fn run(exe: &Path, warm_exe: &Path, on_stall: &dyn Fn(u64)) -> io::Result<String> {
     let other = |m: &str| io::Error::other(m.to_string());
     let base = store_base(exe).ok_or_else(|| other("invalid game path"))?;
     let todo: Vec<PathBuf> = bases(exe).into_iter().filter(|b| with_suffix(b, ".tshi").is_file()).collect();
@@ -162,14 +167,61 @@ pub fn run(exe: &Path, warm_exe: &Path) -> io::Result<String> {
     fs::copy(warm_exe, &copy)?;
     let mut lines = Vec::new();
     for b in todo {
-        lines.push(run_one(&copy, &b)?);
+        lines.push(run_one(&copy, &b, on_stall)?);
     }
     Ok(lines.join("\n"))
 }
 
-fn run_one(copy: &Path, base: &Path) -> io::Result<String> {
+/// Runs one warm-up to its end, reporting (never acting on) a log that stops
+/// growing: the warm exe flushes it before each risky driver call.
+fn wait_reporting(mut cmd: Command, log: &Path, stall_s: u64, on_stall: &dyn Fn(u64)) -> io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = cmd
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Drained on their own threads so a full pipe never blocks the child.
+    fn drain<R: Read + Send + 'static>(p: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            if let Some(mut p) = p {
+                let _ = p.read_to_end(&mut v);
+            }
+            v
+        })
+    }
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    let size = || fs::metadata(log).map(|m| m.len()).unwrap_or(0);
+    let (mut last, mut moved, mut next) = (size(), Instant::now(), stall_s);
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let now = size();
+        if now != last {
+            (last, moved, next) = (now, Instant::now(), stall_s);
+        }
+        let idle = moved.elapsed().as_secs();
+        if idle >= next {
+            next = idle + 10;
+            on_stall(idle);
+        }
+    };
+    let (stdout, stderr) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
+fn run_one(copy: &Path, base: &Path, on_stall: &dyn Fn(u64)) -> io::Result<String> {
     for _ in 0..=MAX_RELAUNCHES {
-        let out = Command::new(copy).arg(base).creation_flags(CREATE_NO_WINDOW).output()?;
+        let mut cmd = Command::new(copy);
+        cmd.arg(base);
+        let out = wait_reporting(cmd, &with_suffix(base, ".twarm"), STALL_S, on_stall)?;
         match out.status.code() {
             Some(0) => return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
             Some(1) => {
@@ -187,6 +239,17 @@ fn run_one(copy: &Path, base: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_a_stalled_warm_up_and_lets_it_finish() {
+        let mut cmd = Command::new("ping");
+        cmd.args(["-n", "4", "127.0.0.1"]); // about 3 s, no log written
+        let told = std::cell::Cell::new(0u32);
+        let out = wait_reporting(cmd, Path::new("no such log"), 1, &|_| told.set(told.get() + 1)).unwrap();
+        assert!(out.status.success(), "never killed");
+        assert!(!out.stdout.is_empty(), "output still collected");
+        assert_eq!(told.get(), 1, "told once at the limit, then every 10 s");
+    }
 
     #[test]
     fn counts_each_hash_once_and_a_pending_try_as_failed() {
