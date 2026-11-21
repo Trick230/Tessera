@@ -119,6 +119,9 @@ try {
         if ($on) {
             & $layer install $GameDir $payload | Out-Null
             if (-not $LASTEXITCODE) { Write-TestIni $variant }
+            # A crash in an earlier run must not put this one in safe mode.
+            $safe = @(Get-ChildItem (Join-Path $data "safemode") -Filter "$ExeName*.count" -ErrorAction SilentlyContinue)
+            if ($safe.Count) { $safe | Remove-Item; Log "run ${i}: safe-mode counter cleared" }
         } elseif (((& $layer status $GameDir) -join "") -notmatch "NotInstalled") { & $layer uninstall $GameDir | Out-Null }
         if ($LASTEXITCODE) { throw "layer $mode failed" }
         $start = Get-Date
@@ -133,8 +136,15 @@ try {
             [console]::Beep(880, 300)
             [Tessera.W]::GetAsyncKeyState($Key) | Out-Null
             while (-not ([Tessera.W]::GetAsyncKeyState($Key) -band 0x8000)) {
-                if ($p.HasExited) { throw "run ${i}: the game exited before F10" }
+                if ($p.HasExited) { break }
                 Start-Sleep -Milliseconds 50
+            }
+            if ($p.HasExited) {
+                # A crash before the route: mark it and go on with the next run.
+                Log ("run ${i}: CRASHED before F10 (exit code 0x{0:X8})" -f $p.ExitCode)
+                Set-Content (Join-Path $OutDir "run${i}_$mode.crashed") "" -Encoding ascii
+                Start-Sleep 10
+                continue
             }
             [console]::Beep(1200, 150)
         }
