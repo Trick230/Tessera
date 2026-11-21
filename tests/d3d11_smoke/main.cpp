@@ -356,9 +356,11 @@ int verify(const wchar_t* dir, int fps) {
                 if (r.d == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) ++sc_comp;
                 break;
             case TESSERA_REC_SHADER:
+                if (!(r.d & TESSERA_SHADER_DXBC) || r.c == 0 || r.bytes == 0) return fail("shader record fields");
+                // Overlays or the runtime may create their own in this process: only the exe's count.
+                if (r.flags & TESSERA_FLAG_FOREIGN) break;
                 ++shaders;
                 if (r.d & TESSERA_SHADER_NEW) ++shaders_new;
-                if (!(r.d & TESSERA_SHADER_DXBC) || r.c == 0 || r.bytes == 0) return fail("shader record fields");
                 break;
             case TESSERA_REC_VRAM: ++vram; budget_mb = r.a; usage_mb = r.b; cap_mb = r.d; break;
             case TESSERA_REC_END: ++end; dropped = r.a; break;
