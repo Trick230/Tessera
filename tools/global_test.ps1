@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+﻿# SPDX-License-Identifier: GPL-3.0-or-later
 # Global test of the D3D11 layer on a real game: does it help, and does every
 # module work? Interleaved runs without/with the layer (off, on, off, on, ...).
 # The script starts the game for every run and closes it after. In the first
@@ -36,10 +36,12 @@ param(
     [int]$FpsLimit = 0,
     [switch]$Auto,
     [string]$Steam = "C:\Program Files (x86)\Steam\steam.exe",
-    [string]$OutDir = (Join-Path (Split-Path $PSScriptRoot -Parent) "build\global")
+    [string]$OutDir = ""
 )
 $ErrorActionPreference = "Stop"
+# $PSScriptRoot is still empty in Windows PowerShell's parameter defaults.
 $root = Split-Path $PSScriptRoot -Parent
+if (-not $OutDir) { $OutDir = Join-Path $root "build\global" }
 $layer = Join-Path $root "target\release\examples\layer.exe"
 $sessionExe = Join-Path $root "target\release\examples\session.exe"
 $payload = Join-Path $root "target\release\tessera_d3d11.dll"
@@ -62,17 +64,35 @@ Add-Type -Name W -Namespace Tessera -MemberDefinition `
 Add-Type -TypeDefinition (Get-Content (Join-Path $PSScriptRoot "input_replay.cs") -Raw) -ReferencedAssemblies System.Windows.Forms
 if (-not $Route) { $Route = Join-Path $OutDir "route.txt" }
 $routeFile = $Route
-$route = $null
+$routeData = $null
 $recording = $false
 if ((Test-Path $routeFile) -and -not $NewRoute) {
-    $route = [TesseraInput.Route]::Load($routeFile)
-    Log ("route: replaying $routeFile, {0} inputs, {1:N0} s after F10" -f $route.Events.Count, $route.RouteSeconds())
-    if ($route.RouteSeconds() -lt $Record - 5) { Log "route: shorter than -Record $Record; the rest of each run stands still" }
+    $routeData = [TesseraInput.Route]::Load($routeFile)
+    Log ("route: replaying $routeFile, {0} inputs, {1:N0} s after F10" -f $routeData.Events.Count, $routeData.RouteSeconds())
+    if ($routeData.RouteSeconds() -lt $Record - 5) { Log "route: shorter than -Record $Record; the rest of each run stands still" }
+}
+
+# The layer's state and tessera.ini as found, also on disk: an "off" run
+# uninstalls the layer (which deletes tessera.ini), and a test stopped by
+# closing this window never reaches the finally below. The next start puts
+# them back first.
+$saveLayer = Join-Path $OutDir "restore.layer"
+$saveIni = Join-Path $OutDir "restore.ini"
+function Restore-Game($installed, $iniText) {
+    if ($installed) { & $layer install $GameDir $payload | Out-Null } else { & $layer uninstall $GameDir | Out-Null }
+    if ($null -ne $iniText) { Set-Content -Path $ini -Value $iniText -NoNewline -Encoding ascii }
+    elseif (Test-Path $ini) { Remove-Item $ini }
+    Remove-Item $saveLayer, $saveIni -ErrorAction SilentlyContinue
+}
+if (Test-Path $saveLayer) {
+    $text = if (Test-Path $saveIni) { Get-Content $saveIni -Raw } else { $null }
+    Restore-Game ((Get-Content $saveLayer -Raw) -notmatch "NotInstalled") $text
+    Log "an earlier test was stopped midway: layer and tessera.ini put back as it found them"
 }
 
 # tessera.ini for the "on" runs: the game's own settings, plus these.
 $iniBackup = $null
-if (Test-Path $ini) { $iniBackup = Get-Content $ini -Raw }
+if (Test-Path $ini) { $iniBackup = Get-Content $ini -Raw; Set-Content -Path $saveIni -Value $iniBackup -NoNewline -Encoding ascii }
 function Write-TestIni {
     $want = [ordered]@{ mip_residency = "1"; fps_limit = "$FpsLimit" }
     $lines = if ($iniBackup) { @($iniBackup -split "`r?`n" | Where-Object { $_ -ne "" }) } else { @("[tessera]") }
@@ -84,6 +104,7 @@ function Write-TestIni {
 }
 
 $initial = (& $layer status $GameDir) -join ""
+Set-Content -Path $saveLayer -Value $initial -Encoding ascii
 Log "layer initially: $initial; on runs: mip_residency=1 fps_limit=$FpsLimit, the rest from tessera.ini"
 try {
     # Run 0 (without the layer, left out of the means) warms the driver's
@@ -104,11 +125,11 @@ try {
         for ($t = 0; $t -lt 180 -and -not $p; $t++) { Start-Sleep 1; $p = Get-Process $procName -ErrorAction SilentlyContinue | Select-Object -First 1 }
         if (-not $p) { throw "run ${i}: $ExeName did not start" }
         Log "run $i ($mode): pid $($p.Id)"
-        $replay = -not $Auto -and $null -ne $route
+        $replay = -not $Auto -and $null -ne $routeData
         if ($Auto) { Start-Sleep $Settle }
         elseif ($replay) {
             # Menus and loading the save, with gaps longer than recorded.
-            Log ("run ${i}: " + [TesseraInput.Player]::Lead($route, $p))
+            Log ("run ${i}: " + [TesseraInput.Player]::Lead($routeData, $p))
             if ($p.HasExited) { throw "run ${i}: the game exited before the route" }
         } else {
             # The player's run: everything from now to the end of the route
@@ -130,14 +151,14 @@ try {
             "--no_console_stats --stop_existing_session --session_name TesseraGlobal")
         if ($replay) {
             Start-Sleep 1  # PresentMon's ETW session starts
-            Log ("run ${i}: " + [TesseraInput.Player]::Play($route, $p, $Record))
+            Log ("run ${i}: " + [TesseraInput.Player]::Play($routeData, $p, $Record))
         }
         if (-not $pm.WaitForExit(($Record + 30) * 1000)) { $pm.Kill() }
         if ($recording) {
-            $route = [TesseraInput.Recorder]::Stop()
+            $routeData = [TesseraInput.Recorder]::Stop()
             $recording = $false
-            $route.Save($routeFile)
-            Log ("run ${i}: route saved to $routeFile, {0} inputs, {1:N0} s after F10" -f $route.Events.Count, $route.RouteSeconds())
+            $routeData.Save($routeFile)
+            Log ("run ${i}: route saved to $routeFile, {0} inputs, {1:N0} s after F10" -f $routeData.Events.Count, $routeData.RouteSeconds())
         }
         if (Test-Path $csv) { Log "run ${i}: recorded $csv" } else { Log "run ${i}: NO CSV (PresentMon exit $($pm.ExitCode), see $pmlog)" }
         # A clean exit keeps the session file whole and the safe-mode counter at zero.
@@ -159,9 +180,7 @@ try {
     Log "error: $_"
 } finally {
     if ($recording) { [TesseraInput.Recorder]::Stop() | Out-Null }
-    if ($initial -match "NotInstalled") { & $layer uninstall $GameDir | Out-Null } else { & $layer install $GameDir $payload | Out-Null }
-    if ($null -ne $iniBackup) { Set-Content -Path $ini -Value $iniBackup -NoNewline -Encoding ascii }
-    elseif (Test-Path $ini) { Remove-Item $ini }
+    Restore-Game ($initial -notmatch "NotInstalled") $iniBackup
     Log "layer restored: $((& $layer status $GameDir) -join ''), tessera.ini restored"
 }
 
