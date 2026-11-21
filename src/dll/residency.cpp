@@ -99,9 +99,12 @@ ID3D11DeviceContext* g_imm = nullptr;
 ID3D11DeviceContext2* g_ctx2 = nullptr;
 ID3D11Device2* g_dev2 = nullptr;
 IDXGIDevice3* g_dxgi3 = nullptr;  // weak, like g_dev
-// A device created while textures of the current one were still alive:
-// compared only, never used, until it creates a texture (then it is alive).
-std::atomic<uintptr_t> g_next_dev{0};
+// Devices created while the managed one was still alive (a few: a video
+// decoder's may come between the game's two): compared only, never used,
+// until one creates a texture (then it is alive). Written under g_dev_lock.
+constexpr int kWaiting = 4;
+std::atomic<uintptr_t> g_waiting[kWaiting];
+int g_wait_next = 0;  // the slot a full list overwrites
 // residency_present's cache: the last swapchain and whether it is g_dev's.
 std::atomic<IDXGISwapChain*> g_present_sc{nullptr};
 std::atomic<bool> g_present_ours{false};
@@ -120,6 +123,10 @@ uint64_t g_ram_max = 0;                  // M10: the configured cap
 std::atomic<uint64_t> g_ram_cap{0};      // lowered while the system runs short (tick)
 std::atomic<uint32_t> g_live{0}, g_restores{0}, g_evictions{0}, g_late{0};
 std::atomic<bool> g_lists_reused{false}, g_evict_off{false}, g_restore_due{false};
+// Evictions off for what the game does (it maps tiles, swaps context
+// states, a deferred context could not be hooked): kept when another device
+// takes over. Hook trouble on the old device's context is not.
+std::atomic<bool> g_game_off{false};
 uint32_t g_epoch = 0;  // Present thread
 
 // Cold textures picked by the background tick, consumed by Present.
@@ -597,6 +604,7 @@ void STDMETHODCALLTYPE hk_Exec(ID3D11DeviceContext* self, ID3D11CommandList* cl,
 // each call). Immediate context only, as these methods are.
 void game_maps_tiles() {
     if (t_in_op || !g_on.load(std::memory_order_relaxed)) return;
+    g_game_off.store(true, std::memory_order_relaxed);
     if (!g_evict_off.exchange(true)) {
         logf("residency: the game maps tiles itself; evictions off");
         restore_all(0);
@@ -642,6 +650,7 @@ void STDMETHODCALLTYPE hk_Flush(ID3D11DeviceContext* self) {
 // A swapped-in state rebinds views we never see bound: stop evicting.
 void STDMETHODCALLTYPE hk_SwapState(ID3D11DeviceContext1* self, ID3DDeviceContextState* state,
                                     ID3DDeviceContextState** prev) {
+    if (g_on.load(std::memory_order_relaxed)) g_game_off.store(true, std::memory_order_relaxed);
     if (g_on.load(std::memory_order_relaxed) && !g_evict_off.exchange(true)) {
         logf("residency: the game swaps device context states; evictions off");
         if (static_cast<ID3D11DeviceContext*>(self) == g_imm) restore_all(0);
@@ -774,18 +783,26 @@ void on_device_locked(ID3D11Device* dev) {
         if (dev == g_dev.load(std::memory_order_relaxed)) return;
         // The managed device is alive: this one takes over once it is
         // destroyed and this one creates a texture (residency_create).
-        if (g_next_dev.exchange(reinterpret_cast<uintptr_t>(dev)) != reinterpret_cast<uintptr_t>(dev))
-            logf("residency: new device, the managed one is still alive");
+        const auto d = reinterpret_cast<uintptr_t>(dev);
+        for (const auto& w : g_waiting)
+            if (w.load(std::memory_order_relaxed) == d) return;
+        int k = 0;
+        while (k < kWaiting && g_waiting[k].load(std::memory_order_relaxed)) ++k;
+        if (k == kWaiting) {  // the oldest one goes
+            k = g_wait_next;
+            g_wait_next = (g_wait_next + 1) % kWaiting;
+        }
+        g_waiting[k].store(d, std::memory_order_release);
+        logf("residency: new device, the managed one is still alive");
         return;
     }
-    g_next_dev.store(0, std::memory_order_relaxed);
     // The previous device is gone (or never managed): forget it before trying
     // this one, so a failure below leaves nothing pointing at a freed device.
     forget_device();
     g_dev_gone.store(false, std::memory_order_relaxed);
-    // Its textures went with it: nothing is evicted, nothing is left to restore.
-    g_evict_off.store(false, std::memory_order_relaxed);
-    g_lists_reused.store(false, std::memory_order_relaxed);
+    // Its textures went with it: nothing is evicted, nothing is left to
+    // restore. What the game itself does still holds (replayed lists too).
+    g_evict_off.store(g_game_off.load(std::memory_order_relaxed), std::memory_order_relaxed);
     g_restore_due.store(false, std::memory_order_relaxed);
     D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
     if (FAILED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) ||
@@ -873,14 +890,17 @@ void residency_on_device(ID3D11Device* dev) {
 
 bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTURE2D_DESC& d,
                       const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out, uint64_t bytes) {
-    // The device waiting to take over creates a texture (it is alive) once
-    // the managed one is destroyed.
-    if (uintptr_t next = g_next_dev.load(std::memory_order_relaxed);
-        next == reinterpret_cast<uintptr_t>(dev) &&
-        (!g_on.load(std::memory_order_acquire) || g_dev_gone.load(std::memory_order_acquire)) &&
-        g_next_dev.compare_exchange_strong(next, 0)) {
-        logf("residency: the managed device is gone, the new device takes over");
-        residency_on_device(dev);
+    // A waiting device creates a texture (it is alive) once the managed one
+    // is destroyed: the first to do so takes over.
+    if (!g_on.load(std::memory_order_acquire) || g_dev_gone.load(std::memory_order_acquire)) {
+        const auto d = reinterpret_cast<uintptr_t>(dev);
+        for (auto& w : g_waiting) {
+            uintptr_t seen = d;
+            if (w.load(std::memory_order_relaxed) != d || !w.compare_exchange_strong(seen, 0)) continue;
+            logf("residency: the managed device is gone, the new device takes over");
+            residency_on_device(dev);
+            break;
+        }
     }
     if (!g_on.load(std::memory_order_acquire) || dev != g_dev.load(std::memory_order_relaxed) ||
         g_evict_off.load(std::memory_order_relaxed))
@@ -1019,6 +1039,7 @@ void residency_check_hooks(ID3D11DeviceContext* imm) {
 
 void residency_on_context(ID3D11DeviceContext* ctx) {
     if (!g_on.load(std::memory_order_acquire) || (ctx && hook_context(ctx, false))) return;
+    g_game_off.store(true, std::memory_order_relaxed);  // maybe a waiting device's context
     // Its binds and copies go unseen: stop evicting, restore at the next Present.
     if (!g_evict_off.exchange(true)) {
         logf("residency: deferred context hooks FAILED; evictions off");

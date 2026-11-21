@@ -718,6 +718,11 @@ int tiled() {
     hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, fl, 2, D3D11_SDK_VERSION, &next, nullptr,
                            nullptr);
     if (FAILED(hr)) return fail("second device", hr);
+    // A third one (a video decoder's, say) comes after it: the second still takes over.
+    ID3D11Device* other = nullptr;
+    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, fl, 2, D3D11_SDK_VERSION, &other, nullptr,
+                           nullptr);
+    if (FAILED(hr)) return fail("third device", hr);
 
     // Released by the game: our reference goes within a few seconds.
     for (UINT t = 0; t < kTiledCount; ++t) {
@@ -762,6 +767,7 @@ int tiled() {
     on_next->Release();
     next2->Release();
     next->Release();
+    other->Release();
     if (!took_over) return fail("the second device must take over once the first is gone");
     std::printf("tiled: ok\n");
     return 0;
