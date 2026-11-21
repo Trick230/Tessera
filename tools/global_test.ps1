@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Global test of the D3D11 layer on a real game: does it help, and does every
 # module work? Interleaved runs without/with the layer (off, on, off, on, ...).
-# In each run the player loads the same save and plays the same route while
-# PresentMon records; the "on" runs also keep the layer's log and session
+# The script starts the game; in each run the player loads the same save,
+# presses F10 (-Key) in the game at the start of the route and plays it for
+# -Record seconds while PresentMon records; then the script closes the game
+# and starts the next run. Run 0 is a warm-up left out of the means
+# (-NoWarmup skips it). The "on" runs also keep the layer's log and session
 # summary (shaders, VRAM, working set, mip residency) and list what each
 # module reported. Needs an elevated shell (PresentMon uses ETW) and a fresh
 # build (build.ps1: target\release\tessera_d3d11.dll and the layer/session
@@ -22,7 +25,9 @@ param(
     [Parameter(Mandatory)][string]$ExeName,
     [Parameter(Mandatory)][string]$PresentMon,
     [int]$Runs = 4,
-    [int]$Record = 300,
+    [int]$Record = 100,
+    [int]$Key = 0x79,  # F10: starts the recording from inside the game
+    [switch]$NoWarmup,
     [int]$Settle = 60,
     [int]$FpsLimit = 0,
     [switch]$Auto,
@@ -48,8 +53,9 @@ Get-ChildItem $OutDir -Filter "run*" -ErrorAction SilentlyContinue | Remove-Item
 $log = Join-Path $OutDir "global.log"
 function Log($m) { $l = "{0:HH:mm:ss} {1}" -f (Get-Date), $m; $l; Add-Content -Path $log -Value $l -Encoding utf8 }
 Set-Content -Path $log -Value "" -Encoding utf8
-Add-Type -Name W -Namespace Tessera -MemberDefinition `
-    '[DllImport("user32.dll")] public static extern bool PostMessage(System.IntPtr h, uint m, System.IntPtr w, System.IntPtr l);'
+Add-Type -Name W -Namespace Tessera -MemberDefinition (
+    '[DllImport("user32.dll")] public static extern bool PostMessage(System.IntPtr h, uint m, System.IntPtr w, System.IntPtr l);' +
+    '[DllImport("user32.dll")] public static extern short GetAsyncKeyState(int k);')
 
 # tessera.ini for the "on" runs: the game's own settings, plus these.
 $iniBackup = $null
@@ -67,9 +73,13 @@ function Write-TestIni {
 $initial = (& $layer status $GameDir) -join ""
 Log "layer initially: $initial; on runs: mip_residency=1 fps_limit=$FpsLimit, the rest from tessera.ini"
 try {
-    for ($i = 1; $i -le $Runs; $i++) {
-        $on = ($i % 2) -eq 0
-        $mode = if ($on) { "on" } else { "off" }
+    # Run 0 (without the layer, left out of the means) warms the driver's
+    # shader cache and the file cache, so the first counted run is not the
+    # only one paying for the first time through the route.
+    $first = if ($NoWarmup) { 1 } else { 0 }
+    for ($i = $first; $i -le $Runs; $i++) {
+        $on = $i -gt 0 -and ($i % 2) -eq 0
+        $mode = if ($i -eq 0) { "warm" } elseif ($on) { "on" } else { "off" }
         if ($on) {
             & $layer install $GameDir $payload | Out-Null
             if (-not $LASTEXITCODE) { Write-TestIni }
@@ -83,8 +93,16 @@ try {
         Log "run $i ($mode): pid $($p.Id)"
         if ($Auto) { Start-Sleep $Settle }
         else {
+            # The player loads the save, stands at the start of the route and
+            # presses the key in the game (no need to switch windows).
+            Write-Host "run $i of $Runs ($mode): load the save, stand at the start of the route, press F10 and play it for $Record s"
             [console]::Beep(880, 300)
-            Read-Host "run $i of $Runs ($mode): load the save, stand at the start of the route, then press Enter here and play it for $Record s"
+            [Tessera.W]::GetAsyncKeyState($Key) | Out-Null
+            while (-not ([Tessera.W]::GetAsyncKeyState($Key) -band 0x8000)) {
+                if ($p.HasExited) { throw "run ${i}: the game exited before the recording" }
+                Start-Sleep -Milliseconds 50
+            }
+            [console]::Beep(1200, 150)
         }
         $csv = Join-Path $OutDir "run${i}_$mode.csv"
         $pmlog = Join-Path $OutDir "run${i}_$mode.pm.txt"
@@ -93,15 +111,10 @@ try {
         $pmExit = $LASTEXITCODE
         if (Test-Path $csv) { Log "run ${i}: recorded $csv" } else { Log "run ${i}: NO CSV (PresentMon exit $pmExit, see $pmlog)" }
         # A clean exit keeps the session file whole and the safe-mode counter at zero.
-        if ($Auto) {
-            $p.Refresh()
-            [Tessera.W]::PostMessage($p.MainWindowHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
-        } else {
-            [console]::Beep(660, 300); [console]::Beep(660, 300)
-            Write-Host "run ${i}: recorded. Quit the game from its menu (waiting up to 5 min)."
-        }
-        $wait = if ($Auto) { 60000 } else { 300000 }
-        if (-not $p.WaitForExit($wait)) { Log "run ${i}: the game did not exit, killing (unclean: counts toward safe mode)"; $p.Kill(); $p.WaitForExit() }
+        if (-not $Auto) { [console]::Beep(660, 300); [console]::Beep(660, 300) }
+        $p.Refresh()
+        [Tessera.W]::PostMessage($p.MainWindowHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        if (-not $p.WaitForExit(60000)) { Log "run ${i}: the game did not exit, killing (unclean: counts toward safe mode)"; $p.Kill(); $p.WaitForExit() }
         if ($on) {
             $glog = Join-Path $data "logs\$ExeName.log"
             if (Test-Path $glog) { Copy-Item $glog (Join-Path $OutDir "run${i}_on.log") }
