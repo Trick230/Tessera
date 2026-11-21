@@ -160,15 +160,17 @@ pub struct Settings {
     pub vram_budget_mb: u32,
     /// P2: windowed blit swapchains become flip model; off by default.
     pub flip_model: bool,
+    /// R1: big render targets the game releases come back on its next create; off by default.
+    pub rt_recycle: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { process: true, residency: false, fps_limit: 0, vram_budget_mb: 0, flip_model: false }
+        Settings { process: true, residency: false, fps_limit: 0, vram_budget_mb: 0, flip_model: false, rt_recycle: false }
     }
 }
 
-const SETTING_KEYS: [&str; 5] = ["process", "residency", "fps_limit", "vram_budget_mb", "flip_model"];
+const SETTING_KEYS: [&str; 6] = ["process", "residency", "fps_limit", "vram_budget_mb", "flip_model", "rt_recycle"];
 
 pub fn settings(dir: &Path) -> Settings {
     let mut s = Settings::default();
@@ -182,6 +184,7 @@ pub fn settings(dir: &Path) -> Settings {
             "fps_limit" => s.fps_limit = v,
             "vram_budget_mb" => s.vram_budget_mb = v,
             "flip_model" => s.flip_model = v != 0,
+            "rt_recycle" => s.rt_recycle = v != 0,
             _ => {}
         }
     }
@@ -202,8 +205,8 @@ pub fn save_settings(dir: &Path, s: &Settings) -> io::Result<()> {
         out.push('\n');
     }
     out.push_str(&format!(
-        "process={}\nresidency={}\nfps_limit={}\nvram_budget_mb={}\nflip_model={}\n",
-        s.process as u8, s.residency as u8, s.fps_limit, s.vram_budget_mb, s.flip_model as u8
+        "process={}\nresidency={}\nfps_limit={}\nvram_budget_mb={}\nflip_model={}\nrt_recycle={}\n",
+        s.process as u8, s.residency as u8, s.fps_limit, s.vram_budget_mb, s.flip_model as u8, s.rt_recycle as u8
     ));
     fs::write(dir.join(INI), out)
 }
@@ -283,7 +286,7 @@ mod tests {
         assert_eq!(settings(t.path()), Settings::default());
         fs::write(t.path().join(INI), "[tessera]\nnext=d3d11.next.dll\nfps_limit=30\nmax_frame_latency=1\n").unwrap();
         assert_eq!(settings(t.path()).fps_limit, 30);
-        let s = Settings { process: false, residency: true, fps_limit: 141, vram_budget_mb: 6144, flip_model: true };
+        let s = Settings { process: false, residency: true, fps_limit: 141, vram_budget_mb: 6144, flip_model: true, rt_recycle: true };
         save_settings(t.path(), &s).unwrap();
         assert_eq!(settings(t.path()), s);
         let ini = fs::read_to_string(t.path().join(INI)).unwrap();
