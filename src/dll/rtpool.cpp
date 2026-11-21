@@ -92,7 +92,6 @@ bool rtpool_take(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& d, uint64_t byte
     }
     ReleaseSRWLockExclusive(&g_lock);
     if (!hit) return false;
-    hit->SetEvictionPriority(DXGI_RESOURCE_PRIORITY_NORMAL);  // as a new one (M2 may raise it after)
     *out = hit;
     if (n <= 8 || (n & (n - 1)) == 0) logf("rtpool: reused %ux%u format %u (%u so far)", d.Width, d.Height, d.Format, n);
     return true;
@@ -140,29 +139,23 @@ void rtpool_frame() {
     Slot& s = g_slots[g_next];
     g_next = (g_next + 1) % kSlots;
     ID3D11Texture2D* drop = nullptr;
-    ID3D11Texture2D* lower = nullptr;
     if (s.tex) {
         const ULONGLONG now = GetTickCount64();
         if (!released(s)) {
             if (s.idle_since) g_idle_bytes -= s.bytes;
             s.idle_since = 0;
         } else {
+            // Its eviction priority stays as it is: SetEvictionPriority hangs the
+            // GPU or removes the device in FF7R on NVIDIA 621.14 (M2, R1 alike).
             if (!s.idle_since) {
                 s.idle_since = now;
                 g_idle_bytes += s.bytes;
-                lower = s.tex;
-                lower->AddRef();
             }
             if (now - s.idle_since >= kIdleMs || g_idle_bytes > kMaxIdle || g_stop.load(std::memory_order_relaxed))
                 drop = empty(s);
         }
     }
     ReleaseSRWLockExclusive(&g_lock);
-    // Unused: paged out before anything the game uses.
-    if (lower) {
-        lower->SetEvictionPriority(DXGI_RESOURCE_PRIORITY_MINIMUM);
-        lower->Release();
-    }
     if (drop) drop->Release();  // outside the lock: the driver frees it
 }
 
