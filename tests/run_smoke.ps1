@@ -54,6 +54,17 @@ try {
     Check "warm copy has the game's exe name" (@(Get-ChildItem "$data\warm\*\d3d11_smoke.exe").Count -eq 1)
 } finally { Remove-Item $ini; Remove-Item Env:TESSERA_SMOKE_CAP_MB }
 
+# M3-M5: managed textures lose their top mip while unbound and get it back before any read.
+Set-Content -Path $ini -Value "[tessera]`nmip_residency=1`nmip_force_evict=1" -Encoding ascii
+try {
+    $t = & $exe --tiled
+    $t | Write-Host
+    Check "mip residency run" ($LASTEXITCODE -eq 0)
+    if ("$t" -notmatch "skipped") {
+        Check "residency on logged" ((Select-String -Path $log -Pattern "residency: on" -Quiet))
+    }
+} finally { Remove-Item $ini }
+
 & $exe --crash | Out-Null
 & $exe --crash | Out-Null
 Check "counter after two crashes" ((Get-Content $counter) -eq "2")

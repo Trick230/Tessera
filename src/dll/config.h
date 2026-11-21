@@ -14,6 +14,9 @@ struct Config {
     int vram_budget_mb = 0;     // M1: highest VRAM budget reported to the game, 0 = the real one
     bool flip_model = false;    // P2: windowed blit swapchains become flip model (+ tearing)
     bool workset = true;        // M11: texture working-set meter (bind hooks)
+    bool mip_residency = false; // M3-M5: cold top mips of sampled textures move to system memory
+    int mip_ram_mb = 0;         // M10: system memory for those mips, 0 = min(4 GB, RAM / 16)
+    bool mip_force_evict = false;  // tests: evict every texture not bound in the current frame
 };
 
 // Reads tessera.ini once (from session init, never DllMain).

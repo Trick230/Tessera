@@ -16,6 +16,7 @@
 #include "pacing.h"
 #include "process.h"
 #include "shaders.h"
+#include "residency.h"
 #include "workset.h"
 
 namespace tessera {
@@ -168,6 +169,7 @@ DWORD WINAPI writer_main(void*) {
         if ((tick & 3) == 1) {  // every 1 s, first after 250 ms
             memory_background_tick();
             workset_background_tick();
+            residency_background_tick();
         }
         if ((tick & 7) == 0) pacing_background_tick();  // every 2 s
         shaders_background_tick();
@@ -311,6 +313,7 @@ void session_frame(uint32_t wait_us) {
     }
     session_push(r);
     workset_frame();
+    residency_frame();
 }
 
 void session_shutdown() {

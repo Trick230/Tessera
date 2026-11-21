@@ -143,6 +143,16 @@ void memory_on_device(ID3D11Device* dev) {
     memory_background_tick();  // baseline before the game allocates anything
 }
 
+namespace {
+std::atomic<uint64_t> g_local_usage{0}, g_local_budget{0};
+}
+
+bool memory_local(uint64_t* usage, uint64_t* budget) {
+    *budget = g_local_budget.load(std::memory_order_acquire);
+    *usage = g_local_usage.load(std::memory_order_relaxed);
+    return *budget != 0;
+}
+
 void memory_background_tick() {
     IDXGIAdapter3* a = g_adapter.load(std::memory_order_acquire);
     if (!a) return;
@@ -151,6 +161,8 @@ void memory_background_tick() {
     const Qvmi q = real_qvmi(a);
     if (FAILED(q(a, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) return;
     q(a, 0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared);
+    g_local_usage.store(local.CurrentUsage, std::memory_order_relaxed);
+    g_local_budget.store(local.Budget, std::memory_order_release);
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     TesseraRecord r = {};

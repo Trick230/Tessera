@@ -39,11 +39,14 @@ void config_load() {
     if (c.vram_budget_mb && c.vram_budget_mb < 1024) c.vram_budget_mb = 0;  // below 1 GB: a typo, off
     c.flip_model = get(L"flip_model", 0) != 0;
     c.workset = get(L"workset", 1) != 0;
+    c.mip_residency = get(L"mip_residency", 0) != 0;
+    c.mip_ram_mb = clamp_int(get(L"mip_ram_mb", 0), 0, 1 << 20);
+    c.mip_force_evict = get(L"mip_force_evict", 0) != 0;
     g_config = c;
     logf("config: process %d priority %d residency %d fps_limit %d ext_fps_limit %d max_frame_latency %d vram_budget_mb %d "
-         "flip_model %d workset %d",
+         "flip_model %d workset %d mip_residency %d mip_ram_mb %d mip_force_evict %d",
          c.process, c.priority, c.residency, c.fps_limit, c.ext_fps_limit, c.max_frame_latency, c.vram_budget_mb,
-         c.flip_model, c.workset);
+         c.flip_model, c.workset, c.mip_residency, c.mip_ram_mb, c.mip_force_evict);
 }
 
 const Config& config() { return g_config; }

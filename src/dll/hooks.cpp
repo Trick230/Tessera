@@ -3,7 +3,7 @@
 #include "hooks.h"
 
 #include <windows.h>
-#include <d3d11_2.h>
+#include <d3d11_3.h>
 #include <intrin.h>
 
 #include "config.h"
@@ -13,6 +13,7 @@
 #include "memory.h"
 #include "shaders.h"
 #include "pacing.h"
+#include "residency.h"
 #include "session.h"
 #include "vtable.h"
 #include "workset.h"
@@ -23,6 +24,10 @@ namespace {
 constexpr int kDevCreateBuffer = 3;
 constexpr int kDevCreateTexture2D = 5;
 constexpr int kDevCreateSRV = 7;
+constexpr int kDevCreateDeferredContext = 27;
+constexpr int kDev1CreateDeferredContext1 = 44;
+constexpr int kDev2CreateDeferredContext2 = 51;
+constexpr int kDev3CreateDeferredContext3 = 62;
 constexpr int kFactoryCreateSwapChain = 10;
 constexpr int kFactory2CreateSwapChainForHwnd = 15;
 constexpr int kFactory2CreateSwapChainForCoreWindow = 16;
@@ -68,6 +73,14 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain*, UINT, UINT, UINT, DX
 VtHook g_create_buffer = {kDevCreateBuffer, reinterpret_cast<void*>(&hk_CreateBuffer)};
 VtHook g_create_tex2d = {kDevCreateTexture2D, reinterpret_cast<void*>(&hk_CreateTexture2D)};
 VtHook g_create_srv = {kDevCreateSRV, reinterpret_cast<void*>(&hk_CreateSRV)};
+HRESULT STDMETHODCALLTYPE hk_CreateDeferred(ID3D11Device*, UINT, ID3D11DeviceContext**);
+HRESULT STDMETHODCALLTYPE hk_CreateDeferred1(ID3D11Device1*, UINT, ID3D11DeviceContext1**);
+HRESULT STDMETHODCALLTYPE hk_CreateDeferred2(ID3D11Device2*, UINT, ID3D11DeviceContext2**);
+HRESULT STDMETHODCALLTYPE hk_CreateDeferred3(ID3D11Device3*, UINT, ID3D11DeviceContext3**);
+VtHook g_create_def = {kDevCreateDeferredContext, reinterpret_cast<void*>(&hk_CreateDeferred)};
+VtHook g_create_def1 = {kDev1CreateDeferredContext1, reinterpret_cast<void*>(&hk_CreateDeferred1)};
+VtHook g_create_def2 = {kDev2CreateDeferredContext2, reinterpret_cast<void*>(&hk_CreateDeferred2)};
+VtHook g_create_def3 = {kDev3CreateDeferredContext3, reinterpret_cast<void*>(&hk_CreateDeferred3)};
 VtHook g_create_sc = {kFactoryCreateSwapChain, reinterpret_cast<void*>(&hk_CreateSwapChain)};
 VtHook g_create_sc_hwnd = {kFactory2CreateSwapChainForHwnd, reinterpret_cast<void*>(&hk_CreateSwapChainForHwnd)};
 VtHook g_create_sc_core = {kFactory2CreateSwapChainForCoreWindow,
@@ -103,6 +116,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateBuffer(ID3D11Device* self, const D3D11_BUFFER
     Depth depth;
     using F = decltype(&hk_CreateBuffer);
     const HRESULT hr = orig<F>(g_create_buffer, self)(self, d, init, out);
+    if (SUCCEEDED(hr) && d && (d->MiscFlags & D3D11_RESOURCE_MISC_TILED) && depth.outer()) residency_after_present();
     if (SUCCEEDED(hr) && out && *out && d && depth.outer()) {
         TesseraRecord r = {};
         r.qpc = now_qpc();
@@ -127,21 +141,30 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
     void* const ret = _ReturnAddress();
     Depth depth;
     using F = decltype(&hk_CreateTexture2D);
-    const HRESULT hr = orig<F>(g_create_tex2d, self)(self, d, init, out);
-    if (SUCCEEDED(hr) && out && *out && d && depth.outer()) {
+    const F create = orig<F>(g_create_tex2d, self);
+    const bool outer = depth.outer();
+    const bool game = outer && is_game_code(ret);
+    const uint64_t bytes = d ? texture2d_bytes(*d) : 0;
+    // M3: large immutable textures become tiled, their top mip movable.
+    const bool tiled = game && d && out && residency_create(self, create, *d, init, out, bytes);
+    const HRESULT hr = tiled ? S_OK : create(self, d, init, out);
+    if (SUCCEEDED(hr) && !tiled && d && (d->MiscFlags & D3D11_RESOURCE_MISC_TILED)) residency_after_present();
+    if (SUCCEEDED(hr) && out && *out && d && outer) {
         TesseraRecord r = {};
         r.qpc = now_qpc();
         r.kind = TESSERA_REC_TEXTURE2D;
         r.format = static_cast<uint16_t>(d->Format);
         r.flags = d->BindFlags;
         constexpr UINT kTargetBinds = D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS;
-        if (!is_game_code(ret))
+        if (!game)
             r.flags |= TESSERA_FLAG_FOREIGN;
         else
             r.flags |= raise_priority(*out, d->Usage, d->MiscFlags, (d->BindFlags & kTargetBinds) != 0);
-        r.bytes = texture2d_bytes(*d);
-        // M11 tracks what M4 could manage: game textures that are only sampled.
-        if (!(r.flags & TESSERA_FLAG_FOREIGN) && (d->BindFlags & D3D11_BIND_SHADER_RESOURCE) &&
+        if (tiled) r.flags |= TESSERA_FLAG_TILED;
+        r.bytes = bytes;
+        // M11 tracks what M4 could manage: game textures that are only sampled
+        // (managed ones were registered by residency_create).
+        if (game && !tiled && (d->BindFlags & D3D11_BIND_SHADER_RESOURCE) &&
             !(d->BindFlags & kTargetBinds) && !(d->MiscFlags & kSharedMisc) &&
             (d->Usage == D3D11_USAGE_DEFAULT || d->Usage == D3D11_USAGE_IMMUTABLE))
             workset_on_texture(*out, r.bytes);
@@ -151,6 +174,37 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
         r.d = static_cast<uint32_t>(d->Usage) | (d->MiscFlags << 8);
         session_push(r);
     }
+    return hr;
+}
+
+// Each deferred context has a vtable of its own: hooked before the game gets it.
+void on_deferred(ID3D11DeviceContext* ctx) {
+    workset_on_context(ctx);
+    residency_on_context(ctx);
+}
+
+HRESULT STDMETHODCALLTYPE hk_CreateDeferred(ID3D11Device* self, UINT flags, ID3D11DeviceContext** out) {
+    using F = decltype(&hk_CreateDeferred);
+    const HRESULT hr = orig<F>(g_create_def, self)(self, flags, out);
+    if (SUCCEEDED(hr) && out && *out) on_deferred(*out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE hk_CreateDeferred1(ID3D11Device1* self, UINT flags, ID3D11DeviceContext1** out) {
+    using F = decltype(&hk_CreateDeferred1);
+    const HRESULT hr = orig<F>(g_create_def1, self)(self, flags, out);
+    if (SUCCEEDED(hr) && out && *out) on_deferred(*out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE hk_CreateDeferred2(ID3D11Device2* self, UINT flags, ID3D11DeviceContext2** out) {
+    using F = decltype(&hk_CreateDeferred2);
+    const HRESULT hr = orig<F>(g_create_def2, self)(self, flags, out);
+    if (SUCCEEDED(hr) && out && *out) on_deferred(*out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE hk_CreateDeferred3(ID3D11Device3* self, UINT flags, ID3D11DeviceContext3** out) {
+    using F = decltype(&hk_CreateDeferred3);
+    const HRESULT hr = orig<F>(g_create_def3, self)(self, flags, out);
+    if (SUCCEEDED(hr) && out && *out) on_deferred(*out);
     return hr;
 }
 
@@ -170,7 +224,10 @@ HRESULT STDMETHODCALLTYPE hk_CreateSRV(ID3D11Device* self, ID3D11Resource* res,
         }
         session_push(r);
         // Views made by overlays and SDKs are theirs: no private data on them.
-        if (is_game_code(ret)) workset_on_srv(res, *out);
+        if (is_game_code(ret))
+            workset_on_srv(res, *out);
+        else
+            residency_pin_resource(res);  // its binds go unseen
     }
     return hr;
 }
@@ -275,14 +332,19 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForComposition(IDXGIFactory2* self, 
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
     Depth depth;
     FlipFrame ff;
+    bool managed = false;
     if (depth.outer()) {
-        if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) session_frame(pace_before_present(self));
+        if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
+            managed = residency_present(self);
+            session_frame(pace_before_present(self));
+        }
         flags = flip_before_present(self, sync, flags, ff);
         if (ff.skip) return S_OK;
     }
     using F = decltype(&hk_Present);
     const HRESULT hr = orig<F>(g_present, self)(self, sync, flags);
     flip_after_present(ff);
+    if (managed) residency_after_present();
     return hr;
 }
 
@@ -290,14 +352,19 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
                                       const DXGI_PRESENT_PARAMETERS* params) {
     Depth depth;
     FlipFrame ff;
+    bool managed = false;
     if (depth.outer()) {
-        if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) session_frame(pace_before_present(self));
+        if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
+            managed = residency_present(self);
+            session_frame(pace_before_present(self));
+        }
         flags = flip_before_present(self, sync, flags, ff);
         if (ff.skip) return S_OK;
     }
     using F = decltype(&hk_Present1);
     const HRESULT hr = orig<F>(g_present1, self)(self, sync, flags, params);
     flip_after_present(ff);
+    if (managed) residency_after_present();
     return hr;
 }
 
@@ -378,7 +445,20 @@ bool flip_hooks_ready() {
 InternalCall::InternalCall() { ++t_depth; }
 InternalCall::~InternalCall() { --t_depth; }
 
+
 void on_swapchain(IDXGISwapChain* sc) {
+    {
+        // Making it rewrote copy methods of its device's immediate context.
+        // Inside D3D11CreateDeviceAndSwapChain that device is not hooked yet.
+        ID3D11Device* dev = nullptr;
+        if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&dev)))) {
+            ID3D11DeviceContext* imm = nullptr;
+            dev->GetImmediateContext(&imm);
+            residency_check_hooks(imm);
+            if (imm) imm->Release();
+            dev->Release();
+        }
+    }
     bool ok = vt_hook(g_present, sc) && vt_hook(g_resize, sc);
     IDXGISwapChain1* sc1 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1)))) {
@@ -415,6 +495,28 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
     logf("device fl 0x%x flags 0x%x tiled tier %u, device hooks %s", r.a, create_flags, r.b, ok ? "ok" : "FAILED");
     memory_on_device(dev);
     workset_on_device(dev);
+    residency_on_device(dev);
+    // After the modules: a context made from here on gets their hooks.
+    bool def_ok = vt_hook(g_create_def, dev);
+    ID3D11Device1* d1 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d1)))) {
+        def_ok = vt_hook(g_create_def1, d1) && def_ok;
+        d1->Release();
+    }
+    ID3D11Device2* d2 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d2)))) {
+        def_ok = vt_hook(g_create_def2, d2) && def_ok;
+        d2->Release();
+    }
+    ID3D11Device3* d3 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d3)))) {
+        def_ok = vt_hook(g_create_def3, d3) && def_ok;
+        d3->Release();
+    }
+    if (!def_ok) {
+        logf("deferred context hooks FAILED");
+        residency_on_context(nullptr);
+    }
     shaders_on_device(dev);
 
     IDXGIDevice* dxgi = nullptr;

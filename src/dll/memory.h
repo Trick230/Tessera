@@ -18,4 +18,6 @@ uint64_t memory_reported_for(uint32_t vendor_id, uint64_t real);
 bool memory_device_seen();
 // From the writer thread, about once a second: pushes a VRAM record.
 void memory_background_tick();
+// Real local (dedicated) usage and budget at the last tick; false before one.
+bool memory_local(uint64_t* usage, uint64_t* budget);
 }  // namespace tessera

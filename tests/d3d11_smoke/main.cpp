@@ -2,6 +2,7 @@
 // Smoke test for the d3d11 layer.
 //   d3d11_smoke            render through both creation paths, then exit cleanly
 //   d3d11_smoke --crash    create a device and die without DLL detach
+//   d3d11_smoke --tiled    mip residency (M3-M5), with mip_residency=1 and mip_force_evict=1
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
 #include <d3d11.h>
@@ -444,8 +445,247 @@ int bench() {
     return 0;
 }
 
+// M3-M5 (run with mip_residency=1 and mip_force_evict=1 in tessera.ini):
+// large immutable textures are managed, their top mip leaves VRAM once they
+// are not bound, and every way of reading them (bind on the immediate or a
+// deferred context, copy) sees the full texture again.
+struct Tiled {
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    IDXGIAdapter3* adapter = nullptr;
+    IDXGISwapChain1* sc = nullptr;
+    ID3D11Texture2D* rt = nullptr;
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11Texture2D* readback = nullptr;
+    ID3D11Buffer* cb = nullptr;
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+};
+
+constexpr UINT kTiledSize = 2048, kTiledMips = 12, kTiledCount = 8, kProbe = 64;
+
+uint32_t texel(UINT t, UINT m, UINT x, UINT y) {
+    const uint32_t r = (x + t * 17) & 255, g = y & 255, b = ((x >> 8) & 15) | (((y >> 8) & 15) << 4);
+    return r | g << 8 | b << 16 | (255u - m * 8) << 24;
+}
+
+uint64_t local_usage(IDXGIAdapter3* a) {
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
+    a->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi);
+    return mi.CurrentUsage;
+}
+
+void present_frames(Tiled& g, int n) {
+    for (int i = 0; i < n; ++i) {
+        DXGI_PRESENT_PARAMETERS pp = {};
+        g.sc->Present1(0, 0, &pp);
+    }
+}
+
+// Lets the GPU finish, so freed memory shows in the usage.
+void settle(Tiled& g) {
+    g.ctx->Flush();
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (SUCCEEDED(g.ctx->Map(g.readback, 0, D3D11_MAP_READ, 0, &map))) g.ctx->Unmap(g.readback, 0);
+    Sleep(200);
+}
+
+// Draws mip m of the view into the probe target on ctx (the immediate one
+// or a deferred one, then executed) and compares it with what was uploaded.
+bool probe(Tiled& g, ID3D11ShaderResourceView* v, UINT t, UINT m, bool deferred) {
+    const UINT size = kTiledSize >> m;
+    const UINT step = size >= kProbe ? size / kProbe : 1, off = size >= kProbe ? 7 % step : 0;
+    const int p[4] = {static_cast<int>(step), static_cast<int>(off), static_cast<int>(off), static_cast<int>(m)};
+    ID3D11DeviceContext* c = g.ctx;
+    if (deferred && FAILED(g.dev->CreateDeferredContext(0, &c))) return false;
+    c->UpdateSubresource(g.cb, 0, nullptr, p, 0, 0);
+    D3D11_VIEWPORT vp = {0, 0, float(kProbe), float(kProbe), 0, 1};
+    c->RSSetViewports(1, &vp);
+    c->OMSetRenderTargets(1, &g.rtv, nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(g.vs, nullptr, 0);
+    c->PSSetShader(g.ps, nullptr, 0);
+    c->PSSetConstantBuffers(0, 1, &g.cb);
+    c->PSSetShaderResources(0, 1, &v);
+    c->Draw(3, 0);
+    ID3D11ShaderResourceView* none = nullptr;
+    c->PSSetShaderResources(0, 1, &none);
+    if (deferred) {
+        ID3D11CommandList* cl = nullptr;
+        const HRESULT hr = c->FinishCommandList(FALSE, &cl);
+        c->Release();
+        if (FAILED(hr)) return false;
+        g.ctx->ExecuteCommandList(cl, FALSE);
+        cl->Release();
+    }
+    g.ctx->CopyResource(g.readback, g.rt);
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (FAILED(g.ctx->Map(g.readback, 0, D3D11_MAP_READ, 0, &map))) return false;
+    bool ok = true;
+    for (UINT y = 0; y < kProbe && ok; ++y)
+        for (UINT x = 0; x < kProbe && ok; ++x) {
+            const UINT sx = x * step + off, sy = y * step + off;
+            if (sx >= size || sy >= size) continue;
+            const uint32_t got = static_cast<const uint32_t*>(map.pData)[y * map.RowPitch / 4 + x];
+            if (got != texel(t, m, sx, sy)) {
+                std::printf("texture %u mip %u at %u,%u: 0x%08x, want 0x%08x\n", t, m, sx, sy, got, texel(t, m, sx, sy));
+                ok = false;
+            }
+        }
+    g.ctx->Unmap(g.readback, 0);
+    return ok;
+}
+
+bool probe_all_mips(Tiled& g, ID3D11ShaderResourceView* v, UINT t, bool deferred = false) {
+    return probe(g, v, t, 0, deferred) && probe(g, v, t, 1, deferred) && probe(g, v, t, kTiledMips - 1, deferred);
+}
+
+int tiled() {
+    Tiled g;
+    const D3D_FEATURE_LEVEL fl[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};  // tier 2 needs 11_1
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, fl, 2, D3D11_SDK_VERSION, &g.dev,
+                                   nullptr, &g.ctx);
+    if (FAILED(hr)) return fail("D3D11CreateDevice", hr);
+    D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
+    g.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1);
+    if (o1.TiledResourcesTier < D3D11_TILED_RESOURCES_TIER_2) {
+        std::printf("tiled: skipped (tiled resources tier %d)\n", static_cast<int>(o1.TiledResourcesTier));
+        return 0;
+    }
+    IDXGIDevice* dxgi = nullptr;
+    IDXGIAdapter* a = nullptr;
+    IDXGIFactory2* factory = nullptr;
+    g.dev->QueryInterface(IID_PPV_ARGS(&dxgi));
+    dxgi->GetAdapter(&a);
+    a->QueryInterface(IID_PPV_ARGS(&g.adapter));
+    a->GetParent(IID_PPV_ARGS(&factory));
+    DXGI_SWAP_CHAIN_DESC1 sd = {};
+    sd.Width = sd.Height = 64;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    hr = factory->CreateSwapChainForHwnd(g.dev, make_window(), &sd, nullptr, nullptr, &g.sc);
+    if (FAILED(hr)) return fail("CreateSwapChainForHwnd", hr);
+
+    static const char kSrc[] =
+        "Texture2D<float4> tx : register(t0);\n"
+        "cbuffer c : register(b0) { int4 p; };\n"
+        "float4 vs(uint id : SV_VertexID) : SV_Position {\n"
+        "  float2 uv = float2((id << 1) & 2, id & 2); return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); }\n"
+        "float4 ps(float4 pos : SV_Position) : SV_Target { return tx.Load(int3(int2(pos.xy) * p.x + p.yz, p.w)); }\n";
+    ID3DBlob* vb = nullptr;
+    ID3DBlob* pb = nullptr;
+    hr = D3DCompile(kSrc, sizeof kSrc - 1, "tiled", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vb, nullptr);
+    if (SUCCEEDED(hr)) hr = D3DCompile(kSrc, sizeof kSrc - 1, "tiled", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &pb, nullptr);
+    if (SUCCEEDED(hr)) hr = g.dev->CreateVertexShader(vb->GetBufferPointer(), vb->GetBufferSize(), nullptr, &g.vs);
+    if (SUCCEEDED(hr)) hr = g.dev->CreatePixelShader(pb->GetBufferPointer(), pb->GetBufferSize(), nullptr, &g.ps);
+    if (FAILED(hr)) return fail("probe shaders", hr);
+    D3D11_BUFFER_DESC bd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+    D3D11_TEXTURE2D_DESC rd = {};
+    rd.Width = rd.Height = kProbe;
+    rd.MipLevels = rd.ArraySize = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.BindFlags = D3D11_BIND_RENDER_TARGET;
+    if (SUCCEEDED(hr)) hr = g.dev->CreateBuffer(&bd, nullptr, &g.cb);
+    if (SUCCEEDED(hr)) hr = g.dev->CreateTexture2D(&rd, nullptr, &g.rt);
+    if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.rt, nullptr, &g.rtv);
+    rd.BindFlags = 0;
+    rd.Usage = D3D11_USAGE_STAGING;
+    rd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (SUCCEEDED(hr)) hr = g.dev->CreateTexture2D(&rd, nullptr, &g.readback);
+    if (FAILED(hr)) return fail("probe target", hr);
+
+    // The textures: full chains, a different pattern per texture and mip.
+    std::vector<uint32_t> data;
+    for (UINT m = 0; m < kTiledMips; ++m) data.resize(data.size() + (kTiledSize >> m) * (kTiledSize >> m));
+    D3D11_SUBRESOURCE_DATA init[kTiledMips];
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = td.Height = kTiledSize;
+    td.MipLevels = 0;  // the full chain
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ID3D11Texture2D* tex[kTiledCount] = {};
+    ID3D11ShaderResourceView* srv[kTiledCount] = {};
+    for (UINT t = 0; t < kTiledCount; ++t) {
+        size_t at = 0;
+        for (UINT m = 0; m < kTiledMips; ++m) {
+            const UINT s = kTiledSize >> m;
+            for (UINT y = 0; y < s; ++y)
+                for (UINT x = 0; x < s; ++x) data[at + y * s + x] = texel(t, m, x, y);
+            init[m] = {&data[at], s * 4, 0};
+            at += size_t{s} * s;
+        }
+        hr = g.dev->CreateTexture2D(&td, init, &tex[t]);
+        if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(tex[t], nullptr, &srv[t]);
+        if (FAILED(hr)) return fail("tiled texture", hr);
+    }
+    D3D11_TEXTURE2D_DESC seen = {};
+    tex[0]->GetDesc(&seen);
+    std::printf("tiled: desc usage %d misc 0x%x mips %u\n", seen.Usage, seen.MiscFlags, seen.MipLevels);
+    if (seen.Usage != D3D11_USAGE_IMMUTABLE || seen.MiscFlags != 0 || seen.MipLevels != kTiledMips)
+        return fail("the game must see the texture it asked for");
+
+    // Before any Present: the first bind uploads.
+    for (UINT t = 0; t < kTiledCount; ++t)
+        if (!probe_all_mips(g, srv[t], t)) return fail("content at the first bind");
+    settle(g);
+    const uint64_t before = local_usage(g.adapter);
+    // Nothing is bound now: all evicted, and the freed memory trimmed a few
+    // frames later.
+    present_frames(g, 6);
+    settle(g);
+    const uint64_t evicted = local_usage(g.adapter);
+    std::printf("tiled: local usage %llu MB -> %llu MB after eviction\n", before >> 20, evicted >> 20);
+    if (evicted + (96ull << 20) > before) return fail("top mips must leave VRAM");
+    if (g.ctx->GetResourceMinLOD(tex[3]) != 0.0f) return fail("the game's min LOD must stay 0");
+
+    // M5: binding restores before the draw, immediate and deferred.
+    for (UINT t = 0; t < kTiledCount; ++t)
+        if (!probe_all_mips(g, srv[t], t)) return fail("content after restore");
+    present_frames(g, 3);
+    if (!probe_all_mips(g, srv[2], 2, true)) return fail("content through a deferred context");
+    present_frames(g, 3);
+    // A copy from an evicted texture copies the whole texture.
+    D3D11_TEXTURE2D_DESC cd = td;
+    cd.Usage = D3D11_USAGE_DEFAULT;
+    ID3D11Texture2D* copy = nullptr;
+    ID3D11ShaderResourceView* copy_srv = nullptr;
+    hr = g.dev->CreateTexture2D(&cd, nullptr, &copy);
+    if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(copy, nullptr, &copy_srv);
+    if (FAILED(hr)) return fail("copy target", hr);
+
+    g.ctx->CopyResource(copy, tex[5]);
+    if (!probe_all_mips(g, copy_srv, 5)) return fail("content of a copy from an evicted texture");
+    copy_srv->Release();
+    copy->Release();
+
+    // Released by the game: our reference goes within a few seconds.
+    for (UINT t = 0; t < kTiledCount; ++t) {
+        srv[t]->Release();
+        tex[t]->Release();
+    }
+    const uint64_t held = local_usage(g.adapter);
+    uint64_t now = held;
+    for (int i = 0; i < 40 && now + (32ull << 20) > held; ++i) {
+        Sleep(100);
+        present_frames(g, 1);
+        now = local_usage(g.adapter);
+    }
+    std::printf("tiled: local usage %llu MB -> %llu MB after release\n", held >> 20, now >> 20);
+    if (now + (32ull << 20) > held) return fail("released textures must be freed");
+    std::printf("tiled: ok\n");
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0) return bench();
+    if (argc >= 2 && wcscmp(argv[1], L"--tiled") == 0) return tiled();
     if (argc >= 3 && wcscmp(argv[1], L"--verify") == 0) return verify(argv[2], argc >= 4 ? _wtoi(argv[3]) : 0);
     return run(argc >= 2 && wcscmp(argv[1], L"--crash") == 0);
 }

@@ -9,6 +9,7 @@
 
 #include "config.h"
 #include "log.h"
+#include "residency.h"
 #include "session.h"
 #include "vtable.h"
 
@@ -32,7 +33,7 @@ constexpr GUID kSlotGuid = {0x3e9b6f2d, 0x41a7, 0x4c58, {0x9d, 0x0e, 0x7b, 0x2a,
 struct Hot {
     std::atomic<void*> key;
     std::atomic<uint32_t> last;  // SRV: frame it was last bound in, 0 = never
-    uint32_t pad;
+    std::atomic<uint32_t> res;   // SRV: residency index + 1 of its texture (M3), 0 = unmanaged
 };
 // The rest, in a parallel array. A slot is a COM object by layout (vtable
 // pointer first), written by hand so the tables stay plain zeroed memory:
@@ -48,9 +49,11 @@ struct Slot {
     std::atomic<long> refs;
     std::atomic<uint32_t> mark;  // texture: tick that found it bound (1 s / 10 s windows)
     std::atomic<uint32_t> mark10;
+    std::atomic<int> views;       // texture: tracked views alive
     Hot* hot;                     // its key; written under g_lock before publishing
     std::atomic<uint64_t> bytes;  // texture: size estimate
     std::atomic<Slot*> tex;       // SRV: the texture slot it views
+    std::atomic<uint32_t> res;    // texture: residency index + 1 (M3), 0 = unmanaged
 };
 struct Table {
     Hot* hot;
@@ -71,7 +74,11 @@ HRESULT STDMETHODCALLTYPE slot_query(Slot* s, REFIID id, void** out) {
 ULONG STDMETHODCALLTYPE slot_add_ref(Slot* s) { return static_cast<ULONG>(s->refs.fetch_add(1) + 1); }
 ULONG STDMETHODCALLTYPE slot_release(Slot* s) {
     const long n = s->refs.fetch_sub(1) - 1;
-    if (n == 0) s->hot->key.store(kTomb, std::memory_order_release);
+    if (n == 0) {
+        // A view dies before its texture (it holds a reference to it).
+        if (Slot* t = s->tex.load(std::memory_order_relaxed)) t->views.fetch_sub(1, std::memory_order_relaxed);
+        s->hot->key.store(kTomb, std::memory_order_release);
+    }
     return static_cast<ULONG>(n);
 }
 const SlotVtbl kSlotVtbl = {&slot_query, &slot_add_ref, &slot_release};
@@ -83,6 +90,7 @@ SRWLOCK g_lock = SRWLOCK_INIT;
 std::atomic<uint32_t> g_frame{1};
 std::atomic<uint32_t> g_untracked{0};
 std::atomic<bool> g_on{false};
+ID3D11DeviceContext* g_imm = nullptr;  // weak, like the device
 
 uint32_t hash(const void* p, int bits) {
     return static_cast<uint32_t>(((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull) >> (64 - bits));
@@ -126,7 +134,7 @@ bool attach(const Table& t, int j, ID3D11DeviceChild* obj) {
 }
 
 // One lookup per view; the texture is resolved in the tick, off the frame path.
-void mark(UINT start, UINT n, ID3D11ShaderResourceView* const* v) {
+void mark(ID3D11DeviceContext* ctx, UINT start, UINT n, ID3D11ShaderResourceView* const* v) {
     // The runtime drops an out-of-range call without reading v: so must we.
     if (!v || start >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) return;
     if (n > D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - start) return;
@@ -141,6 +149,8 @@ void mark(UINT start, UINT n, ID3D11ShaderResourceView* const* v) {
         // Write only on the first bind in a frame: no cache line ping-pong.
         std::atomic<uint32_t>& last = g_srv.hot[j].last;
         if (last.load(std::memory_order_relaxed) != f) last.store(f, std::memory_order_relaxed);
+        // M5: a managed texture is made whole before the draw that samples it.
+        if (const uint32_t r = g_srv.hot[j].res.load(std::memory_order_relaxed)) residency_on_use(r - 1, ctx);
     }
 }
 
@@ -155,7 +165,7 @@ VtHook g_set[6] = {
 
 template <int I>
 void STDMETHODCALLTYPE hk_set(ID3D11DeviceContext* self, UINT start, UINT n, ID3D11ShaderResourceView* const* v) {
-    mark(start, n, v);
+    mark(self, start, n, v);
     using F = decltype(&hk_set<I>);
     reinterpret_cast<F>(vt_orig(g_set[I], self))(self, start, n, v);
 }
@@ -182,33 +192,49 @@ void workset_on_device(ID3D11Device* dev) {
     if (!ctx) return;
     bool ok = true;
     for (VtHook& h : g_set) ok = vt_hook(h, ctx) && ok;
+    g_imm = ctx;
     ctx->Release();
-    // Deferred contexts are a different class with their own vtable: patch
-    // it through a throwaway one (fails on single-threaded devices, which
-    // cannot have deferred contexts anyway).
-    ID3D11DeviceContext* def = nullptr;
-    if (SUCCEEDED(dev->CreateDeferredContext(0, &def))) {
-        for (VtHook& h : g_set) ok = vt_hook(h, def) && ok;
-        def->Release();
-    }
     logf("workset: bind hooks %s", ok ? "ok" : "FAILED");
     // A partial set would undercount; the meter is only on with all six.
     if (ok) g_on.store(true, std::memory_order_release);
 }
 
-void workset_on_texture(ID3D11Texture2D* tex, uint64_t bytes) {
+bool workset_check_hooks(ID3D11DeviceContext* imm) {
+    // g_imm is weak: compared, never followed unless it is imm (alive).
+    if (!g_on.load(std::memory_order_acquire) || imm != g_imm) return true;
+    bool ok = true;
+    for (VtHook& h : g_set) ok = vt_rehook(h, g_imm) && ok;
+    static std::atomic<bool> s_logged{false};
+    if (!ok && !s_logged.exchange(true)) logf("workset: bind hooks overwritten, binds go uncounted");
+    return ok;
+}
+
+void workset_on_context(ID3D11DeviceContext* ctx) {
     if (!g_on.load(std::memory_order_acquire)) return;
+    bool ok = true;
+    for (VtHook& h : g_set) ok = vt_hook(h, ctx, true) && ok;
+    static std::atomic<bool> s_logged{false};
+    if (!ok && !s_logged.exchange(true)) logf("workset: deferred context hooks FAILED, its binds go uncounted");
+}
+
+std::atomic<int>* workset_on_texture(ID3D11Texture2D* tex, uint64_t bytes, uint32_t res) {
+    if (!g_on.load(std::memory_order_acquire)) return nullptr;
     AcquireSRWLockExclusive(&g_lock);
+    std::atomic<int>* views = nullptr;
     const int j = claim(g_tex, tex);
     if (j >= 0) {
         Slot& s = g_tex.slot[j];
         s.bytes.store(bytes, std::memory_order_relaxed);
         s.mark.store(0, std::memory_order_relaxed);
         s.mark10.store(0, std::memory_order_relaxed);
+        s.views.store(0, std::memory_order_relaxed);
         s.tex.store(nullptr, std::memory_order_relaxed);
+        s.res.store(res, std::memory_order_relaxed);
+        if (attach(g_tex, j, tex)) views = &s.views;
     }
-    if (j < 0 || !attach(g_tex, j, tex)) g_untracked.fetch_add(1, std::memory_order_relaxed);
+    if (!views) g_untracked.fetch_add(1, std::memory_order_relaxed);
     ReleaseSRWLockExclusive(&g_lock);
+    return views;
 }
 
 void workset_on_srv(ID3D11Resource* res, ID3D11ShaderResourceView* view) {
@@ -216,15 +242,44 @@ void workset_on_srv(ID3D11Resource* res, ID3D11ShaderResourceView* view) {
     AcquireSRWLockExclusive(&g_lock);
     // The view holds a reference to its texture: the slot outlives the view's.
     const int t = find(g_tex, res);
+    uint32_t pin = 0;
     if (t >= 0) {
+        Slot* ts = &g_tex.slot[t];
+        const uint32_t managed = ts->res.load(std::memory_order_relaxed);
         const int j = claim(g_srv, view);
         if (j >= 0) {
-            g_srv.slot[j].tex.store(&g_tex.slot[t], std::memory_order_relaxed);
+            g_srv.slot[j].tex.store(ts, std::memory_order_relaxed);
             g_srv.hot[j].last.store(0, std::memory_order_relaxed);
+            g_srv.hot[j].res.store(managed, std::memory_order_relaxed);
         }
-        if (j < 0 || !attach(g_srv, j, view)) g_untracked.fetch_add(1, std::memory_order_relaxed);
+        if (j >= 0 && attach(g_srv, j, view)) {
+            ts->views.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_untracked.fetch_add(1, std::memory_order_relaxed);
+            pin = managed;
+        }
     }
     ReleaseSRWLockExclusive(&g_lock);
+    // Its binds go unseen: the texture must never lose a mip.
+    if (pin) residency_pin(pin - 1);
+}
+
+uint32_t workset_texture_res(const void* tex) {
+    if (!tex || !g_on.load(std::memory_order_acquire)) return 0;
+    const int j = find(g_tex, tex);
+    return j < 0 ? 0 : g_tex.slot[j].res.load(std::memory_order_relaxed);
+}
+
+uint32_t workset_view_res(const void* view) {
+    if (!view || !g_on.load(std::memory_order_acquire)) return 0;
+    const int j = find(g_srv, view);
+    return j < 0 ? 0 : g_srv.hot[j].res.load(std::memory_order_relaxed);
+}
+
+void workset_clear_res(const void* tex) {
+    if (!tex || !g_on.load(std::memory_order_acquire)) return;
+    const int j = find(g_tex, tex);
+    if (j >= 0) g_tex.slot[j].res.store(0, std::memory_order_relaxed);
 }
 
 void workset_frame() { g_frame.fetch_add(1, std::memory_order_relaxed); }

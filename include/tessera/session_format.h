@@ -16,6 +16,9 @@
 #define TESSERA_FLAG_FOREIGN 0x80000000u
 // Bit in `flags` of TEXTURE2D / BUFFER records: eviction priority raised (M2).
 #define TESSERA_FLAG_PRIORITY 0x40000000u
+// Bit in `flags` of TEXTURE2D records: created as a tiled texture whose top
+// mip Tessera may move to system memory while it is cold (M3/M4).
+#define TESSERA_FLAG_TILED 0x20000000u
 
 enum TesseraRecordKind {
     TESSERA_REC_FRAME = 1,      // a = CPU frame time in us (0 on the first frame),
@@ -38,6 +41,10 @@ enum TesseraRecordKind {
                                 // bytes = bytes of the tracked textures alive. "Last second"
                                 // includes the frame in flight at the previous tick, so at low
                                 // frame rates the window is a frame longer.
+    TESSERA_REC_RESIDENCY = 10, // ~1 s, M3-M5/M10: a = managed textures alive, b = with the top mip
+                                // in system memory now, c = restores since the last record, d =
+                                // evictions since the last record, flags = late restores (total),
+                                // bytes = system memory holding top mips
     TESSERA_REC_END = 0xFFFF,   // a = records dropped (ring overrun), bytes = records written
 };
 
