@@ -27,6 +27,32 @@ fn main() {
             println!("layer      limited {} frames ({:.1} s waited), {} prioritized, {} foreign",
                 s.limited_frames, s.limiter_wait_s, s.prioritized, s.foreign);
             println!("display    {:?}, feature level {:#x}", s.swapchain, s.feature_level);
+            println!(
+                "hitches    {} shaders, {} over the VRAM budget",
+                s.hitches_shaders, s.hitches_over_budget
+            );
+            println!(
+                "shaders    {} created, {} new, {:.1} ms creating",
+                s.shaders, s.shaders_new, s.shader_create_ms
+            );
+            println!(
+                "vram       budget {} MB, peak {} MB, {} s over, cap {} MB",
+                s.vram_budget_mb, s.vram_peak_mb, s.vram_over_s, s.vram_cap_mb
+            );
+            match &s.workset {
+                Some(w) => println!(
+                    "workset    {} MB of textures, bound avg {} / peak {} MB a second, {} MB in 10 s, {} untracked",
+                    w.textures_mb, w.used_avg_mb, w.used_peak_mb, w.used10_peak_mb, w.untracked
+                ),
+                None => println!("workset    no samples"),
+            }
+            match &s.residency {
+                Some(r) => println!(
+                    "residency  {} managed, {} evicted at most, {} evictions, {} restores, {} late, {} MB in RAM at most",
+                    r.managed_peak, r.evicted_peak, r.evictions, r.restores, r.late, r.ram_peak_mb
+                ),
+                None => println!("residency  off"),
+            }
         }
         Err(e) => {
             eprintln!("error: {e}");

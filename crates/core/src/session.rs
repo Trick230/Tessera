@@ -20,6 +20,7 @@ pub const REC_SWAPCHAIN: u16 = 6;
 pub const REC_VRAM: u16 = 7;
 pub const REC_SHADER: u16 = 8;
 pub const REC_WORKSET: u16 = 9;
+pub const REC_RESIDENCY: u16 = 10;
 pub const REC_END: u16 = 0xFFFF;
 
 /// Resource created by code outside the game's folder (overlay, SDK).
@@ -115,6 +116,22 @@ pub struct Summary {
     pub swapchain: Option<(u32, u32)>,
     /// M11 texture working set; None when the layer had no samples.
     pub workset: Option<WorkSet>,
+    /// M3-M5/M10 mip residency; None when it was off.
+    pub residency: Option<Residency>,
+}
+
+/// M3-M5/M10: what mip residency did during the session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Residency {
+    /// Most managed textures alive at once, and most with the top mip evicted.
+    pub managed_peak: u32,
+    pub evicted_peak: u32,
+    pub evictions: u64,
+    pub restores: u64,
+    /// Restores that came after the texture was already drawn (pop-in risk).
+    pub late: u32,
+    /// Most system memory holding evicted top mips, MB.
+    pub ram_peak_mb: u32,
 }
 
 /// M11: how much of the game's sampled texture memory play really binds.
@@ -230,6 +247,7 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
         return Err(Error::Format("tamanhos"));
     }
     let mut s = Summary { header, ..Default::default() };
+    let mut res: Option<Residency> = None;
     let mut frame_us: Vec<u32> = Vec::with_capacity((b.len() - hs) / rs);
     // Frames during which the game created many resources, by index into frame_us.
     let mut creating: Vec<bool> = Vec::with_capacity(frame_us.capacity());
@@ -310,6 +328,15 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
                 ws_used_kb += r.a as u64;
             }
             REC_SWAPCHAIN => s.swapchain = Some((r.a, r.b)),
+            REC_RESIDENCY => {
+                let m = res.get_or_insert_with(Residency::default);
+                m.managed_peak = m.managed_peak.max(r.a);
+                m.evicted_peak = m.evicted_peak.max(r.b);
+                m.restores += r.c as u64;
+                m.evictions += r.d as u64;
+                m.late = m.late.max(r.flags);
+                m.ram_peak_mb = m.ram_peak_mb.max((r.bytes >> 20) as u32);
+            }
             REC_END => {
                 s.clean = true;
                 s.dropped = r.a;
@@ -321,6 +348,7 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
         s.duration_s = (last - first) as f64 / s.header.qpc_frequency as f64;
     }
     s.limiter_wait_s = limiter_us as f64 / 1e6;
+    s.residency = res;
     if ws.samples > 0 {
         ws.used_avg_mb = (ws_used_kb / ws.samples as u64 >> 10) as u32;
         s.workset = Some(ws);
@@ -510,6 +538,19 @@ mod tests {
         b.extend_from_slice(&bytes.to_le_bytes());
     }
 
+
+    #[test]
+    fn summarizes_mip_residency() {
+        let mut b = header(1000);
+        assert_eq!(summarize(&b).unwrap().residency, None, "off: no records");
+        rec_full(&mut b, 1, REC_RESIDENCY, 0, [10, 4, 1, 5], 30 << 20);
+        rec_full(&mut b, 2, REC_RESIDENCY, 2, [12, 2, 3, 0], 10 << 20);
+        let r = summarize(&b).unwrap().residency.unwrap();
+        assert_eq!(
+            r,
+            Residency { managed_peak: 12, evicted_peak: 4, evictions: 5, restores: 4, late: 2, ram_peak_mb: 30 }
+        );
+    }
 
     #[test]
     fn suggests_a_vram_cap_from_the_working_set() {
