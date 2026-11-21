@@ -114,7 +114,12 @@ void forget(void** vt) {
     for (int k = 0; k < g_n_hooks; ++k) {
         VtHook& h = *g_hooks[k];
         for (long i = 0; i < h.n; ++i)
-            if (h.vt[i] == vt) InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&h.vt[i]), nullptr);
+            if (h.vt[i] == vt) {
+                // A call still made through it (later in the destructor) goes here.
+                h.forgotten = h.orig[i];
+                h.forgotten_vt = vt;
+                InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&h.vt[i]), nullptr);
+            }
     }
     ReleaseSRWLockExclusive(&g_patch_lock);
 }
@@ -187,6 +192,8 @@ void* vt_orig(const VtHook& h, void* obj) {
     const long n = h.n;
     for (long i = 0; i < n; ++i)
         if (h.vt[i] == vt) return h.orig[i];
+    // A vtable forgotten while its object was being destroyed.
+    if (vt == h.forgotten_vt) return h.forgotten;
     return h.orig[0];
 }
 }  // namespace tessera

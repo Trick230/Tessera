@@ -14,6 +14,8 @@ struct VtHook {
     volatile long n;
     void** volatile vt[kVtMax];  // nullptr: a forgotten vtable's entry, free for a new one
     void* orig[kVtMax];
+    void** volatile forgotten_vt;  // the last forgotten vtable, and its original:
+    void* volatile forgotten;      // vt_orig for a call made through it while its object dies
     bool listed;  // in the list vt_forget walks
 };
 
