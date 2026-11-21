@@ -177,23 +177,24 @@ fn shader_text(exe: &Path, sum: Option<&session::Summary>) -> String {
 }
 
 /// Fills the panel for the last session. Also returns the real VRAM budget
-/// seen in it (MB, 0 if unknown) for the budget cap choices, and the shaders
+/// seen in it (MB, 0 if unknown) and the cap its working set suggests (M11),
+/// for the budget cap choices, and the shaders
 /// it created and how many of those were new (not stored yet).
-fn session_info(exe: &Path) -> (SessionInfo, u32, Option<(u64, u64)>) {
+fn session_info(exe: &Path) -> (SessionInfo, (u32, Option<u32>), Option<(u64, u64)>) {
     let s = |v: String| SharedString::from(v);
     let mut info = SessionInfo {
         safe_mode: session::safe_mode_active(exe),
         shaders: s(shader_text(exe, None)),
         ..Default::default()
     };
-    let Some(path) = session::latest(exe) else { return (info, 0, None) };
+    let Some(path) = session::latest(exe) else { return (info, (0, None), None) };
     info.present = true;
     let sum = match session::summarize_file(&path) {
         Ok(v) => v,
         Err(e) => {
             info.when = s(session_when(&path));
             info.note = s(format!("Could not read {}: {e}", path.display()));
-            return (info, 0, None);
+            return (info, (0, None), None);
         }
     };
     info.clean = sum.clean;
@@ -332,7 +333,7 @@ fn session_info(exe: &Path) -> (SessionInfo, u32, Option<(u64, u64)>) {
     }
     info.note = s(notes.join("; "));
     let run = (sum.shaders > 0).then_some((sum.shaders, sum.shaders_new));
-    (info, sum.vram_budget_mb, run)
+    (info, (sum.vram_budget_mb, session::suggested_vram_cap_mb(&sum)), run)
 }
 
 /// The Shaders tab: what the driver already compiled, how much of what the
@@ -458,7 +459,7 @@ static SETTINGS: Mutex<Option<SettingsLists>> = Mutex::new(None);
 
 /// Choice lists for the settings card; a value set by hand in tessera.ini is
 /// kept as an extra entry so the card never rewrites it by accident.
-fn game_settings(dir: &Path, budget_mb: u32) -> (GameSettings, SettingsLists) {
+fn game_settings(dir: &Path, (budget_mb, suggest_mb): (u32, Option<u32>)) -> (GameSettings, SettingsLists) {
     let cur = install::settings(dir);
     let mut fps: Vec<u32> = FPS_CHOICES.to_vec();
     // Caps from 3 GB up to the real budget (or 12 GB when no session measured it).
@@ -475,7 +476,13 @@ fn game_settings(dir: &Path, budget_mb: u32) -> (GameSettings, SettingsLists) {
         ModelRc::new(VecModel::from(v))
     };
     let idx = |list: &[u32], v: u32| list.iter().position(|&x| x == v).unwrap_or(0) as i32;
-    let hint = if budget_mb > 0 {
+    let hint = if let (true, Some(cap)) = (budget_mb > 0, suggest_mb) {
+        format!(
+            "Windows gives this game {}; the textures it used last time fit in {}.",
+            gb(budget_mb),
+            gb(cap)
+        )
+    } else if budget_mb > 0 {
         format!(
             "Windows gives this game {}. A lower cap makes it free memory sooner.",
             gb(budget_mb)

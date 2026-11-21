@@ -350,6 +350,22 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
     Ok(s)
 }
 
+/// M11 → M1: a VRAM cap, in whole GB as MB, that still fits everything play
+/// used: the peak usage less the sampled textures nothing bound for 10 s,
+/// plus a margin. None without a full minute of samples, when the meter
+/// missed textures, or when the cap would not be below the real budget.
+pub fn suggested_vram_cap_mb(s: &Summary) -> Option<u32> {
+    const MARGIN_MB: u32 = 512;
+    let w = s.workset.as_ref()?;
+    if w.samples < 60 || w.untracked > 0 || s.vram_budget_mb == 0 || s.vram_peak_mb == 0 {
+        return None;
+    }
+    let idle = w.textures_mb.saturating_sub(w.used10_peak_mb);
+    let need = s.vram_peak_mb.saturating_sub(idle) + MARGIN_MB;
+    let cap = need.div_ceil(1024).max(3) * 1024;
+    (cap < s.vram_budget_mb / 1024 * 1024).then_some(cap)
+}
+
 pub fn summarize_file(path: &Path) -> Result<Summary, Error> {
     summarize(&std::fs::read(path)?)
 }
@@ -494,6 +510,24 @@ mod tests {
         b.extend_from_slice(&bytes.to_le_bytes());
     }
 
+
+    #[test]
+    fn suggests_a_vram_cap_from_the_working_set() {
+        let w = WorkSet { samples: 600, textures_mb: 5000, used_avg_mb: 900, used_peak_mb: 1500, used10_peak_mb: 2000, untracked: 0 };
+        let mut s = Summary { vram_budget_mb: 7400, vram_peak_mb: 7000, workset: Some(w), ..Default::default() };
+        // 7000 - (5000 - 2000) + 512 = 4512 → 5 GB.
+        assert_eq!(suggested_vram_cap_mb(&s), Some(5 << 10));
+        s.workset.as_mut().unwrap().used10_peak_mb = 4900;
+        assert_eq!(suggested_vram_cap_mb(&s), None, "no lower than the budget's whole GB");
+        s.workset.as_mut().unwrap().used10_peak_mb = 100;
+        s.vram_peak_mb = 2000;
+        assert_eq!(suggested_vram_cap_mb(&s), Some(3 << 10), "never below 3 GB");
+        s.workset.as_mut().unwrap().untracked = 1;
+        assert_eq!(suggested_vram_cap_mb(&s), None, "a meter that missed textures undercounts");
+        s.workset.as_mut().unwrap().untracked = 0;
+        s.workset.as_mut().unwrap().samples = 30;
+        assert_eq!(suggested_vram_cap_mb(&s), None, "under a minute of play");
+    }
     #[test]
     fn summarizes_the_working_set() {
         let mut b = header(1_000_000);
