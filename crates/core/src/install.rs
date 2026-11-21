@@ -232,6 +232,28 @@ pub struct UeCvars {
     pub skipped: Vec<String>,
 }
 
+/// U1 variables tessera.ini asks for: the streaming profile (ue_streaming) and
+/// each test variant whose key is non-zero (uecvars::VARIANTS).
+fn ue_wanted(dir: &Path, vram_mb: u32) -> Vec<(&'static str, f64)> {
+    let s = settings(dir);
+    let mut wanted = Vec::new();
+    if s.ue_streaming {
+        // The cap the user set for this game counts as its memory.
+        let vram_mb = if s.vram_budget_mb > 0 { vram_mb.min(s.vram_budget_mb) } else { vram_mb };
+        wanted = crate::uecvars::streaming_profile(vram_mb);
+    }
+    let text = fs::read_to_string(dir.join(INI)).unwrap_or_default();
+    for (key, vars) in crate::uecvars::VARIANTS {
+        let on = text.lines().filter_map(|l| l.split_once('=')).any(|(k, v)| {
+            k.trim().eq_ignore_ascii_case(key) && v.trim().parse::<u32>().unwrap_or(0) != 0
+        });
+        if on {
+            wanted.extend_from_slice(vars);
+        }
+    }
+    wanted
+}
+
 /// U1: rewrites the `ue_image`/`cvar.*` lines of tessera.ini for `exe` (the
 /// process the layer loads in) from the ue_streaming setting. Off: the lines
 /// go. On: the executable is scanned again (~0.1 s), so an updated game gets
@@ -239,11 +261,8 @@ pub struct UeCvars {
 pub fn apply_ue_cvars(dir: &Path, exe: &Path, vram_mb: u32) -> io::Result<UeCvars> {
     let mut lines = Vec::new();
     let mut report = UeCvars::default();
-    let s = settings(dir);
-    if s.ue_streaming {
-        // The cap the user set for this game counts as its memory.
-        let vram_mb = if s.vram_budget_mb > 0 { vram_mb.min(s.vram_budget_mb) } else { vram_mb };
-        let wanted = crate::uecvars::streaming_profile(vram_mb);
+    let wanted = ue_wanted(dir, vram_mb);
+    if !wanted.is_empty() {
         let names: Vec<&str> = wanted.iter().map(|w| w.0).collect();
         match crate::uecvars::find_cvars(exe, &names)? {
             Ok((id, slots)) => {
@@ -260,7 +279,7 @@ pub fn apply_ue_cvars(dir: &Path, exe: &Path, vram_mb: u32) -> io::Result<UeCvar
         return Ok(report); // not installed: nothing to keep in step
     };
     // Turned off while this scan ran (saves run on their own threads): no lines.
-    if !settings(dir).ue_streaming {
+    if ue_wanted(dir, vram_mb).is_empty() {
         lines.clear();
         report = UeCvars::default();
     }
@@ -385,5 +404,10 @@ mod tests {
         assert!(fs::read_to_string(t.path().join(INI)).unwrap().contains("cvar.r.Old"));
         apply_ue_cvars(t.path(), &exe, 8192).unwrap();
         assert!(!fs::read_to_string(t.path().join(INI)).unwrap().contains("ue_image"));
+        // A test variant asks for its variables without ue_streaming; "0" does not.
+        fs::write(t.path().join(INI), "[tessera]\nue_drs_off=1\nue_rt_grow=0\n").unwrap();
+        let r = apply_ue_cvars(t.path(), &exe, 8192).unwrap();
+        assert_eq!(r.skipped.len(), 2);
+        assert!(r.skipped[0].starts_with("r.DynamicRes.OperationMode"));
     }
 }

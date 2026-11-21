@@ -119,7 +119,13 @@ try {
         $mode = if ($i -eq 0) { "warm" } elseif (-not $on) { "off" } elseif ($variant) { "on-" + ($variant -replace "\W+", "_") } else { "on" }
         if ($on) {
             & $layer install $GameDir $payload | Out-Null
-            if (-not $LASTEXITCODE) { Write-TestIni $variant }
+            if (-not $LASTEXITCODE) {
+                Write-TestIni $variant
+                # U1 lines follow the run's keys (ue_streaming, ue_drs_off, ...).
+                $ue = (& $layer ue $GameDir (Join-Path $GameDir $ExeName)) -join " "
+                if ($LASTEXITCODE) { throw "run ${i}: layer ue failed" }
+                Log "run ${i}: $ue"
+            }
             # A crash in an earlier run must not put this one in safe mode.
             $safe = @(Get-ChildItem (Join-Path $data "safemode") -Filter "$ExeName*.count" -ErrorAction SilentlyContinue)
             if ($safe.Count) { $safe | Remove-Item; Log "run ${i}: safe-mode counter cleared" }

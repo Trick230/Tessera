@@ -408,6 +408,29 @@ pub fn streaming_profile(vram_mb: u32) -> Vec<(&'static str, f64)> {
     v
 }
 
+/// U1 test variants, each switched on by its own tessera.ini key (`<key>=1`),
+/// off by default and independent of ue_streaming. Kept for A/B runs until
+/// measurements say which ones help.
+pub const VARIANTS: &[(&str, &[(&str, f64)])] = &[
+    // Dynamic resolution off, full resolution (UE4 DRS is not meant for PC).
+    ("ue_drs_off", &[("r.DynamicRes.OperationMode", 0.0), ("r.DynamicRes.MinScreenPercentage", 100.0)]),
+    // Scene render targets only grow: no reallocation when the render size changes.
+    ("ue_rt_grow", &[("r.SceneRenderTargetResizeMethod", 2.0)]),
+    // Texture pool kept inside VRAM, more temporary memory for mip changes.
+    ("ue_pool_vram", &[("r.Streaming.LimitPoolSizeToVRAM", 1.0), ("r.Streaming.MaxTempMemoryAllowed", 100.0)]),
+    // Shader objects created when a package loads, not on first draw.
+    ("ue_shaders_on_load", &[("r.CreateShadersOnLoad", 1.0)]),
+    // Less game-thread time per frame for level streaming work (ms; UE4 defaults 5, 5, 1).
+    (
+        "ue_load_limits",
+        &[
+            ("s.AsyncLoadingTimeLimit", 2.0),
+            ("s.LevelStreamingActorsUpdateTimeLimit", 2.0),
+            ("s.UnregisterComponentsTimeLimit", 0.5),
+        ],
+    ),
+];
+
 /// tessera.ini lines (src/dll/uecvars.cpp) for `wanted` on the scanned image,
 /// plus the variables left out and why.
 pub fn ini_lines(id: ImageId, wanted: &[(&str, f64)], slots: &[Result<CvarSlot, CvarError>]) -> (Vec<String>, Vec<String>) {
@@ -626,6 +649,16 @@ mod tests {
             "s.AsyncLoadingTimeLimit",
             "s.LevelStreamingActorsUpdateTimeLimit",
             "r.CreateShadersOnLoad",
+            "r.Streaming.LimitPoolSizeToVRAM",
+            "r.Streaming.MaxTempMemoryAllowed",
+            "s.UnregisterComponentsTimeLimit",
+            "r.DynamicRes.OperationMode",
+            "r.DynamicRes.MinScreenPercentage",
+            "r.DynamicRes.MaxScreenPercentage",
+            "r.DynamicRes.FrameTimeBudget",
+            "r.DynamicRes.MinResolutionChangePeriod",
+            "r.ScreenPercentage",
+            "r.SceneRenderTargetResizeMethod",
         ];
         let t = std::time::Instant::now();
         let (id, r) = find_cvars(Path::new(&p), &names).unwrap().unwrap();
