@@ -5,7 +5,7 @@
 //   d3d11_smoke --tiled    mip residency (M3-M5), with mip_residency=1 and mip_force_evict=1
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
-#include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <windows.h>
@@ -667,8 +667,34 @@ int tiled() {
     for (UINT t = 0; t < kTiledCount; ++t)
         if (!probe_all_mips(g, srv[t], t)) return fail("content after restore");
     present_frames(g, 3);
+    // Games create deferred contexts all session long, each with a vtable of
+    // its own: the hooks must keep working past many of them.
+    for (int round = 0; round < 2; ++round) {
+        ID3D11DeviceContext* c[40] = {};
+        ID3D11Device1* dev1 = nullptr;
+        if (FAILED(g.dev->QueryInterface(IID_PPV_ARGS(&dev1)))) return fail("ID3D11Device1");
+        for (int k = 0; k < 40; ++k) {
+            // Round 1 through CreateDeferredContext1, which may reach the plain hook too.
+            HRESULT chr = S_OK;
+            if (round == 0) {
+                chr = g.dev->CreateDeferredContext(0, &c[k]);
+            } else {
+                ID3D11DeviceContext1* c1 = nullptr;
+                chr = dev1->CreateDeferredContext1(0, &c1);
+                c[k] = c1;
+            }
+            if (FAILED(chr)) return fail("deferred context", chr);
+            c[k]->PSSetShaderResources(0, 1, &srv[k % kTiledCount]);
+        }
+        for (ID3D11DeviceContext* x : c) x->Release();
+        dev1->Release();
+    }
     if (!probe_all_mips(g, srv[2], 2, true)) return fail("content through a deferred context");
-    present_frames(g, 3);
+    present_frames(g, 6);
+    settle(g);
+    const uint64_t again = local_usage(g.adapter);
+    std::printf("tiled: local usage %llu MB after eviction past 80 deferred contexts\n", again >> 20);
+    if (again + (96ull << 20) > before) return fail("evictions must go on past many deferred contexts");
     // A copy from an evicted texture copies the whole texture.
     D3D11_TEXTURE2D_DESC cd = td;
     cd.Usage = D3D11_USAGE_DEFAULT;

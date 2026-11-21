@@ -179,6 +179,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
 
 // Each deferred context has a vtable of its own: hooked before the game gets it.
 void on_deferred(ID3D11DeviceContext* ctx) {
+    vt_track(ctx);
     workset_on_context(ctx);
     residency_on_context(ctx);
 }

@@ -2,8 +2,11 @@
 #include "vtable.h"
 
 #include <windows.h>
+#include <d3d11.h>
 
+#include <atomic>
 #include <cstdlib>
+#include <new>
 
 namespace tessera {
 namespace {
@@ -56,6 +59,11 @@ bool is_system_module(HMODULE m) {
     return yes;
 }
 
+// Under g_patch_lock: the hooks that patched anything, for vt_forget.
+// About 40 hooks exist today; past this, a new hook fails its first patch.
+VtHook* g_hooks[128];
+int g_n_hooks = 0;
+
 bool hook_impl(VtHook& h, void* obj, bool readopt) {
     void** vt = *static_cast<void***>(obj);
     AcquireSRWLockExclusive(&g_patch_lock);
@@ -76,22 +84,91 @@ bool hook_impl(VtHook& h, void* obj, bool readopt) {
         }
         h.orig[i] = vt[h.slot];
     } else {
-        if (h.n == static_cast<long>(_countof(h.vt))) {
+        if (!h.listed) {
+            if (g_n_hooks == static_cast<int>(_countof(g_hooks))) {
+                ok = false;
+                goto done;
+            }
+            g_hooks[g_n_hooks++] = &h;
+            h.listed = true;
+        }
+        long j = 0;
+        while (j < h.n && h.vt[j]) ++j;  // a forgotten entry first
+        if (j == kVtMax) {
             ok = false;
             goto done;
         }
         // Publish the original before the hook can be reached through this vtable.
-        h.vt[h.n] = vt;
-        h.orig[h.n] = vt[h.slot];
-        InterlockedIncrement(&h.n);
+        h.orig[j] = vt[h.slot];
+        InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&h.vt[j]), vt);
+        if (j == h.n) InterlockedIncrement(&h.n);
     }
     ok = write_slot(vt, h.slot, h.fn);
 done:
     ReleaseSRWLockExclusive(&g_patch_lock);
     return ok;
 }
+
+void forget(void** vt) {
+    AcquireSRWLockExclusive(&g_patch_lock);
+    for (int k = 0; k < g_n_hooks; ++k) {
+        VtHook& h = *g_hooks[k];
+        for (long i = 0; i < h.n; ++i)
+            if (h.vt[i] == vt) InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&h.vt[i]), nullptr);
+    }
+    ReleaseSRWLockExclusive(&g_patch_lock);
+}
+
+// Private data of a tracked object: the runtime releases it when the object
+// is destroyed, before its memory (and the vtable in it) can be reused.
+// {3F7A2C19-8E45-4B6D-9C21-5A0E7D3B8F14}
+constexpr GUID kTrackGuid = {0x3f7a2c19, 0x8e45, 0x4b6d, {0x9c, 0x21, 0x5a, 0x0e, 0x7d, 0x3b, 0x8f, 0x14}};
+struct Tracker final : IUnknown {
+    std::atomic<long> refs{1};
+    void** vt = nullptr;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        if (iid == __uuidof(IUnknown)) {
+            *out = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(refs.fetch_add(1) + 1); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const long n = refs.fetch_sub(1) - 1;
+        if (n == 0) {
+            forget(vt);
+            this->~Tracker();
+            HeapFree(GetProcessHeap(), 0, this);
+        }
+        return static_cast<ULONG>(n);
+    }
+};
 }  // namespace
 
+void vt_track(ID3D11DeviceChild* obj) {
+    void** vt = *reinterpret_cast<void***>(obj);
+    // Only a vtable inside the object itself: one in a module image is shared.
+    const auto a = reinterpret_cast<uintptr_t>(vt), o = reinterpret_cast<uintptr_t>(obj);
+    if (a < o || a >= o + 4096 || module_of(vt)) return;
+    // Tracked already (a second creation hook for the same object): replacing
+    // the tracker would release it and forget a vtable still in use.
+    IUnknown* had = nullptr;
+    UINT size = sizeof had;
+    if (SUCCEEDED(obj->GetPrivateData(kTrackGuid, &size, &had))) {
+        if (had) had->Release();
+        return;
+    }
+    void* mem = HeapAlloc(GetProcessHeap(), 0, sizeof(Tracker));
+    if (!mem) return;
+    auto* t = new (mem) Tracker();
+    t->vt = vt;
+    obj->SetPrivateDataInterface(kTrackGuid, t);
+    t->Release();  // the object's reference is the one left
+}
 bool vt_hook(VtHook& h, void* obj, bool readopt) { return hook_impl(h, obj, readopt); }
 
 bool vt_rehook(VtHook& h, void* obj) {

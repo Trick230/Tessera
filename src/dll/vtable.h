@@ -4,13 +4,17 @@
 // of different classes sharing the hook each chain to their own original.
 #pragma once
 
+struct ID3D11DeviceChild;
+
 namespace tessera {
+constexpr int kVtMax = 64;
 struct VtHook {
     int slot;
     void* fn;
     volatile long n;
-    void** vt[32];  // every deferred context has its own (heap) vtable
-    void* orig[32];
+    void** volatile vt[kVtMax];  // nullptr: a forgotten vtable's entry, free for a new one
+    void* orig[kVtMax];
+    bool listed;  // in the list vt_forget walks
 };
 
 // Patches obj's vtable at h.slot (once per vtable). Saves the current
@@ -27,4 +31,10 @@ bool vt_rehook(VtHook& h, void* obj);
 
 // Original pointer for obj's vtable. Only called from inside h.fn.
 void* vt_orig(const VtHook& h, void* obj);
+
+// For an object whose vtable lives and dies with it (a deferred context's,
+// inside the object): once it is destroyed, every hook forgets that vtable,
+// so objects created all session long do not fill the tables. Before any
+// vt_hook on obj.
+void vt_track(ID3D11DeviceChild* obj);
 }  // namespace tessera
