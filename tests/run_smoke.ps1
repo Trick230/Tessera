@@ -68,6 +68,8 @@ try {
     Check "mip residency run" ($LASTEXITCODE -eq 0)
     if ("$t" -notmatch "skipped") {
         Check "residency on logged" ((Select-String -Path $log -Pattern "residency: on" -Quiet))
+        Check "a replacing device takes over" ((Select-String -Path $log -Pattern "new device takes over" -Quiet) -and
+            @(Select-String -Path $log -Pattern "residency: on").Count -ge 2)
     }
 } finally { Remove-Item $ini }
 

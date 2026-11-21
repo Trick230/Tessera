@@ -98,6 +98,12 @@ ID3D11DeviceContext* g_imm = nullptr;
 ID3D11DeviceContext2* g_ctx2 = nullptr;
 ID3D11Device2* g_dev2 = nullptr;
 IDXGIDevice3* g_dxgi3 = nullptr;  // weak, like g_dev
+// A device created while textures of the current one were still alive:
+// compared only, never used, until it creates a texture (then it is alive).
+std::atomic<uintptr_t> g_next_dev{0};
+// residency_present's cache: the last swapchain and whether it is g_dev's.
+std::atomic<IDXGISwapChain*> g_present_sc{nullptr};
+std::atomic<bool> g_present_ours{false};
 // Present thread: a released pool goes to the driver's free cache, still
 // counted as ours; Trim gives it back. Once the GPU is past the evictions.
 uint32_t g_trim_after = 0;  // frame from which to trim, 0 = nothing to trim
@@ -702,12 +708,8 @@ bool tiled_format(ID3D11Device* dev, DXGI_FORMAT f) {
     }
     return k == 1;
 }
-}  // namespace
-
-void residency_on_device(ID3D11Device* dev) {
-    if (!config().mip_residency || g_live.load(std::memory_order_acquire) != 0) return;
-    // No managed texture holds the previous device: forget it before trying
-    // this one, so a failure below leaves nothing pointing at a freed device.
+// Off, and nothing left pointing at the device (no managed texture holds it).
+void forget_device() {
     g_on.store(false, std::memory_order_release);
     g_dev.store(nullptr, std::memory_order_release);
     g_imm = nullptr;
@@ -715,6 +717,22 @@ void residency_on_device(ID3D11Device* dev) {
     g_dev2 = nullptr;
     g_dxgi3 = nullptr;
     g_trim_after = 0;
+}
+}  // namespace
+
+void residency_on_device(ID3D11Device* dev) {
+    if (!config().mip_residency) return;
+    if (g_live.load(std::memory_order_acquire) != 0) {
+        // The previous device's textures still hold it: this one takes over
+        // once they are gone (residency_present, then residency_create).
+        if (g_next_dev.exchange(reinterpret_cast<uintptr_t>(dev)) != reinterpret_cast<uintptr_t>(dev))
+            logf("residency: new device, waiting for the previous one's textures to go");
+        return;
+    }
+    g_next_dev.store(0, std::memory_order_relaxed);
+    // No managed texture holds the previous device: forget it before trying
+    // this one, so a failure below leaves nothing pointing at a freed device.
+    forget_device();
     D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
     if (FAILED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) ||
         o1.TiledResourcesTier < D3D11_TILED_RESOURCES_TIER_2) {
@@ -773,6 +791,7 @@ void residency_on_device(ID3D11Device* dev) {
         dxgi3->Release();
     }
     g_dev.store(dev, std::memory_order_release);
+    g_present_sc.store(nullptr, std::memory_order_relaxed);
     // Weak from here on (see g_dev).
     ctx2->Release();
     dev2->Release();
@@ -783,6 +802,11 @@ void residency_on_device(ID3D11Device* dev) {
 
 bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTURE2D_DESC& d,
                       const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out, uint64_t bytes) {
+    // The device waiting to take over creates a texture: it is alive now.
+    if (uintptr_t next = g_next_dev.load(std::memory_order_relaxed);
+        next == reinterpret_cast<uintptr_t>(dev) && !g_on.load(std::memory_order_acquire) &&
+        g_next_dev.compare_exchange_strong(next, 0))
+        residency_on_device(dev);
     if (!g_on.load(std::memory_order_acquire) || dev != g_dev.load(std::memory_order_relaxed) ||
         g_evict_off.load(std::memory_order_relaxed))
         return false;
@@ -931,23 +955,27 @@ static void trim_if_due();
 
 bool residency_present(IDXGISwapChain* sc) {
     if (!g_on.load(std::memory_order_acquire) || !g_live.load(std::memory_order_relaxed) || t_in_op) return false;
-    static std::atomic<IDXGISwapChain*> s_sc{nullptr};
-    static std::atomic<bool> s_ours{false};
-    if (s_sc.load(std::memory_order_relaxed) != sc) {
+    if (g_present_sc.load(std::memory_order_relaxed) != sc) {
         ID3D11Device* d = nullptr;
         bool ours = false;
         if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&d)))) {
             ours = d == g_dev.load(std::memory_order_relaxed);
             d->Release();
         }
-        s_ours.store(ours, std::memory_order_relaxed);
-        s_sc.store(sc, std::memory_order_relaxed);
+        g_present_ours.store(ours, std::memory_order_relaxed);
+        g_present_sc.store(sc, std::memory_order_relaxed);
     }
     // Drops need no context: on any Present, so textures of a device the game
     // replaced (and that device with them) are freed once the game lets go.
     uint32_t i;
     for (int k = 0; k < kDropPerFrame && pop(g_drop, &i); ++k) drop(i);
-    if (!s_ours.load(std::memory_order_relaxed)) return false;
+    if (g_live.load(std::memory_order_acquire) == 0 && g_next_dev.load(std::memory_order_relaxed)) {
+        // The last one is gone and the previous device may be with it.
+        forget_device();
+        logf("residency: previous device's textures gone, the new device takes over");
+        return false;
+    }
+    if (!g_present_ours.load(std::memory_order_relaxed)) return false;
     trim_if_due();
 
     drain_need();

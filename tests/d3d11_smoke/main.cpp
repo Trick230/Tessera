@@ -709,6 +709,13 @@ int tiled() {
     copy_srv->Release();
     copy->Release();
 
+    // A new device while these textures live (a device the game replaces):
+    // it takes over once they are gone (the log shows it, run_smoke checks).
+    ID3D11Device* next = nullptr;
+    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, fl, 2, D3D11_SDK_VERSION, &next, nullptr,
+                           nullptr);
+    if (FAILED(hr)) return fail("second device", hr);
+
     // Released by the game: our reference goes within a few seconds.
     for (UINT t = 0; t < kTiledCount; ++t) {
         srv[t]->Release();
@@ -723,6 +730,12 @@ int tiled() {
     }
     std::printf("tiled: local usage %llu MB -> %llu MB after release\n", held >> 20, now >> 20);
     if (now + (32ull << 20) > held) return fail("released textures must be freed");
+    present_frames(g, 10);  // the rest of the drops
+    ID3D11Texture2D* on_next = nullptr;
+    hr = next->CreateTexture2D(&td, init, &on_next);
+    if (FAILED(hr)) return fail("texture on the second device", hr);
+    on_next->Release();
+    next->Release();
     std::printf("tiled: ok\n");
     return 0;
 }
