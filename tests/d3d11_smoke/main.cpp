@@ -89,6 +89,25 @@ int run(bool crash) {
     std::printf("d3d11.dll = %ls\n", mod);
     if (_wcsnicmp(mod, exe, wcslen(exe)) != 0) return fail("layer not loaded from the exe folder");
 
+    // M1 before any device (as Unreal sizes its texture pool): the adapter
+    // from the exe's own CreateDXGIFactory1 import must already be capped.
+    if (GetEnvironmentVariableW(L"TESSERA_SMOKE_CAP_MB", nullptr, 0)) {
+        wchar_t cap_s[16] = {};
+        GetEnvironmentVariableW(L"TESSERA_SMOKE_CAP_MB", cap_s, 16);
+        const unsigned long long cap = static_cast<unsigned long long>(_wtoi(cap_s)) << 20;
+        IDXGIFactory1* f = nullptr;
+        IDXGIAdapter1* a = nullptr;
+        DXGI_ADAPTER_DESC1 d = {};
+        HRESULT er = CreateDXGIFactory1(IID_PPV_ARGS(&f));
+        if (FAILED(er)) return fail("CreateDXGIFactory1", er);
+        er = f->EnumAdapters1(0, &a);
+        if (SUCCEEDED(er)) er = a->GetDesc1(&d);
+        if (a) a->Release();
+        f->Release();
+        std::printf("dedicated memory seen before the device: %zu MB\n", d.DedicatedVideoMemory >> 20);
+        if (FAILED(er) || d.DedicatedVideoMemory > cap) return fail("dedicated memory cap not applied before the device", er);
+    }
+
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,

@@ -20,8 +20,11 @@ struct Config {
     bool mip_force_evict = false;  // tests: evict every texture not bound in the current frame
 };
 
-// Reads tessera.ini once (from session init, never DllMain).
+// Reads tessera.ini once, whoever calls first (session init or the early
+// factory hook, never DllMain); later calls do nothing.
 void config_load();
+// Writes the settings to the log (after log_open).
+void config_log();
 // Valid after config_load; defaults before.
 const Config& config();
 }  // namespace tessera

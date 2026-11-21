@@ -253,6 +253,7 @@ BOOL CALLBACK init_once(PINIT_ONCE, void*, void**) {
     }
     g_started = true;
     config_load();
+    config_log();
     if (config().process) apply_process_tweaks();
 
     g_ring = static_cast<Slot*>(VirtualAlloc(nullptr, kRing * sizeof(Slot), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));

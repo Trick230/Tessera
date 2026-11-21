@@ -16,6 +16,9 @@ void memory_on_device(ID3D11Device* dev);
 uint64_t memory_reported_for(uint32_t vendor_id, uint64_t real);
 // A D3D11 device of ours exists (so the session is up); any thread.
 bool memory_device_seen();
+// From DllMain: points the exe's CreateDXGIFactory/1/2 imports at hooks that
+// put the adapter hooks in before the game creates its device.
+void memory_patch_imports();
 // From the writer thread, about once a second: pushes a VRAM record.
 void memory_background_tick();
 // Real local (dedicated) usage and budget at the last tick; false before one.

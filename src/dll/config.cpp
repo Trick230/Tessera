@@ -14,14 +14,14 @@ namespace {
 Config g_config;
 
 int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
-}  // namespace
+INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 
-void config_load() {
+BOOL CALLBACK load_once(PINIT_ONCE, void*, void**) {
     wchar_t ini[MAX_PATH];
     const DWORD n = GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), ini, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return;
+    if (n == 0 || n >= MAX_PATH) return TRUE;
     wchar_t* s = wcsrchr(ini, L'\\');
-    if (!s || static_cast<size_t>(s - ini) + 13 >= MAX_PATH) return;
+    if (!s || static_cast<size_t>(s - ini) + 13 >= MAX_PATH) return TRUE;
     wcscpy_s(s + 1, MAX_PATH - (s + 1 - ini), L"tessera.ini");
 
     auto get = [&](const wchar_t* key, int def) {
@@ -45,6 +45,15 @@ void config_load() {
     c.mip_ram_mb = clamp_int(get(L"mip_ram_mb", 0), 0, 1 << 20);
     c.mip_force_evict = get(L"mip_force_evict", 0) != 0;
     g_config = c;
+    return TRUE;
+}
+}  // namespace
+
+// Hooks read the settings concurrently: they are written once, never again.
+void config_load() { InitOnceExecuteOnce(&g_once, load_once, nullptr, nullptr); }
+
+void config_log() {
+    const Config& c = g_config;
     logf("config: process %d priority %d residency %d fps_limit %d ext_fps_limit %d max_frame_latency %d vram_budget_mb %d "
          "flip_model %d workset %d mip_residency %d mip_ram_mb %d mip_force_evict %d",
          c.process, c.priority, c.residency, c.fps_limit, c.ext_fps_limit, c.max_frame_latency, c.vram_budget_mb,
