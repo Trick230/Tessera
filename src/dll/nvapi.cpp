@@ -5,7 +5,7 @@
 // in its folder, also those loaded later) are patched when the layer
 // loads (chaining the previous pointer), and nvapi_QueryInterface is handed
 // back wrapped; every other name and id goes to the original untouched.
-//   M1: NvAPI_GPU_GetMemoryInfo reports at most the budget the game is given.
+//   M1: NvAPI_GPU_GetMemoryInfo(Ex) reports at most the budget the game is given.
 //   P6: NvAPI_D3D_SetSleepMode with low latency on = Reflex: the limiter backs off.
 #include "nvapi.h"
 
@@ -28,16 +28,19 @@ namespace {
 using NvStatus = int;
 using QueryInterface = void*(__cdecl*)(unsigned);
 using GetMemoryInfo = NvStatus(__cdecl*)(void*, uint32_t*);
+using GetMemoryInfoEx = NvStatus(__cdecl*)(void*, uint64_t*);
 using SetSleepMode = NvStatus(__cdecl*)(IUnknown*, const uint8_t*);
 using GetProc = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 
 // Ids from the public NVAPI interface table.
 constexpr unsigned kGetMemoryInfo = 0x07F9B368;
+constexpr unsigned kGetMemoryInfoEx = 0xC0599498;
 constexpr unsigned kSetSleepMode = 0xAC1CA9E0;
 
 GetProc g_get_proc = nullptr;  // written once in DllMain, before the patch
 std::atomic<QueryInterface> g_qi{nullptr};
 std::atomic<GetMemoryInfo> g_mem{nullptr};
+std::atomic<GetMemoryInfoEx> g_mem_ex{nullptr};
 std::atomic<SetSleepMode> g_sleep{nullptr};
 
 constexpr uint32_t nv_version(uint32_t size, uint32_t v) { return size | (v << 16); }
@@ -68,6 +71,25 @@ NvStatus __cdecl hk_get_memory_info(void* gpu, uint32_t* info) {
     return st;
 }
 
+// NV_GPU_MEMORY_INFO_EX V1 (bytes): version (padded to 8), dedicated,
+// available dedicated, system, shared, current available dedicated, then
+// eviction and promotion counters.
+NvStatus __cdecl hk_get_memory_info_ex(void* gpu, uint64_t* info) {
+    const NvStatus st = g_mem_ex.load(std::memory_order_relaxed)(gpu, info);
+    // As hk_get_memory_info: once our device exists, for the game's calls only.
+    if (st != 0 || !info || !memory_device_seen() || !is_game_code(_ReturnAddress())) return st;
+    if (static_cast<uint32_t>(info[0]) != nv_version(80, 1)) return st;
+    const uint64_t dedicated = info[1];
+    const uint64_t told = memory_reported_for(0x10DE, dedicated);
+    if (told >= dedicated) return st;
+    const uint64_t used = info[2] > info[5] ? info[2] - info[5] : 0;
+    const uint64_t free_bytes = told > used ? told - used : 0;
+    if (info[5] > free_bytes) info[5] = free_bytes;
+    info[1] = told;
+    if (info[2] > told) info[2] = told;
+    return st;
+}
+
 // NV_SET_SLEEP_MODE_PARAMS V1: version, bLowLatencyMode (byte at 4), ...
 NvStatus __cdecl hk_set_sleep_mode(IUnknown* dev, const uint8_t* p) {
     const NvStatus st = g_sleep.load(std::memory_order_relaxed)(dev, p);
@@ -86,6 +108,11 @@ void* __cdecl hk_query_interface(unsigned id) {
         GetMemoryInfo expected = nullptr;
         g_mem.compare_exchange_strong(expected, reinterpret_cast<GetMemoryInfo>(p));
         return reinterpret_cast<void*>(&hk_get_memory_info);
+    }
+    if (id == kGetMemoryInfoEx) {
+        GetMemoryInfoEx expected = nullptr;
+        g_mem_ex.compare_exchange_strong(expected, reinterpret_cast<GetMemoryInfoEx>(p));
+        return reinterpret_cast<void*>(&hk_get_memory_info_ex);
     }
     if (id == kSetSleepMode) {
         SetSleepMode expected = nullptr;

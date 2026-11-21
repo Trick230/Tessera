@@ -149,6 +149,20 @@ int run(bool crash) {
                 mem(gpus[0], info) == 0) {
                 std::printf("NVAPI dedicated memory seen by the app: %u MB\n", info[1] >> 10);
                 if ((static_cast<unsigned long long>(info[1]) << 10) > cap) return fail("NVAPI memory cap not applied");
+                // GetMemoryInfoEx (bytes): capped too; system and shared memory,
+                // never capped, match the older call (the layout is right).
+                using MemEx = int(__cdecl*)(void*, unsigned long long*);
+                const auto mem_ex = reinterpret_cast<MemEx>(qi(0xC0599498));
+                unsigned long long ex[10] = {80 | (1 << 16)};
+                if (mem_ex && mem_ex(gpus[0], ex) == 0) {
+                    std::printf("NVAPI Ex dedicated memory seen by the app: %llu MB (shared %llu MB)\n", ex[1] >> 20,
+                                ex[4] >> 20);
+                    if (ex[1] > cap || ex[2] > cap) return fail("NVAPI Ex memory cap not applied");
+                    if ((ex[3] >> 10) != info[3] || (ex[4] >> 10) != info[4])
+                        return fail("NVAPI Ex layout: system/shared memory differ from GetMemoryInfo");
+                } else {
+                    std::printf("NVAPI Ex memory query not available, skipped\n");
+                }
             } else {
                 std::printf("NVAPI memory query not available, skipped\n");
             }
