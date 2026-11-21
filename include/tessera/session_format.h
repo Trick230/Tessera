@@ -22,6 +22,8 @@
 // Bit in `flags` of TEXTURE2D records: a render target the game had released,
 // handed back instead of a new one (R1).
 #define TESSERA_FLAG_RECYCLED 0x10000000u
+// Bit in `flags` of TEXTURE2D / BUFFER records: created with initial data.
+#define TESSERA_FLAG_INIT_DATA 0x08000000u
 
 enum TesseraRecordKind {
     TESSERA_REC_FRAME = 1,      // a = CPU frame time in us (0 on the first frame),
@@ -48,6 +50,9 @@ enum TesseraRecordKind {
                                 // in system memory now, c = restores since the last record, d =
                                 // evictions since the last record, flags = late restores (total),
                                 // bytes = system memory holding top mips
+    TESSERA_REC_SLOW_CREATE = 11, // a game texture/buffer create that took >= 1 ms, right after its
+                                // record: a = call us, b = thread id, c = kind of that record,
+                                // d = 1 if the thread also presents; format and bytes as there
     TESSERA_REC_END = 0xFFFF,   // a = records dropped (ring overrun), bytes = records written
 };
 

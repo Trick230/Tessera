@@ -52,6 +52,30 @@ uint64_t now_qpc() {
     return static_cast<uint64_t>(t.QuadPart);
 }
 
+std::atomic<DWORD> g_present_tid{0};  // last thread that presented
+
+// After the record r of a game create that began at t0: a SLOW_CREATE record
+// when the call took >= 1 ms (where the driver stalls, and on which thread).
+void push_slow_create(const TesseraRecord& r, uint64_t t0) {
+    static const uint64_t freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<uint64_t>(f.QuadPart);
+    }();
+    const uint64_t us = (r.qpc - t0) * 1000000 / freq;
+    if (us < 1000) return;
+    TesseraRecord s = {};
+    s.qpc = r.qpc;
+    s.kind = TESSERA_REC_SLOW_CREATE;
+    s.format = r.format;
+    s.a = static_cast<uint32_t>(us);
+    s.b = GetCurrentThreadId();
+    s.c = r.kind;
+    s.d = s.b == g_present_tid.load(std::memory_order_relaxed);
+    s.bytes = r.bytes;
+    session_push(s);
+}
+
 HRESULT STDMETHODCALLTYPE hk_CreateBuffer(ID3D11Device*, const D3D11_BUFFER_DESC*, const D3D11_SUBRESOURCE_DATA*,
                                           ID3D11Buffer**);
 HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device*, const D3D11_TEXTURE2D_DESC*,
@@ -115,6 +139,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateBuffer(ID3D11Device* self, const D3D11_BUFFER
                                           const D3D11_SUBRESOURCE_DATA* init, ID3D11Buffer** out) {
     void* const ret = _ReturnAddress();
     Depth depth;
+    const uint64_t t0 = now_qpc();
     using F = decltype(&hk_CreateBuffer);
     const HRESULT hr = orig<F>(g_create_buffer, self)(self, d, init, out);
     if (SUCCEEDED(hr) && d && (d->MiscFlags & D3D11_RESOURCE_MISC_TILED) && depth.outer()) residency_after_present();
@@ -132,7 +157,9 @@ HRESULT STDMETHODCALLTYPE hk_CreateBuffer(ID3D11Device* self, const D3D11_BUFFER
         r.a = d->ByteWidth;
         r.d = static_cast<uint32_t>(d->Usage) | (d->MiscFlags << 8);
         r.bytes = d->ByteWidth;
+        if (init) r.flags |= TESSERA_FLAG_INIT_DATA;
         session_push(r);
+        if (!(r.flags & TESSERA_FLAG_FOREIGN)) push_slow_create(r, t0);
     }
     return hr;
 }
@@ -146,6 +173,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
     const bool outer = depth.outer();
     const bool game = outer && is_game_code(ret);
     const uint64_t bytes = d ? texture2d_bytes(*d) : 0;
+    const uint64_t t0 = now_qpc();
     // M3: large immutable textures become tiled, their top mip movable.
     // R1: a released render target with this description comes back.
     const bool reused = game && d && out && !init && rtpool_take(self, *d, bytes, out);
@@ -177,7 +205,9 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
         r.b = d->Height;
         r.c = d->MipLevels | (d->ArraySize << 8);
         r.d = static_cast<uint32_t>(d->Usage) | (d->MiscFlags << 8);
+        if (init) r.flags |= TESSERA_FLAG_INIT_DATA;
         session_push(r);
+        if (game) push_slow_create(r, t0);
     }
     return hr;
 }
@@ -344,6 +374,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     bool managed = false;
     if (depth.outer()) {
         if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
+            g_present_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
             managed = residency_present(self);
             session_frame(pace_before_present(self));
             rtpool_frame(self);
@@ -365,6 +396,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
     bool managed = false;
     if (depth.outer()) {
         if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
+            g_present_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
             managed = residency_present(self);
             session_frame(pace_before_present(self));
             rtpool_frame(self);
