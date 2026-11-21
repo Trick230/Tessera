@@ -68,6 +68,13 @@ try {
     Check "warm copy has the game's exe name" (@(Get-ChildItem "$data\warm\*\d3d11_smoke.exe").Count -eq 1)
 } finally { Remove-Item $ini; Remove-Item Env:TESSERA_SMOKE_CAP_MB }
 
+# R1: a released big render target comes back on the next matching create; held ones and initial data never.
+Set-Content -Path $ini -Value "[tessera]`nrt_recycle=1" -Encoding ascii
+try {
+    & $exe --recycle | Write-Host
+    Check "released render target reused, held ones and initial data left alone (R1)" ($LASTEXITCODE -eq 0)
+} finally { Remove-Item $ini }
+
 # M3-M5: managed textures lose their top mip while unbound and get it back before any read.
 Set-Content -Path $ini -Value "[tessera]`nmip_residency=1`nmip_force_evict=1" -Encoding ascii
 try {

@@ -937,9 +937,63 @@ int imports_mode() {
     return 0;
 }
 
+// --recycle (rt_recycle=1): a released big render target comes back on the
+// next create with the same description; one still held, or a create with
+// initial data, gets a new texture. 0 ok, 3 nothing reused (layer off).
+int recycle_mode() {
+    ID3D11Device* dev = nullptr;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev,
+                                   nullptr, nullptr);
+    if (FAILED(hr)) return fail("D3D11CreateDevice", hr);
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = td.Height = 4096;  // 64 MB
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    static const GUID kTag = {0x5e1a7c3b, 0x2d4f, 0x4c9a, {0x8b, 0x61, 0x0f, 0x3e, 0x9d, 0x27, 0xa4, 0x15}};
+    auto tagged = [](ID3D11Texture2D* t) {
+        UINT v = 0, size = sizeof v;
+        return SUCCEEDED(t->GetPrivateData(kTag, &size, &v)) && v == 1;
+    };
+    ID3D11Texture2D *a = nullptr, *b = nullptr, *c = nullptr;
+    if (FAILED(hr = dev->CreateTexture2D(&td, nullptr, &a))) return fail("CreateTexture2D a", hr);
+    const UINT one = 1;
+    a->SetPrivateData(kTag, sizeof one, &one);
+    ID3D11RenderTargetView* v = nullptr;
+    dev->CreateRenderTargetView(a, nullptr, &v);
+    // Held by the game: never handed out.
+    if (FAILED(hr = dev->CreateTexture2D(&td, nullptr, &b))) return fail("CreateTexture2D b", hr);
+    if (tagged(b)) return fail("a texture still held was handed out");
+    b->Release();
+    a->Release();  // the view still holds it
+    if (FAILED(hr = dev->CreateTexture2D(&td, nullptr, &b))) return fail("CreateTexture2D b2", hr);
+    if (tagged(b)) return fail("a texture with a live view was handed out");
+    b->Release();
+    v->Release();  // now released for good
+    const bool reused = SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &c)) && tagged(c);
+    std::printf("released render target reused: %d\n", reused);
+    if (!reused) {
+        if (c) c->Release();
+        dev->Release();
+        return 3;
+    }
+    c->Release();
+    // Initial data: always a new texture.
+    std::vector<uint32_t> px(4096 * 4096);
+    const D3D11_SUBRESOURCE_DATA init = {px.data(), 4096 * 4, 0};
+    if (FAILED(hr = dev->CreateTexture2D(&td, &init, &c))) return fail("CreateTexture2D init", hr);
+    if (tagged(c)) return fail("a create with initial data got a recycled texture");
+    c->Release();
+    dev->Release();
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0) return bench();
     if (argc >= 2 && wcscmp(argv[1], L"--imports") == 0) return imports_mode();
+    if (argc >= 2 && wcscmp(argv[1], L"--recycle") == 0) return recycle_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--tiled") == 0) return tiled();
     if (argc >= 2 && wcscmp(argv[1], L"--nvapi") == 0) return nvapi_mode();
     if (argc >= 3 && wcscmp(argv[1], L"--verify") == 0) return verify(argv[2], argc >= 4 ? _wtoi(argv[3]) : 0);

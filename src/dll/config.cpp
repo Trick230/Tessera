@@ -44,6 +44,7 @@ BOOL CALLBACK load_once(PINIT_ONCE, void*, void**) {
     c.mip_residency = get(L"mip_residency", 0) != 0;
     c.mip_ram_mb = clamp_int(get(L"mip_ram_mb", 0), 0, 1 << 20);
     c.mip_force_evict = get(L"mip_force_evict", 0) != 0;
+    c.rt_recycle = get(L"rt_recycle", 0) != 0;
     g_config = c;
     return TRUE;
 }
@@ -55,9 +56,9 @@ void config_load() { InitOnceExecuteOnce(&g_once, load_once, nullptr, nullptr); 
 void config_log() {
     const Config& c = g_config;
     logf("config: process %d priority %d residency %d fps_limit %d ext_fps_limit %d max_frame_latency %d vram_budget_mb %d "
-         "flip_model %d workset %d mip_residency %d mip_ram_mb %d mip_force_evict %d",
+         "flip_model %d workset %d mip_residency %d mip_ram_mb %d mip_force_evict %d rt_recycle %d",
          c.process, c.priority, c.residency, c.fps_limit, c.ext_fps_limit, c.max_frame_latency, c.vram_budget_mb,
-         c.flip_model, c.workset, c.mip_residency, c.mip_ram_mb, c.mip_force_evict);
+         c.flip_model, c.workset, c.mip_residency, c.mip_ram_mb, c.mip_force_evict, c.rt_recycle);
 }
 
 const Config& config() { return g_config; }

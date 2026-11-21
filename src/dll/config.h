@@ -18,6 +18,7 @@ struct Config {
     int mip_ram_mb = 0;         // M10: system memory for those mips, 0 = min(4 GB, RAM / 16);
                                 // lower while less than RAM / 8 (at least 1 GB) is free
     bool mip_force_evict = false;  // tests: evict every texture not bound in the current frame
+    bool rt_recycle = false;    // R1: released big render targets handed back on the next matching create
 };
 
 // Reads tessera.ini once, whoever calls first (session init or the early

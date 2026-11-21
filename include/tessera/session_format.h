@@ -19,6 +19,9 @@
 // Bit in `flags` of TEXTURE2D records: created as a tiled texture whose top
 // mip Tessera may move to system memory while it is cold (M3/M4).
 #define TESSERA_FLAG_TILED 0x20000000u
+// Bit in `flags` of TEXTURE2D records: a render target the game had released,
+// handed back instead of a new one (R1).
+#define TESSERA_FLAG_RECYCLED 0x10000000u
 
 enum TesseraRecordKind {
     TESSERA_REC_FRAME = 1,      // a = CPU frame time in us (0 on the first frame),

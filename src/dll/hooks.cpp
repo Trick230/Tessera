@@ -14,6 +14,7 @@
 #include "shaders.h"
 #include "pacing.h"
 #include "residency.h"
+#include "rtpool.h"
 #include "session.h"
 #include "vtable.h"
 #include "workset.h"
@@ -146,8 +147,11 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
     const bool game = outer && is_game_code(ret);
     const uint64_t bytes = d ? texture2d_bytes(*d) : 0;
     // M3: large immutable textures become tiled, their top mip movable.
-    const bool tiled = game && d && out && residency_create(self, create, *d, init, out, bytes);
-    const HRESULT hr = tiled ? S_OK : create(self, d, init, out);
+    // R1: a released render target with this description comes back.
+    const bool reused = game && d && out && !init && rtpool_take(self, *d, bytes, out);
+    const bool tiled = !reused && game && d && out && residency_create(self, create, *d, init, out, bytes);
+    const HRESULT hr = reused || tiled ? S_OK : create(self, d, init, out);
+    if (SUCCEEDED(hr) && !reused && game && !init && d && out && *out) rtpool_track(self, *out, *d, bytes);
     if (SUCCEEDED(hr) && !tiled && d && (d->MiscFlags & D3D11_RESOURCE_MISC_TILED)) residency_after_present();
     if (SUCCEEDED(hr) && out && *out && d && outer) {
         TesseraRecord r = {};
@@ -161,6 +165,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
         else
             r.flags |= raise_priority(*out, d->Usage, d->MiscFlags, (d->BindFlags & kTargetBinds) != 0);
         if (tiled) r.flags |= TESSERA_FLAG_TILED;
+        if (reused) r.flags |= TESSERA_FLAG_RECYCLED;
         r.bytes = bytes;
         // M11 tracks what M4 could manage: game textures that are only sampled
         // (managed ones were registered by residency_create).
@@ -179,6 +184,8 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
 
 // Each deferred context has a vtable of its own: hooked before the game gets it.
 void on_deferred(ID3D11DeviceContext* ctx) {
+    // R1: command lists hold the textures they use, unseen.
+    rtpool_stop("the process records command lists");
     vt_track(ctx);
     workset_on_context(ctx);
     residency_on_context(ctx);
@@ -215,6 +222,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateSRV(ID3D11Device* self, ID3D11Resource* res,
     Depth depth;
     using F = decltype(&hk_CreateSRV);
     const HRESULT hr = orig<F>(g_create_srv, self)(self, res, d, out);
+    if (SUCCEEDED(hr) && out && *out && res) rtpool_on_view(res, *out);
     if (SUCCEEDED(hr) && out && *out && depth.outer()) {
         TesseraRecord r = {};
         r.qpc = now_qpc();
@@ -338,6 +346,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
         if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
             managed = residency_present(self);
             session_frame(pace_before_present(self));
+            rtpool_frame();
         }
         flags = flip_before_present(self, sync, flags, ff);
         if (ff.skip) return S_OK;
@@ -358,6 +367,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
         if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
             managed = residency_present(self);
             session_frame(pace_before_present(self));
+            rtpool_frame();
         }
         flags = flip_before_present(self, sync, flags, ff);
         if (ff.skip) return S_OK;
@@ -496,6 +506,7 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
     logf("device fl 0x%x flags 0x%x tiled tier %u, device hooks %s", r.a, create_flags, r.b, ok ? "ok" : "FAILED");
     memory_on_device(dev);
     workset_on_device(dev);
+    rtpool_on_device(dev, ok);
     residency_on_device(dev);
     // After the modules: a context made from here on gets their hooks.
     bool def_ok = vt_hook(g_create_def, dev);
@@ -516,6 +527,7 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
     }
     if (!def_ok) {
         logf("deferred context hooks FAILED");
+        rtpool_stop("deferred context hooks FAILED");
         residency_on_context(nullptr);
     }
     shaders_on_device(dev);
