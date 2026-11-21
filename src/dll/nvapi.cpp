@@ -4,7 +4,9 @@
 // D3D device. The GetProcAddress imports of the game (its exe and the DLLs
 // in its folder, also those loaded later) are patched when the layer
 // loads (chaining the previous pointer), and nvapi_QueryInterface is handed
-// back wrapped; every other name and id goes to the original untouched.
+// back wrapped; every other name and id goes to the original untouched,
+// except the few memory.cpp wants (memory_import_hook), patched the same way
+// in import tables and in GetProcAddress results.
 //   M1: NvAPI_GPU_GetMemoryInfo(Ex) reports at most the budget the game is given.
 //   P6: NvAPI_D3D_SetSleepMode with low latency on = Reflex: the limiter backs off.
 #include "nvapi.h"
@@ -49,9 +51,9 @@ constexpr uint32_t nv_version(uint32_t size, uint32_t v) { return size | (v << 1
 // dedicated, system, shared, [V2+] current available dedicated, ...
 NvStatus __cdecl hk_get_memory_info(void* gpu, uint32_t* info) {
     const NvStatus st = g_mem.load(std::memory_order_relaxed)(gpu, info);
-    // Only once our device exists (the session is up) and only for the
-    // game's own calls: SDKs and overlays keep the real numbers.
-    if (st != 0 || !info || !memory_device_seen() || !is_game_code(_ReturnAddress())) return st;
+    // Only for the game's own calls (also before its device, as the DXGI
+    // descriptions): SDKs and overlays keep the real numbers.
+    if (st != 0 || !info || !is_game_code(_ReturnAddress())) return st;
     const uint32_t v = info[0];
     const bool v1 = v == nv_version(20, 1), v2 = v == nv_version(24, 2), v3 = v == nv_version(32, 3);
     if (!v1 && !v2 && !v3) return st;
@@ -76,8 +78,8 @@ NvStatus __cdecl hk_get_memory_info(void* gpu, uint32_t* info) {
 // eviction and promotion counters.
 NvStatus __cdecl hk_get_memory_info_ex(void* gpu, uint64_t* info) {
     const NvStatus st = g_mem_ex.load(std::memory_order_relaxed)(gpu, info);
-    // As hk_get_memory_info: once our device exists, for the game's calls only.
-    if (st != 0 || !info || !memory_device_seen() || !is_game_code(_ReturnAddress())) return st;
+    // As hk_get_memory_info: for the game's calls only.
+    if (st != 0 || !info || !is_game_code(_ReturnAddress())) return st;
     if (static_cast<uint32_t>(info[0]) != nv_version(80, 1)) return st;
     const uint64_t dedicated = info[1];
     const uint64_t told = memory_reported_for(0x10DE, dedicated);
@@ -125,9 +127,12 @@ void* __cdecl hk_query_interface(unsigned id) {
 FARPROC WINAPI hk_get_proc_address(HMODULE m, LPCSTR name) {
     const FARPROC p = g_get_proc(m, name);
     // HIWORD 0: lookup by ordinal, no name to read.
-    if (!p || !(reinterpret_cast<uintptr_t>(name) >> 16) || name[0] != 'n' ||
-        std::strcmp(name, "nvapi_QueryInterface") != 0)
+    if (!p || !(reinterpret_cast<uintptr_t>(name) >> 16)) return p;
+    if (name[0] != 'n' || std::strcmp(name, "nvapi_QueryInterface") != 0) {
+        // M1 (also delay-load imports, whose helper resolves through here).
+        if (void* h = memory_import_hook(name, reinterpret_cast<void*>(p))) return reinterpret_cast<FARPROC>(h);
         return p;
+    }
     QueryInterface expected = nullptr;
     g_qi.compare_exchange_strong(expected, reinterpret_cast<QueryInterface>(p));
     // A second nvapi64.dll (unlikely) would not match what we chain to.
@@ -148,20 +153,20 @@ bool in_game_dir(const wchar_t* path, size_t len) {
     return g_game_dir_len && len > g_game_dir_len && _wcsnicmp(path, g_game_dir, g_game_dir_len) == 0;
 }
 
-void write_slot(void* volatile* slot) {
+void write_slot(void* volatile* slot, void* value) {
     // As in vtable.cpp: write in place when writable, and never drop
     // execute rights from a page that shares code (merged sections).
     MEMORY_BASIC_INFORMATION mi;
     if (!VirtualQuery(const_cast<void**>(slot), &mi, sizeof mi)) return;
     const DWORD writable = PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
     if (mi.Protect & writable) {
-        InterlockedExchangePointer(slot, reinterpret_cast<void*>(&hk_get_proc_address));
+        InterlockedExchangePointer(slot, value);
         return;
     }
     const DWORD rw = (mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ)) ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
     DWORD old;
     if (!VirtualProtect(const_cast<void**>(slot), sizeof(void*), rw, &old)) return;
-    InterlockedExchangePointer(slot, reinterpret_cast<void*>(&hk_get_proc_address));
+    InterlockedExchangePointer(slot, value);
     VirtualProtect(const_cast<void**>(slot), sizeof(void*), old, &old);
 }
 
@@ -189,10 +194,17 @@ bool patch_module(uint8_t* base) {
         for (; names->u1.AddressOfData; ++names, ++iat) {
             if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
             auto* by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
-            if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), "GetProcAddress") != 0) continue;
+            const char* const name = reinterpret_cast<const char*>(by_name->Name);
+            const bool gpa = std::strcmp(name, "GetProcAddress") == 0;
+            if (!gpa && !memory_import_wanted(name)) continue;
             void* const current = reinterpret_cast<void*>(iat->u1.Function);
             if (iat->u1.Function == names->u1.AddressOfData || (prebound && !in_image(current))) {
                 bound = false;  // still the name entry
+                continue;
+            }
+            if (!gpa) {  // M1: DXGI factories, other APIs
+                if (void* h = memory_import_hook(name, current))
+                    write_slot(reinterpret_cast<void* volatile*>(&iat->u1.Function), h);
                 continue;
             }
             if (current == reinterpret_cast<void*>(&hk_get_proc_address)) continue;
@@ -202,7 +214,8 @@ bool patch_module(uint8_t* base) {
             if (!g_get_proc) g_get_proc = reinterpret_cast<GetProc>(current);
             void* const chained = reinterpret_cast<void*>(g_get_proc);
             if (current != chained && !(is_system(current) && is_system(chained))) continue;
-            write_slot(reinterpret_cast<void* volatile*>(&iat->u1.Function));
+            write_slot(reinterpret_cast<void* volatile*>(&iat->u1.Function),
+                       reinterpret_cast<void*>(&hk_get_proc_address));
         }
     }
     return bound;

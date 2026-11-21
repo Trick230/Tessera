@@ -6,6 +6,7 @@
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
 #include <d3d11_2.h>
+#include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <windows.h>
@@ -81,6 +82,75 @@ void render(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGISwapChain* sc, int
     bb->Release();
 }
 
+HMODULE module_of(void* p) {
+    HMODULE m = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(p), &m);
+    return m;
+}
+
+// What a module's import slot for `name` holds now (&func gives a thunk).
+void* import_slot(HMODULE m, const char* name) {
+    auto* base = reinterpret_cast<uint8_t*>(m);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    for (auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp) {
+        if (!imp->OriginalFirstThunk) continue;
+        auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->OriginalFirstThunk);
+        auto* iat = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++iat)
+            if (!IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal) &&
+                std::strcmp(reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData)->Name, name) == 0)
+                return reinterpret_cast<void*>(iat->u1.Function);
+    }
+    return nullptr;
+}
+
+// NVAPI (NVIDIA only): resolved through our import, the memory it reports
+// must be capped as well. 0 ok or no NVAPI; else the failure's exit code.
+int nvapi_capped(unsigned long long cap, const char* when) {
+    HMODULE nv = LoadLibraryW(L"nvapi64.dll");
+    if (!nv) return 0;
+    using Qi = void*(__cdecl*)(unsigned);
+    const auto qi = reinterpret_cast<Qi>(GetProcAddress(nv, "nvapi_QueryInterface"));
+    HMODULE owner = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(qi), &owner);
+    if (!qi || owner == nv) return fail("nvapi_QueryInterface not wrapped");
+    using Init = int(__cdecl*)();
+    using Enum = int(__cdecl*)(void**, unsigned*);
+    using Mem = int(__cdecl*)(void*, unsigned*);
+    const auto init = reinterpret_cast<Init>(qi(0x0150E828));
+    const auto enum_gpus = reinterpret_cast<Enum>(qi(0xE5AC921F));
+    const auto mem = reinterpret_cast<Mem>(qi(0x07F9B368));
+    void* gpus[64] = {};
+    unsigned n = 0;
+    unsigned info[8] = {32 | (3 << 16)};
+    if (init && enum_gpus && mem && init() == 0 && enum_gpus(gpus, &n) == 0 && n > 0 &&
+        mem(gpus[0], info) == 0) {
+        std::printf("NVAPI dedicated memory seen %s: %u MB\n", when, info[1] >> 10);
+        if ((static_cast<unsigned long long>(info[1]) << 10) > cap) return fail("NVAPI memory cap not applied");
+        // GetMemoryInfoEx (bytes): capped too; system and shared memory,
+        // never capped, match the older call (the layout is right).
+        using MemEx = int(__cdecl*)(void*, unsigned long long*);
+        const auto mem_ex = reinterpret_cast<MemEx>(qi(0xC0599498));
+        unsigned long long ex[10] = {80 | (1 << 16)};
+        if (mem_ex && mem_ex(gpus[0], ex) == 0) {
+            std::printf("NVAPI Ex dedicated memory seen %s: %llu MB (shared %llu MB)\n", when, ex[1] >> 20,
+                        ex[4] >> 20);
+            if (ex[1] > cap || ex[2] > cap) return fail("NVAPI Ex memory cap not applied");
+            if ((ex[3] >> 10) != info[3] || (ex[4] >> 10) != info[4])
+                return fail("NVAPI Ex layout: system/shared memory differ from GetMemoryInfo");
+        } else {
+            std::printf("NVAPI Ex memory query not available, skipped\n");
+        }
+    } else {
+        std::printf("NVAPI memory query not available, skipped\n");
+    }
+    FreeLibrary(nv);
+    return 0;
+}
+
 int run(bool crash) {
     wchar_t mod[MAX_PATH] = {}, exe[MAX_PATH] = {};
     GetModuleFileNameW(GetModuleHandleW(L"d3d11.dll"), mod, MAX_PATH);
@@ -106,6 +176,11 @@ int run(bool crash) {
         f->Release();
         std::printf("dedicated memory seen before the device: %zu MB\n", d.DedicatedVideoMemory >> 20);
         if (FAILED(er) || d.DedicatedVideoMemory > cap) return fail("dedicated memory cap not applied before the device", er);
+        // Decisive on any GPU (a small one is below the cap anyway): the
+        // factory the exe calls is the layer's.
+        if (module_of(import_slot(GetModuleHandleW(nullptr), "CreateDXGIFactory1")) != GetModuleHandleW(L"d3d11.dll"))
+            return fail("the exe's CreateDXGIFactory1 import is not the layer's");
+        if (const int r = nvapi_capped(cap, "before the device")) return r;
     }
 
     ID3D11Device* dev = nullptr;
@@ -147,46 +222,7 @@ int run(bool crash) {
                     dd1.DedicatedVideoMemory >> 20, dd2.DedicatedVideoMemory >> 20);
         if (!got || d0.DedicatedVideoMemory > cap || dd1.DedicatedVideoMemory > cap || dd2.DedicatedVideoMemory > cap)
             return fail("dedicated memory cap not applied");
-        // NVAPI (NVIDIA only): resolved through our import, the memory it reports is capped as well.
-        if (HMODULE nv = LoadLibraryW(L"nvapi64.dll")) {
-            using Qi = void*(__cdecl*)(unsigned);
-            const auto qi = reinterpret_cast<Qi>(GetProcAddress(nv, "nvapi_QueryInterface"));
-            HMODULE owner = nullptr;
-            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               reinterpret_cast<LPCWSTR>(qi), &owner);
-            if (!qi || owner == nv) return fail("nvapi_QueryInterface not wrapped");
-            using Init = int(__cdecl*)();
-            using Enum = int(__cdecl*)(void**, unsigned*);
-            using Mem = int(__cdecl*)(void*, unsigned*);
-            const auto init = reinterpret_cast<Init>(qi(0x0150E828));
-            const auto enum_gpus = reinterpret_cast<Enum>(qi(0xE5AC921F));
-            const auto mem = reinterpret_cast<Mem>(qi(0x07F9B368));
-            void* gpus[64] = {};
-            unsigned n = 0;
-            unsigned info[8] = {32 | (3 << 16)};
-            if (init && enum_gpus && mem && init() == 0 && enum_gpus(gpus, &n) == 0 && n > 0 &&
-                mem(gpus[0], info) == 0) {
-                std::printf("NVAPI dedicated memory seen by the app: %u MB\n", info[1] >> 10);
-                if ((static_cast<unsigned long long>(info[1]) << 10) > cap) return fail("NVAPI memory cap not applied");
-                // GetMemoryInfoEx (bytes): capped too; system and shared memory,
-                // never capped, match the older call (the layout is right).
-                using MemEx = int(__cdecl*)(void*, unsigned long long*);
-                const auto mem_ex = reinterpret_cast<MemEx>(qi(0xC0599498));
-                unsigned long long ex[10] = {80 | (1 << 16)};
-                if (mem_ex && mem_ex(gpus[0], ex) == 0) {
-                    std::printf("NVAPI Ex dedicated memory seen by the app: %llu MB (shared %llu MB)\n", ex[1] >> 20,
-                                ex[4] >> 20);
-                    if (ex[1] > cap || ex[2] > cap) return fail("NVAPI Ex memory cap not applied");
-                    if ((ex[3] >> 10) != info[3] || (ex[4] >> 10) != info[4])
-                        return fail("NVAPI Ex layout: system/shared memory differ from GetMemoryInfo");
-                } else {
-                    std::printf("NVAPI Ex memory query not available, skipped\n");
-                }
-            } else {
-                std::printf("NVAPI memory query not available, skipped\n");
-            }
-            FreeLibrary(nv);
-        }
+        if (const int r = nvapi_capped(cap, "by the app")) return r;
     }
 
     DXGI_SWAP_CHAIN_DESC1 d1 = {};
@@ -834,8 +870,76 @@ int nvapi_mode() {
     return e && d ? 0 : !e && !d ? 3 : 1;
 }
 
+// --imports: CreateDXGIFactory1 as the exe and a game DLL get it, through
+// their import tables and GetProcAddress, must be the layer's: 0 all, 3 none
+// (safe mode), 1 mixed. With TESSERA_SMOKE_CAP_MB: capped before any device,
+// and left alone once the game creates a D3D12 device instead (2 if not).
+int imports_mode() {
+    HMODULE probe = LoadLibraryW(L"nvapi_probe.dll");
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    if (!probe || !dxgi) return fail("nvapi_probe.dll / dxgi.dll");
+    // The loader announces a DLL before binding its imports: the layer patches
+    // them on the next load (as games load many) or the session's writer tick.
+    // A DLL of ours, so it is surely a new load.
+    if (!LoadLibraryW(L"load_probe.dll")) return fail("load_probe.dll");
+    using Probe = void*(*)();
+    // probe_factory_import only makes the DLL import CreateDXGIFactory1; its slot is read directly.
+    const auto by_name = reinterpret_cast<Probe>(GetProcAddress(probe, "probe_factory"));
+    if (!by_name) return fail("probe exports");
+    void* const p[4] = {import_slot(GetModuleHandleW(nullptr), "CreateDXGIFactory1"),
+                        reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")),
+                        import_slot(probe, "CreateDXGIFactory1"), by_name()};
+    int wrapped = 0;
+    for (void* q : p) wrapped += q && module_of(q) != dxgi;
+    std::printf("CreateDXGIFactory1 wrapped: exe import %d, exe GetProcAddress %d, DLL import %d, DLL GetProcAddress %d\n",
+                p[0] && module_of(p[0]) != dxgi, p[1] && module_of(p[1]) != dxgi, p[2] && module_of(p[2]) != dxgi,
+                p[3] && module_of(p[3]) != dxgi);
+    if (wrapped == 0) return 3;
+    if (wrapped != 4) return 1;
+    if (!GetEnvironmentVariableW(L"TESSERA_SMOKE_CAP_MB", nullptr, 0)) return 0;
+    wchar_t cap_s[16] = {};
+    GetEnvironmentVariableW(L"TESSERA_SMOKE_CAP_MB", cap_s, 16);
+    const unsigned long long cap = static_cast<unsigned long long>(_wtoi(cap_s)) << 20;
+    auto dedicated = []() -> unsigned long long {
+        IDXGIFactory1* f = nullptr;
+        IDXGIAdapter1* a = nullptr;
+        DXGI_ADAPTER_DESC1 d = {};
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) return 0;
+        if (SUCCEEDED(f->EnumAdapters1(0, &a))) {
+            a->GetDesc1(&d);
+            a->Release();
+        }
+        f->Release();
+        return d.DedicatedVideoMemory;
+    };
+    const unsigned long long before = dedicated();
+    std::printf("dedicated memory before any device: %llu MB\n", before >> 20);
+    if (!before || before > cap) return fail("dedicated memory cap not applied before the device");
+    HMODULE d12 = LoadLibraryW(L"d3d12.dll");
+    using Create12 = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    const auto create12 = d12 ? reinterpret_cast<Create12>(GetProcAddress(d12, "D3D12CreateDevice")) : nullptr;
+    ID3D12Device* dev12 = nullptr;
+    if (!create12 || FAILED(create12(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev12)))) {
+        std::printf("no D3D12 device, skipped\n");
+        return 0;
+    }
+    const unsigned long long after = dedicated();
+    dev12->Release();
+    std::printf("dedicated memory after a D3D12 device: %llu MB\n", after >> 20);
+    if (before < cap) {
+        std::printf("adapter below the cap: not decisive\n");
+        return 0;
+    }
+    if (after <= cap) {
+        std::printf("FAIL: still capped after the game created a D3D12 device\n");
+        return 2;
+    }
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0) return bench();
+    if (argc >= 2 && wcscmp(argv[1], L"--imports") == 0) return imports_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--tiled") == 0) return tiled();
     if (argc >= 2 && wcscmp(argv[1], L"--nvapi") == 0) return nvapi_mode();
     if (argc >= 3 && wcscmp(argv[1], L"--verify") == 0) return verify(argv[2], argc >= 4 ? _wtoi(argv[3]) : 0);

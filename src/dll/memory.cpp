@@ -36,8 +36,14 @@ using Qvmi = decltype(&hk_QueryVideoMemoryInfo);
 // none yet). The honest mode always reports the budget minus this.
 std::atomic<uint64_t> g_own{0};
 
+// The game created a D3D12 device or a Vulkan instance before any D3D11
+// device: it renders with another API, M1 leaves its memory figures alone.
+std::atomic<bool> g_other_api{false};
+std::atomic<const char*> g_other_what{nullptr};  // for the log, opened later
+
 // What the game is told it may use, from the real budget.
 uint64_t reported(uint64_t real) {
+    if (g_other_api.load(std::memory_order_relaxed)) return real;
     const uint64_t own = g_own.load(std::memory_order_relaxed);
     uint64_t v = real > own ? real - own : 0;
     const uint64_t cap = static_cast<uint64_t>(config().vram_budget_mb) << 20;
@@ -119,18 +125,25 @@ bool hook_adapter(IDXGIAdapter* a) {
     return ok;
 }
 
-// The exe's CreateDXGIFactory imports: engines (Unreal's D3D11 RHI) read the
-// adapter's dedicated memory to size their texture pool before creating the
-// device, so the adapters are hooked as soon as the game gets a factory.
+// CreateDXGIFactory/1/2 as the game gets them (its imports, those of the
+// DLLs in its folder, GetProcAddress, which delay-load imports go through
+// too): engines (Unreal's D3D11 RHI) read the adapter's dedicated memory to
+// size their texture pool before creating the device, so the adapters are
+// hooked as soon as the game gets a factory. D3D12CreateDevice and
+// vkCreateInstance only tell that the game renders with another API.
 using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
 using CreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
-CreateFactory g_cf = nullptr, g_cf1 = nullptr;  // written once in DllMain, before the patch
-CreateFactory2 g_cf2 = nullptr;
+using CreateD3D12 = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+using CreateVkInstance = int32_t(WINAPI*)(const void*, const void*, void**);
+// The first pointer seen for each name, chained to; another one is not ours.
+std::atomic<void*> g_cf{nullptr}, g_cf1{nullptr}, g_cf2{nullptr}, g_d3d12{nullptr}, g_vk{nullptr};
 std::atomic<bool> g_early_done{false};
 std::atomic<int> g_early_ok{-1};  // -1 not tried, 0 failed, 1 on; logged with the device
 
 void on_factory(IUnknown* f) {
-    if (g_early_done.load(std::memory_order_acquire) || g_adapter.load(std::memory_order_acquire)) return;
+    if (g_early_done.load(std::memory_order_acquire) || g_adapter.load(std::memory_order_acquire) ||
+        g_other_api.load(std::memory_order_relaxed))
+        return;
     // Settings only, no session: a process that never creates a D3D11 device
     // (a D3D12 or Vulkan game linking both, a launcher) must not count as an
     // unclean exit for safe mode. Safe mode was checked before the patch.
@@ -147,83 +160,85 @@ void on_factory(IUnknown* f) {
     if (!g_early_done.exchange(true, std::memory_order_acq_rel)) g_early_ok.store(ok ? 1 : 0, std::memory_order_release);
 }
 
+// The game's own device or instance (not a probe without one, not an
+// overlay's) before any D3D11 device: M1 stays out of this process.
+void on_other_api(bool made, void* ret, const char* what) {
+    if (!made || memory_device_seen() || !is_game_code(ret)) return;
+    g_other_what.store(what, std::memory_order_relaxed);
+    if (!g_other_api.exchange(true, std::memory_order_release)) logf("memory: the game uses %s, VRAM figures left alone", what);
+}
+
+template <class F>
+F orig(const std::atomic<void*>& p) {
+    return reinterpret_cast<F>(p.load(std::memory_order_relaxed));
+}
+
 HRESULT WINAPI hk_CreateDXGIFactory(REFIID riid, void** out) {
-    const HRESULT hr = g_cf(riid, out);
+    const HRESULT hr = orig<CreateFactory>(g_cf)(riid, out);
     if (SUCCEEDED(hr) && out && *out) on_factory(static_cast<IUnknown*>(*out));
     return hr;
 }
 HRESULT WINAPI hk_CreateDXGIFactory1(REFIID riid, void** out) {
-    const HRESULT hr = g_cf1(riid, out);
+    const HRESULT hr = orig<CreateFactory>(g_cf1)(riid, out);
     if (SUCCEEDED(hr) && out && *out) on_factory(static_cast<IUnknown*>(*out));
     return hr;
 }
 HRESULT WINAPI hk_CreateDXGIFactory2(UINT flags, REFIID riid, void** out) {
-    const HRESULT hr = g_cf2(flags, riid, out);
+    const HRESULT hr = orig<CreateFactory2>(g_cf2)(flags, riid, out);
     if (SUCCEEDED(hr) && out && *out) on_factory(static_cast<IUnknown*>(*out));
     return hr;
 }
+HRESULT WINAPI hk_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** out) {
+    const HRESULT hr = orig<CreateD3D12>(g_d3d12)(adapter, fl, riid, out);
+    on_other_api(SUCCEEDED(hr) && out && *out, _ReturnAddress(), "D3D12");
+    return hr;
+}
+int32_t WINAPI hk_vkCreateInstance(const void* info, const void* alloc, void** out) {
+    const int32_t r = orig<CreateVkInstance>(g_vk)(info, alloc, out);
+    on_other_api(r == 0 && out && *out, _ReturnAddress(), "Vulkan");
+    return r;
+}
 
-void write_import(void* volatile* slot, void* value) {
-    // As in vtable.cpp: never drop execute rights from a page that shares code.
-    MEMORY_BASIC_INFORMATION mi;
-    if (!VirtualQuery(const_cast<void**>(slot), &mi, sizeof mi)) return;
-    const DWORD writable = PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
-    if (mi.Protect & writable) {
-        InterlockedExchangePointer(slot, value);
-        return;
-    }
-    const DWORD rw = (mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ)) ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
-    DWORD old;
-    if (!VirtualProtect(const_cast<void**>(slot), sizeof(void*), rw, &old)) return;
-    InterlockedExchangePointer(slot, value);
-    VirtualProtect(const_cast<void**>(slot), sizeof(void*), old, &old);
+struct Wanted {
+    const char* name;
+    std::atomic<void*>* orig;
+    void* hook;
+};
+const Wanted kWanted[] = {
+    {"CreateDXGIFactory", &g_cf, reinterpret_cast<void*>(&hk_CreateDXGIFactory)},
+    {"CreateDXGIFactory1", &g_cf1, reinterpret_cast<void*>(&hk_CreateDXGIFactory1)},
+    {"CreateDXGIFactory2", &g_cf2, reinterpret_cast<void*>(&hk_CreateDXGIFactory2)},
+    {"D3D12CreateDevice", &g_d3d12, reinterpret_cast<void*>(&hk_D3D12CreateDevice)},
+    {"vkCreateInstance", &g_vk, reinterpret_cast<void*>(&hk_vkCreateInstance)},
+};
+
+const Wanted* find_wanted(const char* name) {
+    if (name[0] != 'C' && name[0] != 'D' && name[0] != 'v') return nullptr;  // most names, cheaply
+    for (const Wanted& w : kWanted)
+        if (std::strcmp(name, w.name) == 0) return &w;
+    return nullptr;
 }
 }  // namespace
 
-void memory_patch_imports() {
-    // The hooks live in this module: stay loaded. Safe under the loader lock.
-    HMODULE self = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                            reinterpret_cast<LPCWSTR>(&hk_CreateDXGIFactory), &self))
-        return;
-    auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
-    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dir.VirtualAddress) return;
-    // The exe's static imports are bound before any DllMain runs.
-    for (auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp) {
-        if (!imp->OriginalFirstThunk || _stricmp(reinterpret_cast<const char*>(base + imp->Name), "dxgi.dll") != 0) continue;
-        auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->OriginalFirstThunk);
-        auto* iat = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->FirstThunk);
-        for (; names->u1.AddressOfData; ++names, ++iat) {
-            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
-            const char* name = reinterpret_cast<const char*>(
-                reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData)->Name);
-            void* const current = reinterpret_cast<void*>(iat->u1.Function);
-            if (!current || iat->u1.Function == names->u1.AddressOfData) continue;  // not bound
-            // Chain to what is there (dxgi's export or another tool's hook).
-            void* hook = nullptr;
-            if (!g_cf && std::strcmp(name, "CreateDXGIFactory") == 0) {
-                g_cf = reinterpret_cast<CreateFactory>(current);
-                hook = reinterpret_cast<void*>(&hk_CreateDXGIFactory);
-            } else if (!g_cf1 && std::strcmp(name, "CreateDXGIFactory1") == 0) {
-                g_cf1 = reinterpret_cast<CreateFactory>(current);
-                hook = reinterpret_cast<void*>(&hk_CreateDXGIFactory1);
-            } else if (!g_cf2 && std::strcmp(name, "CreateDXGIFactory2") == 0) {
-                g_cf2 = reinterpret_cast<CreateFactory2>(current);
-                hook = reinterpret_cast<void*>(&hk_CreateDXGIFactory2);
-            }
-            if (hook) write_import(reinterpret_cast<void* volatile*>(&iat->u1.Function), hook);
-        }
-    }
+bool memory_import_wanted(const char* name) { return find_wanted(name) != nullptr; }
+
+void* memory_import_hook(const char* name, void* current) {
+    const Wanted* w = find_wanted(name);
+    if (!w || !current || current == w->hook) return nullptr;
+    void* expected = nullptr;
+    w->orig->compare_exchange_strong(expected, current, std::memory_order_acq_rel);
+    return w->orig->load(std::memory_order_acquire) == current ? w->hook : nullptr;
 }
 
 uint64_t memory_reported_for(uint32_t vendor, uint64_t real) {
-    // Before the first device the adapter is unknown: report the truth.
-    return g_vendor.load(std::memory_order_acquire) == vendor ? reported(real) : real;
+    // Before the first device the adapter is unknown: the cap as in the
+    // adapter descriptions (NVAPI only knows NVIDIA GPUs).
+    const uint32_t v = g_vendor.load(std::memory_order_acquire);
+    if (!v) {
+        config_load();
+        return reported(real);
+    }
+    return v == vendor ? reported(real) : real;
 }
 
 bool memory_device_seen() { return g_vendor.load(std::memory_order_acquire) != 0; }
@@ -260,7 +275,11 @@ void memory_on_device(ID3D11Device* dev) {
     a3->QueryInterface(IID_PPV_ARGS(&a2));
     const bool ok = vt_hook(g_qvmi, a3) && vt_hook(g_desc, a3) && vt_hook(g_desc1, a3) && (!a2 || vt_hook(g_desc2, a2));
     if (a2) a2->Release();
-    logf("memory: budget hooks %s, cap %d MB", ok ? "on" : "FAILED", config().vram_budget_mb);
+    if (g_other_api.load(std::memory_order_acquire))
+        logf("memory: budget hooks %s, cap %d MB NOT applied: the game used %s first", ok ? "on" : "FAILED",
+             config().vram_budget_mb, g_other_what.load(std::memory_order_relaxed));
+    else
+        logf("memory: budget hooks %s, cap %d MB", ok ? "on" : "FAILED", config().vram_budget_mb);
     const int early = g_early_ok.load(std::memory_order_acquire);
     if (early >= 0) logf("memory: adapter hooks before the device %s", early ? "on" : "FAILED");
     memory_background_tick();  // baseline before the game allocates anything

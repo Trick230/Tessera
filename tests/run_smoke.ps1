@@ -45,6 +45,9 @@ $env:TESSERA_SMOKE_CAP_MB = "2048"
 try {
     & $exe | Write-Host
     Check "limited run" ($LASTEXITCODE -eq 0)
+    # M1 before any device: factories through every route are the layer's; a D3D12 device turns the cap off.
+    & $exe --imports | Write-Host
+    Check "DXGI factories wrapped, capped before the device, left alone for D3D12" ($LASTEXITCODE -eq 0)
     & $exe --verify "$data\sessions" 50 | Write-Host
     Check "limiter holds just under the other tool's 50 fps, budget capped, flip model" ($LASTEXITCODE -eq 0)
     Check "flip conversion logged" ((Select-String -Path $log -Pattern "converted to flip model" -Quiet))
@@ -91,6 +94,8 @@ $before = (Get-ChildItem "$data\sessions\*.tsess").Count
 Check "game still runs in safe mode" ($LASTEXITCODE -eq 0)
 & $exe --nvapi | Write-Host
 if ($nv -ne 4) { Check "imports untouched in safe mode" ($LASTEXITCODE -eq 3) }
+& $exe --imports | Write-Host
+Check "DXGI imports untouched in safe mode" ($LASTEXITCODE -eq 3)
 $after = (Get-ChildItem "$data\sessions\*.tsess").Count
 Check "no session in safe mode" ($after -eq $before)
 Check "safe mode logged" ((Select-String -Path "$data\logs\d3d11_smoke.exe.log" -Pattern "safe mode" -Quiet))
