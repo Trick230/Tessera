@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::oodle::{self, Oodle};
+use crate::unreal_pak::{self, PakKey};
 use crate::shaders::{Shader, FLAG_DXBC, FLAG_DXIL, STAGE_CS, STAGE_DS, STAGE_GS, STAGE_HS, STAGE_PS, STAGE_VS};
 
 /// Largest decompressed stream searched; bigger ones are cut (their start is still searched).
@@ -48,6 +49,9 @@ pub struct ScanStats {
     /// D3D11 containers whose checksum does not match their contents: the
     /// runtime rejects them as they are, so the game never creates them so.
     pub invalid: u64,
+    pub unreal_packages: u64,
+    pub unreadable_unreal_packages: u64,
+    pub locked_unreal_paks: u64,
 }
 
 impl ScanStats {
@@ -61,6 +65,9 @@ impl ScanStats {
         self.lz4 += o.lz4;
         self.oodle += o.oodle;
         self.invalid += o.invalid;
+        self.unreal_packages += o.unreal_packages;
+        self.unreadable_unreal_packages += o.unreadable_unreal_packages;
+        self.locked_unreal_paks += o.locked_unreal_paks;
     }
 }
 
@@ -221,6 +228,25 @@ struct Found {
 }
 
 impl Found {
+    // Legacy Unreal FShaderResource layout adapted from SCSKiller's
+    // InlineShaders 'Z' reader (05205ef1f6c3914b1f1245d133ebc710e2d30b52):
+    // the serialized length immediately before the zlib stream bounds it.
+    fn search_unreal_package(&mut self, data: &[u8]) {
+        self.search(data, MAX_DEPTH);
+        let mut decoded = Vec::new();
+        for at in memchr::memchr_iter(0x78, data) {
+            if at < 4 || at + 2 > data.len() || !is_zlib_header(&data[at..]) { continue; }
+            let size = u32_at(data, at - 4) as usize;
+            let Some(stream) = (size >= 3 && size <= data.len() - at).then(|| &data[at..at + size]) else {
+                continue;
+            };
+            decoded.clear();
+            if inflate(stream, &mut decoded) == Some(Some(size)) {
+                self.stats.zlib += self.search(&decoded, MAX_DEPTH);
+            }
+        }
+    }
+
     fn merge(mut self, o: Found) -> Found {
         self.stats.add(&o.stats);
         for (k, v) in o.shaders {
@@ -407,7 +433,7 @@ fn read_capped<R: Read>(r: Option<R>, out: &mut Vec<u8>) -> bool {
     !out.is_empty()
 }
 
-fn scan_file(path: &Path, oodle: Option<Oodle>) -> Found {
+fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>) -> Found {
     let mut f = Found { oodle, ..Found::default() };
     let Ok(file) = fs::File::open(path) else { return f };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -419,7 +445,17 @@ fn scan_file(path: &Path, oodle: Option<Oodle>) -> Found {
     let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { return f };
     f.stats.files = 1;
     f.stats.bytes = len;
-    f.search(&map, 0);
+    let pak = if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pak")) {
+        unreal_pak::scan(&map, key, oodle, |bytes| f.search_unreal_package(bytes))
+    } else {
+        unreal_pak::PakScan::default()
+    };
+    f.stats.unreal_packages += pak.packages;
+    f.stats.unreadable_unreal_packages += pak.unreadable;
+    f.stats.locked_unreal_paks += u64::from(pak.locked);
+    if !pak.opened || pak.unreadable > 0 {
+        f.search(&map, 0);
+    }
     f
 }
 
@@ -435,11 +471,15 @@ pub fn files(dir: &Path) -> Vec<PathBuf> {
 
 /// Scans `dir`; returns the D3D11-creatable shaders (sorted by hash) and stats.
 pub fn scan_dir(dir: &Path) -> (Vec<Shader>, ScanStats) {
+    scan_dir_with_key(dir, None)
+}
+
+fn scan_dir_with_key(dir: &Path, key: Option<&PakKey>) -> (Vec<Shader>, ScanStats) {
     let oodle = oodle::find(dir).and_then(|p| oodle::load(&p));
     // Each thread may hold a few STREAM_CAP buffers (a stream and the streams
     // inside it), so the thread count bounds the scan's memory.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(SCAN_THREADS);
-    let scan = || files(dir).par_iter().map(|p| scan_file(p, oodle)).reduce(Found::default, Found::merge);
+    let scan = || files(dir).par_iter().map(|p| scan_file(p, oodle, key)).reduce(Found::default, Found::merge);
     let found = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
         Ok(pool) => pool.install(scan),
         Err(_) => scan(),
@@ -471,11 +511,15 @@ fn volatile(p: &Path) -> bool {
 }
 
 /// Identifies the install by the names, sizes and timestamps of its files.
-fn install_key(root: &Path) -> String {
+fn install_key(exe: &Path, root: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut paths = files(root);
     paths.sort_unstable();
     let mut key = std::collections::hash_map::DefaultHasher::new();
+    if let Some(path) = unreal_key_path(exe) {
+        path.hash(&mut key);
+        fs::metadata(path).ok().and_then(|meta| meta.modified().ok()).hash(&mut key);
+    }
     for p in paths {
         if volatile(&p) {
             continue;
@@ -485,7 +529,27 @@ fn install_key(root: &Path) -> String {
         m.len().hash(&mut key);
         m.modified().ok().hash(&mut key);
     }
-    format!("tessera-scan 3 {:016x}", key.finish())
+    format!("tessera-scan 4 {:016x}", key.finish())
+}
+
+fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
+    Some(crate::warm::with_suffix(&scan_base(exe)?, ".pak-key-path"))
+}
+
+fn unreal_key_path(exe: &Path) -> Option<PathBuf> {
+    std::env::var_os("TESSERA_UNREAL_PAK_KEY_FILE").filter(|p| !p.is_empty()).map(PathBuf::from)
+        .or_else(|| Some(PathBuf::from(fs::read_to_string(unreal_key_reference(exe)?).ok()?)))
+}
+
+/// Store a reference to the user-selected key file, leaving its contents in place.
+pub fn set_unreal_key_file(exe: &Path, path: &Path) -> io::Result<()> {
+    let path = std::path::absolute(path)?;
+    if PakKey::from_file(&path).is_none() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected a 256-bit hexadecimal PAK key"));
+    }
+    let reference = unreal_key_reference(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
+    fs::create_dir_all(reference.parent().ok_or_else(|| io::Error::other("missing data directory"))?)?;
+    fs::write(reference, path.to_str().ok_or_else(|| io::Error::other("unsupported key file path"))?)
 }
 
 fn key_path(base: &Path) -> PathBuf {
@@ -501,6 +565,9 @@ pub struct ScanRecord {
     pub key: String,
     pub invalid: Option<u64>,
     pub unsupported: Option<u64>,
+    pub unreal_packages: Option<u64>,
+    pub unreadable_unreal_packages: Option<u64>,
+    pub locked_unreal_paks: Option<u64>,
 }
 
 pub fn record_at(base: &Path) -> Option<ScanRecord> {
@@ -508,29 +575,37 @@ pub fn record_at(base: &Path) -> Option<ScanRecord> {
     let mut lines = text.lines();
     let key = lines.next()?.to_string();
     let value = |prefix| lines.clone().find_map(|l| l.strip_prefix(prefix)?.trim().parse().ok());
-    Some(ScanRecord { key, invalid: value("invalid "), unsupported: value("unsupported ") })
+    Some(ScanRecord {
+        key, invalid: value("invalid "), unsupported: value("unsupported "),
+        unreal_packages: value("unreal_packages "), unreadable_unreal_packages: value("unreadable_unreal_packages "),
+        locked_unreal_paks: value("locked_unreal_paks "),
+    })
 }
 
 /// True when the scan store matches the install as it is now.
 pub fn up_to_date(exe: &Path, root: &Path) -> bool {
-    scan_base(exe).and_then(|b| record_at(&b)).is_some_and(|r| r.key == install_key(root))
+    scan_base(exe).and_then(|b| record_at(&b)).is_some_and(|r| r.key == install_key(exe, root))
 }
 
 /// The key of the install as it is now (walks the folder's file metadata).
-pub fn current_key(root: &Path) -> String {
-    install_key(root)
+pub fn current_key(exe: &Path, root: &Path) -> String {
+    install_key(exe, root)
 }
 
 /// Scans the install folder of `exe` (`root`) and writes what the layer has
 /// not stored yet to the scan store, which the warm-up compiles too.
 pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     let base = scan_base(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
-    let key = install_key(root);
-    let (mut shaders, stats) = scan_dir(root);
+    let key = install_key(exe, root);
+    let pak_key = unreal_key_path(exe).and_then(|p| PakKey::from_file(&p));
+    let (mut shaders, stats) = scan_dir_with_key(root, pak_key.as_ref());
     let stored: std::collections::HashSet<u64> = crate::shaders::read(exe).iter().map(|s| s.hash).collect();
     shaders.retain(|s| !stored.contains(&s.hash));
     crate::shaders::write_base(&base, &shaders)?;
-    fs::write(key_path(&base), format!("{key}\ninvalid {}\nunsupported {}\n", stats.invalid, stats.skipped))?;
+    fs::write(key_path(&base), format!(
+        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\n",
+        stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks
+    ))?;
     Ok(stats)
 }
 
@@ -655,5 +730,77 @@ mod tests {
         let (shaders, stats) = scan_dir(dir.path());
         assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&shader)]);
         assert_eq!((stats.gzip, stats.skipped, stats.invalid), (2, 1, 0));
+    }
+
+    #[test]
+    fn reads_legacy_inline_shaders_from_an_encrypted_pak() {
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        use sha1::{Digest, Sha1};
+        use std::io::Write;
+
+        fn compress(bytes: &[u8]) -> Vec<u8> {
+            let mut writer = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            writer.write_all(bytes).unwrap();
+            writer.finish().unwrap()
+        }
+        fn number(out: &mut Vec<u8>, n: u32) { out.extend_from_slice(&n.to_le_bytes()); }
+        fn offset(out: &mut Vec<u8>, n: usize) { out.extend_from_slice(&(n as u64).to_le_bytes()); }
+        fn path(out: &mut Vec<u8>, s: &str) {
+            number(out, s.len() as u32 + 1);
+            out.extend_from_slice(s.as_bytes());
+            out.push(0);
+        }
+        let cipher = aes::Aes256::new((&[7u8; 32]).into());
+        let encrypt = |bytes: &mut Vec<u8>| {
+            bytes.resize(bytes.len().next_multiple_of(16), 0);
+            for block in bytes.chunks_exact_mut(16) {
+                cipher.encrypt_block(aes::cipher::Block::<aes::Aes256>::from_mut_slice(block));
+            }
+        };
+        let shader = signed(0x0000_0050);
+        let inline = compress(&shader);
+        let mut package = Vec::new();
+        number(&mut package, inline.len() as u32);
+        package.extend_from_slice(&inline);
+        let mut payload = compress(&package);
+        let mut header = Vec::new();
+        for value in [0, payload.len(), package.len()] { offset(&mut header, value); }
+        number(&mut header, 1);
+        header.extend_from_slice(&Sha1::digest(&package));
+        number(&mut header, 1);
+        offset(&mut header, 73);
+        offset(&mut header, 73 + payload.len());
+        header.push(1);
+        number(&mut header, 65536);
+        assert_eq!(header.len(), 73);
+        encrypt(&mut payload);
+        let mut pak = header.clone();
+        pak.extend_from_slice(&payload);
+        let mut index = Vec::new();
+        path(&mut index, "../../../");
+        number(&mut index, 1);
+        path(&mut index, "End/Content/Material.uexp");
+        index.extend_from_slice(&header);
+        let hash = Sha1::digest(&index);
+        encrypt(&mut index);
+        let start = pak.len();
+        pak.extend_from_slice(&index);
+        pak.push(1);
+        number(&mut pak, 0x5a6f12e1);
+        number(&mut pak, 4);
+        offset(&mut pak, start);
+        offset(&mut pak, index.len());
+        pak.extend_from_slice(&hash);
+
+        let dir = tempfile::tempdir().unwrap();
+        let package_path = dir.path().join("chunk.pak");
+        fs::write(&package_path, pak).unwrap();
+        let key_path = dir.path().join("test.key");
+        fs::write(&key_path, "07".repeat(32)).unwrap();
+        let key = PakKey::from_file(&key_path).unwrap();
+        assert_eq!(scan_file(&package_path, None, None).stats.locked_unreal_paks, 1);
+        let f = scan_file(&package_path, None, Some(&key));
+        assert_eq!((f.stats.unreal_packages, f.stats.locked_unreal_paks, f.stats.unreadable_unreal_packages), (1, 0, 0));
+        assert_eq!(f.shaders[&hash_of(&shader)].code, shader);
     }
 }

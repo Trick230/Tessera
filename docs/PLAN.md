@@ -264,6 +264,13 @@ were built side by side. Everything below is on `master`.
 5. Validate P2 in a real blit-model game and mip residency in a tier 2 game that runs over budget.
 6. Measure phase 4 in a game with reproducible traversal stutter, then move on to the next phases.
 
+### Unreal legacy shader packages
+
+The D3D11 preparation reads Unreal PAK v4 package entries and looks for inline bytecode.
+For encrypted archives, use **Choose PAK key file** in the game's **Shaders** tab and select an existing file containing a 256-bit hexadecimal key. Tessera saves the path to that file locally and reads the key during the scan. The game archives are opened read-only.
+
+The length-prefixed zlib layout follows the legacy reader in SCSKiller's [InlineShaders.cs](https://github.com/BlueHeisenberg/SCSKiller/blob/05205ef1f6c3914b1f1245d133ebc710e2d30b52/src/SCSKiller.Core/Unreal/InlineShaders.cs).
+
 ### Phase 4 — preview in D3D11
 
 These settings are off by default. Use the app's Textures tab for streaming options and Settings for

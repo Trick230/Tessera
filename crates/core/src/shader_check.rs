@@ -34,6 +34,9 @@ pub struct ShaderCheck {
     /// Containers in the install files that failed their checksum (last scan).
     pub bad_in_install: Option<u64>,
     pub unsupported_in_install: Option<u64>,
+    pub unreal_packages: u64,
+    pub unreadable_unreal_packages: u64,
+    pub locked_unreal_paks: u64,
     /// Whether the install changed since the last scan (None: never scanned
     /// or install folder unknown).
     pub scan_outdated: Option<bool>,
@@ -64,7 +67,7 @@ pub fn check(exe: &Path, root: Option<&Path>, drivers: &[u64]) -> ShaderCheck {
     let layer = crate::warm::store_base(exe);
     let scan = crate::scan::scan_base(exe);
     let key = match (&scan, root) {
-        (Some(b), Some(r)) if crate::scan::record_at(b).is_some() => Some(crate::scan::current_key(r)),
+        (Some(b), Some(r)) if crate::scan::record_at(b).is_some() => Some(crate::scan::current_key(exe, r)),
         _ => None,
     };
     check_at(layer.as_deref(), scan.as_deref(), key.as_deref(), drivers)
@@ -122,6 +125,9 @@ pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&
     if let Some(r) = scan.and_then(crate::scan::record_at) {
         c.bad_in_install = r.invalid;
         c.unsupported_in_install = r.unsupported;
+        c.unreal_packages = r.unreal_packages.unwrap_or(0);
+        c.unreadable_unreal_packages = r.unreadable_unreal_packages.unwrap_or(0);
+        c.locked_unreal_paks = r.locked_unreal_paks.unwrap_or(0);
         c.scan_outdated = install_key.map(|k| k != r.key);
     }
     c

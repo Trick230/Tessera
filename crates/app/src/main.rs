@@ -87,8 +87,9 @@ fn row(g: &GameInfo) -> GameRow {
 fn can_prepare(g: &GameInfo) -> bool {
     g.exe.as_ref().is_some_and(|e| {
         let all = g.scan.all();
+        let ff7_dx11 = e.file_name().is_some_and(|n| n.eq_ignore_ascii_case("ff7remake_.exe"));
         all.has(tessera_core::pe::ApiSet::D3D11)
-            && (!all.has(tessera_core::pe::ApiSet::D3D12) || tessera_core::shaders::stats(e).shaders > 0)
+            && (!all.has(tessera_core::pe::ApiSet::D3D12) || ff7_dx11 || tessera_core::shaders::stats(e).shaders > 0)
     })
 }
 
@@ -401,6 +402,15 @@ fn shader_state(c: &ShaderCheck, run: Option<(u64, u64)>, can_prepare: bool) -> 
     }
     if let Some(n) = c.unsupported_in_install.filter(|&n| n > 0) {
         d.push(format!("The file scan also found {n} containers outside D3D11 warm-up support."));
+    }
+    if c.unreal_packages > 0 {
+        d.push(format!("Searched {} Unreal packages.", c.unreal_packages));
+    }
+    if c.locked_unreal_paks > 0 {
+        d.push(format!("{} encrypted Unreal PAKs could not be opened with the supplied key file.", c.locked_unreal_paks));
+    }
+    if c.unreadable_unreal_packages > 0 {
+        d.push(format!("{} Unreal packages could not be decoded.", c.unreadable_unreal_packages));
     }
     rows.push(line("Compiled", value, d, tone));
     rows.push(line(
@@ -917,6 +927,23 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_warm_shaders(move |i| warm_action(&w.unwrap(), &s, i));
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_choose_pak_key(move |i| {
+            let Some(ui) = w.upgrade() else { return };
+            let exe = {
+                let st = s.lock().unwrap();
+                st.view.get(i as usize).and_then(|&gi| st.games[gi].exe.clone())
+            };
+            let Some(exe) = exe else { return };
+            let Some(path) = rfd::FileDialog::new().set_title("Select an Unreal PAK key file").pick_file() else { return };
+            let msg = match tessera_core::scan::set_unreal_key_file(&exe, &path) {
+                Ok(()) => "PAK key file linked. Prepare shaders will use it on the next scan.".into(),
+                Err(e) => format!("Could not link the PAK key file: {e}"),
+            };
+            ui.set_status_text(msg.into());
+        });
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());

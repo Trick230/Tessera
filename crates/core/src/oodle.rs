@@ -121,7 +121,12 @@ impl Oodle {
     /// Decodes the block at the start of `b` (of `len` bytes, from
     /// block_len), appending it to `out`. False when no raw size fits.
     pub fn block(&self, b: &[u8], len: usize, out: &mut Vec<u8>) -> bool {
-        for raw in RAW_SIZES {
+        let Some(block) = b.get(..len) else { return false };
+        RAW_SIZES.into_iter().any(|raw| self.decode_exact(block, raw, out))
+    }
+
+    /// Decode a block whose exact output size is supplied by the PAK entry.
+    pub(crate) fn decode_exact(&self, b: &[u8], raw: usize, out: &mut Vec<u8>) -> bool {
             // Decoded into spare capacity: no zero fill, which would cost far
             // more than a failed try on the many false candidates.
             // Slack past `raw`, for older decoders that may overrun on bad input.
@@ -132,7 +137,7 @@ impl Oodle {
             let r = unsafe {
                 (self.decompress)(
                     b.as_ptr(),
-                    len as isize,
+                    b.len() as isize,
                     out.as_mut_ptr().add(out.len()),
                     raw as isize,
                     1,
@@ -150,10 +155,10 @@ impl Oodle {
             if r == raw as isize {
                 // SAFETY: the decoder reported writing exactly `raw` bytes.
                 unsafe { out.set_len(out.len() + raw) };
-                return true;
+                true
+            } else {
+                false
             }
-        }
-        false
     }
 
     /// Decodes a run of blocks that follow each other (one pak entry), joined
