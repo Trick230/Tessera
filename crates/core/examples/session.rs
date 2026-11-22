@@ -3,10 +3,18 @@
 //! `cargo run -p tessera-core --example session -- <file.tsess>`
 
 fn main() {
-    let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: session <file.tsess>");
+    let mut args = std::env::args().skip(1);
+    let Some(path) = args.next() else {
+        eprintln!("usage: session <file.tsess> [--mips]");
         std::process::exit(2)
     };
+    if args.next().as_deref() == Some("--mips") {
+        if let Err(error) = print_quality(std::path::Path::new(&path)) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     match tessera_core::session::summarize_file(std::path::Path::new(&path)) {
         Ok(s) => {
             println!("exe        {}", s.header.exe_path);
@@ -59,4 +67,29 @@ fn main() {
             std::process::exit(1)
         }
     }
+}
+
+fn print_quality(path: &std::path::Path) -> Result<(), tessera_core::session::Error> {
+    use tessera_core::session::{self, FLAG_RECOMPRESSED, REC_MIP_FEEDBACK, REC_TEXTURE2D};
+    let data = std::fs::read(path)?;
+    let (_, header, record) = session::parse_header(&data)?;
+    let mut mips = std::collections::BTreeMap::<u64, (u32, u64)>::new();
+    let mut compressed = 0u64;
+    let mut bytes = 0u64;
+    for r in session::records(&data, header, record) {
+        if r.kind == REC_MIP_FEEDBACK && r.bytes != 0 {
+            let (mip, count) = mips.entry(r.bytes).or_insert((r.b, 0));
+            *mip = (*mip).min(r.b);
+            *count += 1;
+        }
+        if r.kind == REC_TEXTURE2D && r.flags & FLAG_RECOMPRESSED != 0 {
+            compressed += 1;
+            bytes = bytes.saturating_add(r.bytes);
+        }
+    }
+    println!("{compressed} recompressed texture allocations, {bytes} BC bytes");
+    for (texture, (mip, count)) in mips {
+        println!("{texture:016x}  mip {mip}  ({count} samples)");
+    }
+    Ok(())
 }

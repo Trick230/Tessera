@@ -12,6 +12,7 @@
 #include "log.h"
 #include "module.h"
 #include "memory.h"
+#include "mip_feedback.h"
 #include "shaders.h"
 #include "pacing.h"
 #include "prediction.h"
@@ -19,6 +20,7 @@
 #include "rtpool.h"
 #include "uecvars.h"
 #include "session.h"
+#include "texture_quality.h"
 #include "vtable.h"
 #include "workset.h"
 
@@ -175,12 +177,13 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
     const F create = orig<F>(g_create_tex2d, self);
     const bool outer = depth.outer();
     const bool game = outer && is_game_code(ret);
-    const uint64_t bytes = d ? texture2d_bytes(*d) : 0;
+    uint64_t bytes = d ? texture2d_bytes(*d) : 0;
     const uint64_t t0 = now_qpc();
     // M3: large immutable textures become tiled, their top mip movable.
     // R1: a released render target with this description comes back.
     const bool reused = game && d && out && !init && rtpool_take(self, *d, bytes, out);
-    const bool can_share = config().texture_dedup && game && d && init && out;
+    const bool packed = game && d && init && out && quality_replace(self, create, *d, init, out, &bytes);
+    const bool can_share = !packed && config().texture_dedup && game && d && init && out;
     bool shared = false;
     if (can_share) {
         if (auto* match = dedup_texture(self, *d, init, bytes)) {
@@ -188,8 +191,10 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
             shared = true;
         }
     }
-    const bool tiled = !reused && !shared && game && d && out && residency_create(self, create, *d, init, out, bytes);
-    const HRESULT hr = reused || shared || tiled ? S_OK : create(self, d, init, out);
+    const bool tiled = !reused && !shared && !packed && game && d && out && residency_create(self, create, *d, init, out, bytes);
+    const HRESULT hr = reused || shared || packed || tiled ? S_OK : create(self, d, init, out);
+    if (SUCCEEDED(hr) && game && d && init && out && *out && config().texture_quality == 1)
+        quality_capture(*d, init);
     if (can_share && !shared && !tiled && SUCCEEDED(hr) && *out) {
         if (auto* match = dedup_texture(self, *d, init, bytes, *out)) {
             (*out)->Release();
@@ -212,13 +217,15 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
             r.flags |= raise_priority(*out, d->Usage, d->MiscFlags, (d->BindFlags & kTargetBinds) != 0);
         if (tiled) r.flags |= TESSERA_FLAG_TILED;
         if (reused) r.flags |= TESSERA_FLAG_RECYCLED;
+        if (packed) r.flags |= TESSERA_FLAG_RECOMPRESSED;
         r.bytes = bytes;
         // M11 tracks what M4 could manage: game textures that are only sampled
         // (managed ones were registered by residency_create).
         if (game && !tiled && (d->BindFlags & D3D11_BIND_SHADER_RESOURCE) &&
             !(d->BindFlags & kTargetBinds) && !(d->MiscFlags & kSharedMisc) &&
             (d->Usage == D3D11_USAGE_DEFAULT || d->Usage == D3D11_USAGE_IMMUTABLE))
-            workset_on_texture(*out, r.bytes, 0, config().mip_prediction ? texture_prediction_key(*d, init) : 0);
+            workset_on_texture(*out, r.bytes, 0,
+                               (config().mip_prediction || config().mip_feedback) ? texture_prediction_key(*d, init) : 0);
         r.a = d->Width;
         r.b = d->Height;
         r.c = d->MipLevels | (d->ArraySize << 8);
@@ -237,6 +244,7 @@ void on_deferred(ID3D11DeviceContext* ctx) {
     vt_track(ctx);
     workset_on_context(ctx);
     residency_on_context(ctx);
+    if (config().texture_quality == 2) quality_context_hooks(ctx, true);
 }
 
 HRESULT STDMETHODCALLTYPE hk_CreateDeferred(ID3D11Device* self, UINT flags, ID3D11DeviceContext** out) {
@@ -269,7 +277,19 @@ HRESULT STDMETHODCALLTYPE hk_CreateSRV(ID3D11Device* self, ID3D11Resource* res,
     void* const ret = _ReturnAddress();
     Depth depth;
     using F = decltype(&hk_CreateSRV);
-    const HRESULT hr = orig<F>(g_create_srv, self)(self, res, d, out);
+    const auto* entry = quality_entry(res);
+    D3D11_SHADER_RESOURCE_VIEW_DESC adjusted;
+    const auto* desc = d;
+    if (entry && d && d->Format == static_cast<DXGI_FORMAT>(entry->format)) {
+        adjusted = *d;
+        adjusted.Format = static_cast<DXGI_FORMAT>(entry->compressed);
+        desc = &adjusted;
+    }
+    const HRESULT hr = [&] {
+        NativeQuality native(entry != nullptr);
+        return orig<F>(g_create_srv, self)(self, res, desc, out);
+    }();
+    if (entry && SUCCEEDED(hr) && out && *out) quality_on_view(entry, *out);
     if (SUCCEEDED(hr) && out && *out && res) rtpool_on_view(res, *out);
     if (SUCCEEDED(hr) && out && *out && depth.outer()) {
         TesseraRecord r = {};
@@ -394,6 +414,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
         if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
             g_present_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
             managed = residency_present(self);
+            if (config().mip_feedback) feedback_present(self);
             session_frame(pace_before_present(self));
             rtpool_frame(self);
             uecvars_frame();
@@ -405,6 +426,8 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     const HRESULT hr = orig<F>(g_present, self)(self, sync, flags);
     flip_after_present(ff);
     if (managed) residency_after_present();
+    if (config().mip_feedback) feedback_after_present(self);
+    if (config().texture_quality == 2) quality_after_present(self);
     return hr;
 }
 
@@ -417,6 +440,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
         if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
             g_present_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
             managed = residency_present(self);
+            if (config().mip_feedback) feedback_present(self);
             session_frame(pace_before_present(self));
             rtpool_frame(self);
             uecvars_frame();
@@ -428,6 +452,8 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
     const HRESULT hr = orig<F>(g_present1, self)(self, sync, flags, params);
     flip_after_present(ff);
     if (managed) residency_after_present();
+    if (config().mip_feedback) feedback_after_present(self);
+    if (config().texture_quality == 2) quality_after_present(self);
     return hr;
 }
 
@@ -534,6 +560,7 @@ void on_swapchain(IDXGISwapChain* sc) {
     }
     if (!ok) logf("present hook failed");
     pacing_on_swapchain(sc);
+    feedback_on_swapchain(sc);
 }
 
 void on_legacy_swapchain(IDXGISwapChain* sc, IUnknown* dev, const DXGI_SWAP_CHAIN_DESC* d, bool converted,
@@ -564,6 +591,7 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
     workset_on_device(dev);
     rtpool_on_device(dev, ok);
     residency_on_device(dev);
+    if (config().texture_quality == 2) quality_register_device(dev);
     // After the modules: a context made from here on gets their hooks.
     bool def_ok = vt_hook(g_create_def, dev);
     ID3D11Device1* d1 = nullptr;

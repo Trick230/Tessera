@@ -11,9 +11,13 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "tessera/quality_format.h"
 
 namespace {
 using namespace DirectX;
@@ -143,21 +147,83 @@ Result try_compress(const ScratchImage& input, ScratchImage& output, Quality& qu
     return output.GetPixelsSize() < input.GetPixelsSize() ? accepted : rejected;
 }
 
-bool save_new(const ScratchImage& output, const wchar_t* path) {
-    Blob bytes;
-    if (FAILED(SaveToDDSMemory(output.GetImages(), output.GetImageCount(), output.GetMetadata(),
-                               DDS_FLAGS_FORCE_DX10_EXT, bytes)) || bytes.GetBufferSize() > MAXDWORD)
-        return false;
+bool save_new_bytes(const void* bytes, size_t length, const wchar_t* path) {
+    if (length > MAXDWORD) return false;
     const std::wstring tmp = std::wstring(path) + L".tessera-" + std::to_wstring(GetCurrentProcessId()) + L".tmp";
     HANDLE file = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
-    const auto size = static_cast<DWORD>(bytes.GetBufferSize());
-    const bool ok = WriteFile(file, bytes.GetBufferPointer(), size, &written, nullptr) && written == size;
+    const auto size = static_cast<DWORD>(length);
+    const bool ok = WriteFile(file, bytes, size, &written, nullptr) && written == size;
     CloseHandle(file);
     if (ok && MoveFileExW(tmp.c_str(), path, 0)) return true;
     DeleteFileW(tmp.c_str());
     return false;
+}
+
+bool save_new(const ScratchImage& output, const wchar_t* path) {
+    Blob bytes;
+    return SUCCEEDED(SaveToDDSMemory(output.GetImages(), output.GetImageCount(), output.GetMetadata(),
+                                    DDS_FLAGS_FORCE_DX10_EXT, bytes)) &&
+           save_new_bytes(bytes.GetBufferPointer(), bytes.GetBufferSize(), path);
+}
+
+Result pack_texture(const std::filesystem::path& source, const std::filesystem::path& output) {
+    std::ifstream file(source, std::ios::binary | std::ios::ate);
+    const auto length = file.tellg();
+    TesseraQualityHeader h = {};
+    file.seekg(0);
+    if (length < 0 || !file.read(reinterpret_cast<char*>(&h), sizeof h) ||
+        !tessera::quality_header(h, static_cast<uint64_t>(length), false))
+        return rejected;
+    h.compressed = tessera::quality_compressed_format(h.format);
+    h.compressed_bytes = tessera::quality_bytes(h, true);
+    if (h.compressed_bytes >= h.original_bytes) return rejected;
+    std::vector<uint8_t> encoded(sizeof h + h.original_bytes + h.compressed_bytes);
+    std::memcpy(encoded.data(), &h, sizeof h);
+    auto* pixels = encoded.data() + sizeof h;
+    if (!file.read(reinterpret_cast<char*>(pixels), h.original_bytes)) return failed;
+
+    ScratchImage input, compressed;
+    if (FAILED(input.Initialize2D(static_cast<DXGI_FORMAT>(h.format), h.width, h.height, 1, h.mips)))
+        return failed;
+    for (unsigned m = 0; m < h.mips; ++m) {
+        const auto& img = input.GetImages()[m];
+        const auto layout = tessera::quality_mip(h, m, false);
+        for (unsigned y = 0; y < layout.rows; ++y, pixels += layout.pitch)
+            std::memcpy(img.pixels + y * img.rowPitch, pixels, layout.pitch);
+    }
+    Quality quality;
+    const Result result = try_compress(input, compressed, quality);
+    if (result != accepted) return result;
+    for (unsigned m = 0; m < h.mips; ++m) {
+        const auto& img = compressed.GetImages()[m];
+        const auto layout = tessera::quality_mip(h, m, true);
+        for (unsigned y = 0; y < layout.rows; ++y, pixels += layout.pitch)
+            std::memcpy(pixels, img.pixels + y * img.rowPitch, layout.pitch);
+    }
+    return save_new_bytes(encoded.data(), encoded.size(), output.c_str()) ? accepted : failed;
+}
+
+int batch(const wchar_t* raw, const wchar_t* cache) {
+    namespace fs = std::filesystem;
+    fs::create_directories(cache);
+    unsigned saved = 0, existing = 0, skipped = 0, errors = 0;
+    for (const auto& input : fs::directory_iterator(raw)) {
+        if (input.path().extension() != L".txr" || !input.is_regular_file()) continue;
+        auto output = fs::path(cache) / input.path().filename();
+        output.replace_extension(L".tbc");
+        if (fs::exists(output)) {
+            ++existing;
+            continue;
+        }
+        const Result result = pack_texture(input.path(), output);
+        if (result == accepted) ++saved;
+        else if (result == rejected) ++skipped;
+        else ++errors;
+    }
+    std::printf("Texture cache: %u added, %u existing, %u rejected, %u errors\n", saved, existing, skipped, errors);
+    return errors ? failed : accepted;
 }
 
 int selftest() {
@@ -196,8 +262,10 @@ int selftest() {
 
 int wmain(int argc, wchar_t** argv) try {
     if (argc == 2 && std::wstring(argv[1]) == L"--selftest") return selftest();
+    if (argc == 4 && std::wstring(argv[1]) == L"--batch") return batch(argv[2], argv[3]);
     if (argc != 3) {
-        std::fputs("usage: tessera_texcomp <source.dds> <new-output.dds>\n", stderr);
+        std::fputs("usage: tessera_texcomp <source.dds> <new-output.dds> | --batch <capture dir> <cache dir>\n",
+                   stderr);
         return failed;
     }
     TexMetadata meta = {};

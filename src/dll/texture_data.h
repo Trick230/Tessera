@@ -20,6 +20,7 @@ inline TextureLayout texture_layout(DXGI_FORMAT f) {
     if (f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
         f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
         return {1, 4};
+    if (f == DXGI_FORMAT_R16G16B16A16_FLOAT) return {1, 8};
     return {};
 }
 

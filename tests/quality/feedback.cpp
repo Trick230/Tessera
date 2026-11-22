@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <d3d11.h>
+#include <d3d11_3.h>
 #include <d3dcompiler.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -8,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -23,20 +26,135 @@ HRESULT pixel_shader(ID3D11Device* dev, const wchar_t* path, ID3D11PixelShader**
     if (FAILED(hr)) return hr;
     return dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, out);
 }
+
+HRESULT make_swapchain(ID3D11Device* dev, IDXGISwapChain1** out) {
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<IDXGIFactory2> factory;
+    HRESULT hr = dev->QueryInterface(IID_PPV_ARGS(&dxgi));
+    if (SUCCEEDED(hr)) hr = dxgi->GetAdapter(&adapter);
+    if (SUCCEEDED(hr)) hr = adapter->GetParent(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return hr;
+    const HWND window = CreateWindowExW(0, L"STATIC", L"Tessera feedback test", WS_OVERLAPPEDWINDOW,
+                                         0, 0, 64, 64, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!window) return HRESULT_FROM_WIN32(GetLastError());
+    DXGI_SWAP_CHAIN_DESC1 d = {};
+    d.Width = d.Height = 4;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.BufferCount = 2;
+    d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    return factory->CreateSwapChainForHwnd(dev, window, &d, nullptr, nullptr, out);
+}
+
+bool verify_copies(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* source,
+                   const D3D11_TEXTURE2D_DESC& expected, const D3D11_SUBRESOURCE_DATA* initial) {
+    D3D11_TEXTURE2D_DESC visible = {};
+    source->GetDesc(&visible);
+    if (visible.Format != expected.Format || visible.MipLevels != expected.MipLevels ||
+        visible.Usage != D3D11_USAGE_IMMUTABLE) {
+        fail("visible texture descriptor");
+        return false;
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc = {};
+    desc.Format = expected.Format;
+    desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    desc.Texture2D.MipLevels = expected.MipLevels;
+    ComPtr<ID3D11ShaderResourceView> explicit_view;
+    if (FAILED(dev->CreateShaderResourceView(source, &desc, &explicit_view))) {
+        fail("explicit view creation");
+        return false;
+    }
+    explicit_view->GetDesc(&desc);
+    if (desc.Format != expected.Format) {
+        fail("visible view descriptor");
+        return false;
+    }
+    ComPtr<ID3D11Device3> dev3;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev3)))) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC1 d = {};
+        d.Format = expected.Format;
+        d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        d.Texture2D.MipLevels = expected.MipLevels;
+        ComPtr<ID3D11ShaderResourceView1> view;
+        if (FAILED(dev3->CreateShaderResourceView1(source, &d, &view))) {
+            fail("explicit view 1 creation");
+            return false;
+        }
+        view->GetDesc1(&d);
+        if (d.Format != expected.Format) {
+            fail("visible view 1 descriptor");
+            return false;
+        }
+    }
+
+    auto staging = expected;
+    staging.Usage = D3D11_USAGE_STAGING;
+    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging.BindFlags = 0;
+    ComPtr<ID3D11Texture2D> readback;
+    if (FAILED(dev->CreateTexture2D(&staging, nullptr, &readback))) return false;
+    ctx->CopyResource(readback.Get(), source);
+    for (UINT mip = 0; mip < expected.MipLevels; ++mip) {
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        if (FAILED(ctx->Map(readback.Get(), mip, D3D11_MAP_READ, 0, &m))) return false;
+        const auto layout = expected.Height >> mip;
+        bool same = true;
+        for (UINT y = 0; y < layout; ++y) {
+            same &= std::memcmp(static_cast<const char*>(m.pData) + y * m.RowPitch,
+                                static_cast<const char*>(initial[mip].pSysMem) + y * initial[mip].SysMemPitch,
+                                initial[mip].SysMemPitch) == 0;
+        }
+        ctx->Unmap(readback.Get(), mip);
+        if (!same) {
+            std::fprintf(stderr, "FAIL CopyResource content at mip %u\n", mip);
+            return false;
+        }
+    }
+
+    ComPtr<ID3D11DeviceContext> deferred;
+    if (FAILED(dev->CreateDeferredContext(0, &deferred))) return false;
+    // Unaligned on a BC block. This must be copied from the original pixels.
+    ComPtr<ID3D11Texture2D> partial;
+    if (FAILED(dev->CreateTexture2D(&staging, nullptr, &partial))) return false;
+    const D3D11_BOX box = {1, 1, 0, 3, 3, 1};
+    deferred->CopySubresourceRegion(partial.Get(), 0, 0, 0, 0, source, 0, &box);
+    ComPtr<ID3D11CommandList> list;
+    if (FAILED(deferred->FinishCommandList(FALSE, &list))) return false;
+    ctx->ExecuteCommandList(list.Get(), TRUE);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (FAILED(ctx->Map(partial.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+    const auto pixel = initial[0].SysMemPitch / expected.Width;
+    const auto* row = static_cast<const char*>(initial[0].pSysMem) + initial[0].SysMemPitch + pixel;
+    const bool same = std::memcmp(m.pData, row, 2 * pixel) == 0 &&
+                      std::memcmp(static_cast<const char*>(m.pData) + m.RowPitch,
+                                  row + initial[0].SysMemPitch, 2 * pixel) == 0;
+    ctx->Unmap(partial.Get(), 0);
+    if (!same) fail("deferred CopySubresourceRegion content");
+    return same;
+}
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 3) return fail("usage: tessera_test_feedback <original.dxbc> <instrumented.dxbc>");
+    if (argc != 3) return fail("usage: tessera_test_feedback <original.dxbc> <instrumented.dxbc> | --layer <original.dxbc>");
+    const bool changed = std::wcscmp(argv[1], L"--textures-changed") == 0;
+    const bool hdr = std::wcscmp(argv[1], L"--textures-hdr") == 0;
+    const bool occupied = std::wcscmp(argv[1], L"--layer-occupied") == 0;
+    const bool textures = changed || hdr || std::wcscmp(argv[1], L"--textures") == 0;
+    const bool layer = textures || occupied || std::wcscmp(argv[1], L"--layer") == 0;
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
                                    D3D11_SDK_VERSION, &dev, nullptr, &ctx);
     if (FAILED(hr)) return fail("create D3D11 device", hr);
     ComPtr<ID3D11PixelShader> original, instrumented;
-    hr = pixel_shader(dev.Get(), argv[1], &original);
+    hr = pixel_shader(dev.Get(), argv[layer ? 2 : 1], &original);
     if (FAILED(hr)) return fail("create original shader", hr);
-    hr = pixel_shader(dev.Get(), argv[2], &instrumented);
-    if (FAILED(hr)) return fail("create instrumented shader", hr);
+    if (!layer) {
+        hr = pixel_shader(dev.Get(), argv[2], &instrumented);
+        if (FAILED(hr)) return fail("create instrumented shader", hr);
+    }
 
     constexpr char source[] = "float4 main(uint id : SV_VertexID) : SV_Position {"
                               "float2 p = float2((id << 1) & 2, id & 2);"
@@ -50,17 +168,18 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(hr)) return fail("create test vertex shader", hr);
 
     constexpr UINT colors[] = {0xff3b8dde, 0xffbb1133, 0xff2211bb, 0xff467382, 0xff987652};
-    std::array<std::array<UINT, 256>, 5> data = {};
+    std::array<std::array<UINT, 512>, 5> data = {};
     D3D11_SUBRESOURCE_DATA init[5] = {};
     for (UINT mip = 0; mip < 5; ++mip) {
-        data[mip].fill(colors[mip]);
-        init[mip] = {data[mip].data(), (16u >> mip) * sizeof(UINT), 0};
+        data[mip].fill(hdr ? 0x3c003c00 : (textures ? 0xffffffff : colors[mip]));
+        if (changed && mip == 1) data[mip][0] ^= 1;
+        init[mip] = {data[mip].data(), (16u >> mip) * (hdr ? 8u : 4u), 0};
     }
     D3D11_TEXTURE2D_DESC d = {};
     d.Width = d.Height = 16;
     d.MipLevels = 5;
     d.ArraySize = d.SampleDesc.Count = 1;
-    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     d.Usage = D3D11_USAGE_IMMUTABLE;
     d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     ComPtr<ID3D11Texture2D> texture, target, image_readback;
@@ -68,9 +187,15 @@ int wmain(int argc, wchar_t** argv) {
     hr = dev->CreateTexture2D(&d, init, &texture);
     if (SUCCEEDED(hr)) hr = dev->CreateShaderResourceView(texture.Get(), nullptr, &srv);
     if (FAILED(hr)) return fail("create mip chain", hr);
+    if (textures) {
+        if (!verify_copies(dev.Get(), ctx.Get(), texture.Get(), d, init))
+            return fail("texture descriptors or copies changed");
+        std::puts("PASS texture descriptors and immediate and deferred copies");
+    }
 
     d.Width = d.Height = 4;
     d.MipLevels = 1;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     d.Usage = D3D11_USAGE_DEFAULT;
     d.BindFlags = D3D11_BIND_RENDER_TARGET;
     ComPtr<ID3D11RenderTargetView> rtv;
@@ -134,6 +259,13 @@ int wmain(int argc, wchar_t** argv) {
         ctx->PSSetShaderResources(3, 1, &view);
         ctx->PSSetSamplers(1, 1, &filter);
         ctx->Draw(3, 0);
+        if (layer) {
+            ComPtr<ID3D11PixelShader> actual;
+            ctx->PSGetShader(&actual, nullptr, nullptr);
+            ComPtr<ID3D11UnorderedAccessView> actual_uav;
+            ctx->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 7, 1, &actual_uav);
+            if (actual.Get() != ps || actual_uav.Get() != (record ? uav.Get() : nullptr)) return false;
+        }
         ctx->ClearState();
         ctx->CopyResource(image_readback.Get(), target.Get());
         D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -145,6 +277,21 @@ int wmain(int argc, wchar_t** argv) {
         return true;
     };
     std::array<UINT, 16> before = {}, after = {};
+    if (layer) {
+        ComPtr<IDXGISwapChain1> sc;
+        hr = make_swapchain(dev.Get(), &sc);
+        if (FAILED(hr)) return fail("create smoke swapchain", hr);
+        sc->Present(0, 0);
+        const UINT expected = textures ? 0xffffffff : colors[0];
+        if (!render(original.Get(), occupied, before) ||
+            !std::all_of(before.begin(), before.end(), [expected](UINT color) { return color == expected; }))
+            return fail("layer feedback draw changed output or bindings");
+        sc->Present(0, 0);  // the synchronous RT readback above already finished this test draw
+        sc->Present(0, 0);
+        if (textures) Sleep(350);  // leave the writer a tick to save any captures
+        std::puts("PASS layer draw preserved output, pixel shader and UAV state");
+        return 0;
+    }
     if (!render(original.Get(), false, before) || !render(instrumented.Get(), true, after) ||
         before != after || !std::all_of(before.begin(), before.end(), [&](UINT color) { return color == colors[0]; }))
         return fail("instrumentation changed the rendered pixels");

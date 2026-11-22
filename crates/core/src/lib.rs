@@ -13,6 +13,7 @@ pub mod mip_feedback;
 pub mod oodle;
 pub mod pe;
 pub mod paths;
+pub mod quality;
 pub mod scan;
 pub mod session;
 pub mod shader_check;

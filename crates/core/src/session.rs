@@ -21,12 +21,15 @@ pub const REC_VRAM: u16 = 7;
 pub const REC_SHADER: u16 = 8;
 pub const REC_WORKSET: u16 = 9;
 pub const REC_RESIDENCY: u16 = 10;
+pub const REC_MIP_FEEDBACK: u16 = 12;
 pub const REC_END: u16 = 0xFFFF;
 
 /// Resource created by code outside the game's folder (overlay, SDK).
 pub const FLAG_FOREIGN: u32 = 0x8000_0000;
 /// Eviction priority raised by the layer (M2).
 pub const FLAG_PRIORITY: u32 = 0x4000_0000;
+/// The texture allocation uses the compressed byte count (M9).
+pub const FLAG_RECOMPRESSED: u32 = 0x0400_0000;
 /// Bit in `d` of SHADER records: not in the shader store when created (shader_store_format.h).
 pub const SHADER_NEW: u32 = 0x4;
 

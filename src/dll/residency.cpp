@@ -17,6 +17,7 @@
 #include "prediction.h"
 #include "session.h"
 #include "texture_data.h"
+#include "texture_quality.h"
 #include "vtable.h"
 #include "workset.h"
 
@@ -716,13 +717,17 @@ void rehook_copy(VtHook& h, ID3D11DeviceContext* ctx) {
 void STDMETHODCALLTYPE hk_CopySub(ID3D11DeviceContext* self, ID3D11Resource* dst, UINT ds, UINT x, UINT y, UINT z,
                                   ID3D11Resource* src, UINT ss, const D3D11_BOX* box) {
     use_resource(src, self);
-    orig<CopySubFn>(g_copy_sub, self)(self, dst, ds, x, y, z, src, ss, box);
+    auto* original = quality_copy_source(src);
+    orig<CopySubFn>(g_copy_sub, self)(self, dst, ds, x, y, z, original ? original : src, ss, box);
+    if (original) original->Release();
     if (self == g_imm) rehook_copy(g_copy_sub, self);
 }
 
 void STDMETHODCALLTYPE hk_CopyRes(ID3D11DeviceContext* self, ID3D11Resource* dst, ID3D11Resource* src) {
     use_resource(src, self);
-    orig<CopyResFn>(g_copy_res, self)(self, dst, src);
+    auto* original = quality_copy_source(src);
+    orig<CopyResFn>(g_copy_res, self)(self, dst, original ? original : src);
+    if (original) original->Release();
     if (self == g_imm) rehook_copy(g_copy_res, self);
 }
 
@@ -730,7 +735,9 @@ void STDMETHODCALLTYPE hk_CopySub1(ID3D11DeviceContext1* self, ID3D11Resource* d
                                    ID3D11Resource* src, UINT ss, const D3D11_BOX* box, UINT flags) {
     use_resource(src, self);
     using F = decltype(&hk_CopySub1);
-    orig<F>(g_copy_sub1, self)(self, dst, ds, x, y, z, src, ss, box, flags);
+    auto* original = quality_copy_source(src);
+    orig<F>(g_copy_sub1, self)(self, dst, ds, x, y, z, original ? original : src, ss, box, flags);
+    if (original) original->Release();
 }
 
 // The game's own clamp is kept; while the top mip is away ours is at least 1.
@@ -849,7 +856,22 @@ HRESULT STDMETHODCALLTYPE hk_CreateSRV1(ID3D11Device3* self, ID3D11Resource* res
                                         const D3D11_SHADER_RESOURCE_VIEW_DESC1* d, ID3D11ShaderResourceView1** out) {
     void* const ret = _ReturnAddress();
     using F = decltype(&hk_CreateSRV1);
-    const HRESULT hr = orig<F>(g_srv1, self)(self, res, d, out);
+    const auto* entry = quality_entry(res);
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 adjusted;
+    const auto* desc = d;
+    if (entry && d && d->Format == static_cast<DXGI_FORMAT>(entry->format)) {
+        adjusted = *d;
+        adjusted.Format = static_cast<DXGI_FORMAT>(entry->compressed);
+        desc = &adjusted;
+    }
+    const HRESULT hr = [&] {
+        NativeQuality native(entry != nullptr);
+        return orig<F>(g_srv1, self)(self, res, desc, out);
+    }();
+    if (entry && SUCCEEDED(hr) && out && *out) {
+        quality_on_view(entry, *out);
+        if (is_game_code(ret)) workset_on_srv(res, *out);
+    }
     if (SUCCEEDED(hr) && out && *out && res && workset_texture_res(res)) {
         if (is_game_code(ret))
             workset_on_srv(res, *out);
@@ -863,6 +885,8 @@ HRESULT STDMETHODCALLTYPE hk_CreateSRV1(ID3D11Device3* self, ID3D11Resource* res
 void STDMETHODCALLTYPE hk_GetDesc(ID3D11Texture2D* self, D3D11_TEXTURE2D_DESC* d) {
     using F = decltype(&hk_GetDesc);
     orig<F>(g_get_desc, self)(self, d);
+    if (d)
+        if (const auto* entry = quality_entry(self)) d->Format = static_cast<DXGI_FORMAT>(entry->format);
     if (d && (d->MiscFlags & D3D11_RESOURCE_MISC_TILED) && workset_texture_res(self)) {
         d->Usage = D3D11_USAGE_IMMUTABLE;
         d->MiscFlags &= ~static_cast<UINT>(D3D11_RESOURCE_MISC_TILED);
@@ -872,6 +896,8 @@ void STDMETHODCALLTYPE hk_GetDesc(ID3D11Texture2D* self, D3D11_TEXTURE2D_DESC* d
 void STDMETHODCALLTYPE hk_GetDesc1(ID3D11Texture2D1* self, D3D11_TEXTURE2D_DESC1* d) {
     using F = decltype(&hk_GetDesc1);
     orig<F>(g_get_desc1, self)(self, d);
+    if (d)
+        if (const auto* entry = quality_entry(self)) d->Format = static_cast<DXGI_FORMAT>(entry->format);
     if (d && (d->MiscFlags & D3D11_RESOURCE_MISC_TILED) && workset_texture_res(self)) {
         d->Usage = D3D11_USAGE_IMMUTABLE;
         d->MiscFlags &= ~static_cast<UINT>(D3D11_RESOURCE_MISC_TILED);
@@ -1135,7 +1161,7 @@ bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTU
     tex->GetDesc(&got);  // the mip count when the game asked for a full chain
     pool = initial_pool(dev, total);
     if (!pool || !attach_holder(tex, pool)) goto fail;
-    asset = config().mip_prediction ? texture_prediction_key(d, init) : 0;
+    asset = (config().mip_prediction || config().mip_feedback) ? texture_prediction_key(d, init) : 0;
     views = workset_on_texture(tex, bytes, i + 1, asset);
     if (!views) goto fail;
     {
@@ -1422,6 +1448,53 @@ void residency_streaming_tick() {
         last_spares = spares;
         last_batches = batches;
     }
+}
+
+bool quality_context_hooks(ID3D11DeviceContext* ctx, bool deferred) {
+    if (!ctx) return false;
+    bool ok = vt_hook(g_copy_sub, ctx, deferred) && vt_hook(g_copy_res, ctx, deferred);
+    ID3D11DeviceContext1* c1 = nullptr;
+    if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&c1)))) {
+        ok = vt_hook(g_copy_sub1, c1, deferred) && ok;
+        c1->Release();
+    }
+    return ok;
+}
+
+bool quality_device_hooks(ID3D11Device* dev) {
+    ID3D11DeviceContext* ctx = nullptr;
+    dev->GetImmediateContext(&ctx);
+    bool ok = quality_context_hooks(ctx, false);
+    if (ctx) ctx->Release();
+    ID3D11Device3* dev3 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev3)))) {
+        ok = vt_hook(g_srv1, dev3) && ok;
+        dev3->Release();
+    }
+    return ok;
+}
+
+bool quality_texture_hooks(ID3D11Texture2D* tex) {
+    bool ok = vt_hook(g_get_desc, tex);
+    ID3D11Texture2D1* t1 = nullptr;
+    if (SUCCEEDED(tex->QueryInterface(IID_PPV_ARGS(&t1)))) {
+        ok = vt_hook(g_get_desc1, t1) && ok;
+        t1->Release();
+    }
+    return ok;
+}
+
+void quality_after_present(IDXGISwapChain* sc) {
+    if (!quality_has_replacements()) return;
+    ID3D11Device* dev = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&dev)))) return;
+    ID3D11DeviceContext* ctx = nullptr;
+    dev->GetImmediateContext(&ctx);
+    dev->Release();
+    if (!ctx) return;
+    vt_rehook(g_copy_sub, ctx);
+    vt_rehook(g_copy_res, ctx);
+    ctx->Release();
 }
 
 void residency_background_tick() {

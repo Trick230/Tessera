@@ -37,8 +37,8 @@ VRAM taken by other processes, duplicates and uncompressed textures.
            │ separate processes
            ▼
   tessera_warm.exe (shader warming, copied under the game's exe name)
-  instrument (offline DXBC prototype)        [standalone]
-  tessera_texcomp.exe (BC7/BC6H + FLIP)         [standalone]
+  DXBC instrumentation in the preparation app
+  tessera_texcomp.exe (BC7/BC6H + FLIP)         [optional]
 ```
 
 Stack: the layer and the GPU tools are C++20 (CMake, VS 2022). The preparation app is Rust
@@ -275,16 +275,22 @@ These settings are off by default. Set them in the game's `[tessera]` section an
 
 The targeted smoke test is `powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_phase4.ps1` after building the `d3d11_smoke` target. Traversal benefits in a real game and performance-core assignment on hybrid hardware still need validation.
 
-### Phase 5 — standalone tools
+### Phase 5 — D3D11 quality preview
 
-- **M6:** `cargo run -p tessera-core --example instrument -- source.dxbc feedback.dxbc` adds mip feedback to supported `ps_5_0` shaders with implicit samples from statically indexed 2D textures. It instruments the first supported sample site per texture slot, up to eight slots. The caller binds a 512-byte raw UAV at `u7` cleared to `UINT_MAX`. Element `tN` holds the most detailed unclamped mip recorded at that slot. Shaders that already use UAVs are skipped.
-- **M9:** `tessera_texcomp source.dds compressed.dds` processes opaque 2D DDS textures in RGBA8 or nonnegative RGBA16F. It converts to BC7 or BC6H, decodes the result and checks every mip against FLIP and channel error limits. It preserves the sRGB format where applicable. Rejected textures leave no output.
-- **In-game integration remains open.** M6 needs a prepared cache and a pass that binds feedback only when the game's output slots permit it, then reads results without waiting. M9 needs capture and hash-based replacement that preserves the original resource contract, including copies from immutable textures.
+- **M6:** `mip_feedback=1` samples one compatible immediate-context draw per 60 Presents. Preparation instruments the first supported implicit sample per statically indexed 2D texture slot in recorded `ps_5_0` shaders, up to eight slots. The layer skips existing UAVs and draw states with an occupied output slot 7, restores the shader and bindings after the sample, and reads the buffer without waiting. The session records the texture fingerprint and requested mip.
+- **M9:** `texture_quality=1` records up to 32 eligible immutable textures within a 32 MiB capture budget. Preparation converts opaque RGBA8 or nonnegative RGBA16F to BC7 or BC6H and checks every mip with FLIP and channel bounds. `texture_quality=2` applies a prepared replacement only when the input pixels match the captured data. Texture and view descriptions keep the original format. A copy from the resource uses the exact original pixels. Textures that need that fallback retain the original allocation for subsequent copies.
+
+Both options are off by default. Build with `powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Quality`.
+Play a learning session with `texture_quality=1` if testing recompression. Afterwards, with the game closed,
+run `& .\target\release\tessera.exe --prepare-quality "<game executable>" | Out-Host`. Then enable the options
+to be tested in `tessera.ini`. Use `cargo run -p tessera-core --example session -- <file.tsess> --mips` to inspect the results.
+Real game impact still needs measurement.
 
 On Windows, build the optional targets and run the focused test:
 
 ```powershell
 cmake -S . -B build/quality -G "Visual Studio 17 2022" -A x64 -DTESSERA_BUILD_QUALITY=ON
+cmake --build build --config Release --target tessera_d3d11
 cmake --build build/quality --config Release --target tessera_texcomp tessera_test_feedback
 powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_quality.ps1
 ```

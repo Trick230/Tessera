@@ -318,6 +318,14 @@ uint32_t workset_view_res(const void* view) {
     return j < 0 ? 0 : g_srv.hot[j].res.load(std::memory_order_relaxed);
 }
 
+uint64_t workset_view_asset(const void* view) {
+    if (!view || !g_on.load(std::memory_order_acquire)) return 0;
+    const int j = find(g_srv, view);
+    if (j < 0) return 0;
+    const auto* tex = g_srv.slot[j].tex.load(std::memory_order_relaxed);
+    return tex ? tex->asset.load(std::memory_order_relaxed) : 0;
+}
+
 void workset_clear_res(const void* tex) {
     if (!tex || !g_on.load(std::memory_order_acquire)) return;
     const int j = find(g_tex, tex);

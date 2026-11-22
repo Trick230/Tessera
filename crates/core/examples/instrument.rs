@@ -6,6 +6,13 @@ use std::process::ExitCode;
 
 fn run() -> io::Result<bool> {
     let args: Vec<_> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if let [mode, exe] = args.as_slice() {
+        if mode.as_os_str() == "--game" {
+            let count = tessera_core::mip_feedback::prepare(exe)?;
+            println!("Prepared {count} captured pixel shaders for mip feedback.");
+            return Ok(count > 0);
+        }
+    }
     let [input, output] = args.as_slice() else {
         return Err(io::Error::other(
             "usage: instrument <input.dxbc> <new-output.dxbc>",

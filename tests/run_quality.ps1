@@ -67,3 +67,59 @@ if ($LASTEXITCODE -ne 2 -or (Test-Path -LiteralPath "$case\rejected.dxbc")) {
 if ($LASTEXITCODE) { throw "DXBC instrumentation failed" }
 & "$bin\tessera_test_feedback.exe" $in $out
 if ($LASTEXITCODE) { throw "D3D11 mip feedback test failed" }
+
+# Exercise both normal layer paths in a clean local installation.
+Copy-Item -LiteralPath "$bin\tessera_test_feedback.exe" -Destination $case
+Copy-Item -LiteralPath "$root\build\src\dll\$Config\tessera_d3d11.dll" -Destination "$case\d3d11.dll"
+$env:TESSERA_DATA_DIR = Join-Path $case "data"
+$test = Join-Path $case "tessera_test_feedback.exe"
+function Read-Records([uint16]$Kind) {
+    $log = Get-ChildItem -LiteralPath "$env:TESSERA_DATA_DIR\sessions" -Filter "*.tsess" |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $bytes = [IO.File]::ReadAllBytes($log.FullName)
+    for ($p = 568; $p + 40 -le $bytes.Length; $p += 40) {
+        if ([BitConverter]::ToUInt16($bytes, $p + 8) -eq $Kind) {
+            [PSCustomObject]@{
+                Flags = [BitConverter]::ToUInt32($bytes, $p + 12)
+                A = [BitConverter]::ToUInt32($bytes, $p + 16)
+                B = [BitConverter]::ToUInt32($bytes, $p + 20)
+                Bytes = [BitConverter]::ToUInt64($bytes, $p + 32)
+            }
+        }
+    }
+}
+
+Set-Content -LiteralPath "$case\tessera.ini" -Value @("[tessera]", "texture_quality=1") -Encoding ascii
+foreach ($mode in "--textures", "--textures-hdr") {
+    & $test $mode $in
+    if ($LASTEXITCODE) { throw "Texture learning test failed in $mode" }
+}
+& $instrument --game $test
+if ($LASTEXITCODE) { throw "Failed to prepare captured shader" }
+$raw = Get-ChildItem -LiteralPath "$env:TESSERA_DATA_DIR\quality" -Directory -Filter "*.raw" | Select-Object -First 1
+$packed = [IO.Path]::ChangeExtension($raw.FullName, ".packed")
+& $compressor --batch $raw.FullName $packed
+if ($LASTEXITCODE -or @(Get-ChildItem -LiteralPath $packed -Filter "*.tbc").Count -ne 2) {
+    throw "Texture cache did not prepare both formats"
+}
+
+Set-Content -LiteralPath "$case\tessera.ini" -Value @("[tessera]", "mip_feedback=1", "texture_quality=2") -Encoding ascii
+foreach ($mode in "--textures", "--textures-hdr", "--textures-changed") {
+    & $test $mode $in
+    if ($LASTEXITCODE) { throw "Texture replay failed in $mode" }
+    $replaced = @(Read-Records 2 | Where-Object { $_.Flags -band 0x04000000 })
+    $want = [int]($mode -ne "--textures-changed")
+    if ($replaced.Count -ne $want -or ($want -and $replaced[0].Bytes -ne 368)) {
+        throw "Unexpected texture substitution in $mode"
+    }
+    $feedback = @(Read-Records 12)
+    if ($feedback.Count -ne 1 -or $feedback[0].A -ne 3 -or $feedback[0].B -ne 2 -or !$feedback[0].Bytes) {
+        throw "Missing texture feedback in $mode"
+    }
+}
+"PASS runtime M6 and M9, including changed texture bypass"
+& $test --layer-occupied $in
+if ($LASTEXITCODE -or @(Read-Records 12).Count -ne 0) {
+    throw "Feedback touched a draw whose UAV slot was occupied"
+}
+"PASS occupied UAV left alone"

@@ -35,6 +35,7 @@ void workset_on_srv(ID3D11Resource* res, ID3D11ShaderResourceView* view);
 // or of the texture a tracked view shows, 0 otherwise.
 uint32_t workset_texture_res(const void* tex);
 uint32_t workset_view_res(const void* view);
+uint64_t workset_view_asset(const void* view);
 // The texture is no longer managed (it may outlive our reference).
 void workset_clear_res(const void* tex);
 // From Present (outer, real frames).

@@ -764,6 +764,17 @@ fn main() -> Result<(), slint::PlatformError> {
     if args.len() == 3 && args[0] == "--scan" {
         std::process::exit(scan_child(&args[1..]));
     }
+    if args.len() == 2 && args[0] == "--prepare-quality" {
+        let tool = app_dir().join(tessera_core::quality::TEXCOMP_EXE);
+        match tessera_core::quality::prepare(Path::new(&args[1]), &tool) {
+            Ok(report) => println!("{report}"),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let ui = MainWindow::new()?;
     let state: Shared = Arc::new(Mutex::new(State { folders: load_folders(), ..Default::default() }));
 

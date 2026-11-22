@@ -15,6 +15,7 @@ const FTOU: u32 = 28;
 const ATOMIC_UMIN: u32 = 177;
 const FEEDBACK_SLOT: u32 = 7;
 const MAX_TEXTURES: usize = 8;
+const CACHE_LIMIT: usize = 128 * 1024 * 1024;
 
 fn word(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
@@ -257,4 +258,66 @@ pub fn instrument(code: &[u8]) -> Option<(Vec<u8>, Vec<u32>)> {
     let checksum = crate::scan::checksum(&out);
     out[4..20].copy_from_slice(&checksum);
     Some((out, slots))
+}
+
+/// Prepare the DLL's optional cache from shaders recorded for this game.
+/// Keep the original checksum as the lookup key. The driver still validates
+/// each instrumented variant before the DLL can use it.
+pub fn prepare(exe: &std::path::Path) -> std::io::Result<usize> {
+    use std::collections::BTreeMap;
+    use std::fs::{self, OpenOptions};
+    use std::io::{self, Write};
+
+    let key = crate::session::exe_key_name(exe)
+        .ok_or_else(|| io::Error::other("invalid executable path"))?;
+    let root = crate::paths::data_dir().join("feedback");
+    fs::create_dir_all(&root)?;
+    let mut cache = BTreeMap::new();
+    let mut bytes = 16;
+    for shader in crate::shaders::read(exe) {
+        if shader.stage != crate::shaders::STAGE_PS {
+            continue;
+        }
+        if let Some((code, slots)) = instrument(&shader.code) {
+            if code.len() > 1024 * 1024 || bytes + 32 + code.len() > CACHE_LIMIT {
+                break;
+            }
+            let digest: [u8; 16] = shader.code[4..20].try_into().unwrap();
+            if let std::collections::btree_map::Entry::Vacant(entry) = cache.entry(digest) {
+                bytes += 32 + code.len();
+                entry.insert((code, slots));
+            }
+            if cache.len() == 4096 {
+                break;
+            }
+        }
+    }
+    let destination = root.join(format!("{key}.tmip"));
+    let temp = destination.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let result = (|| {
+        file.write_all(b"TSRMIP1\0")?;
+        file.write_all(&(cache.len() as u32).to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        for (key, (code, slots)) in &cache {
+            let mut indices = [0u8; MAX_TEXTURES];
+            for (dst, &slot) in indices.iter_mut().zip(slots) {
+                *dst = slot as u8;
+            }
+            file.write_all(key)?;
+            file.write_all(&(code.len() as u32).to_le_bytes())?;
+            file.write_all(&(slots.len() as u32).to_le_bytes())?;
+            file.write_all(&indices)?;
+            file.write_all(code)?;
+        }
+        drop(file);
+        fs::rename(&temp, destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.map(|_| cache.len())
 }

@@ -20,6 +20,7 @@ FetchContent_MakeAvailable(tessera_directxtex tessera_flip)
 target_compile_options(DirectXTex PRIVATE /EHsc)
 
 add_executable(tessera_texcomp main.cpp)
+target_include_directories(tessera_texcomp PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_include_directories(tessera_texcomp SYSTEM PRIVATE "${tessera_flip_SOURCE_DIR}/src/cpp")
 target_compile_options(tessera_texcomp PRIVATE /EHsc)
 target_link_libraries(tessera_texcomp PRIVATE DirectXTex)

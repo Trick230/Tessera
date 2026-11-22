@@ -21,6 +21,7 @@
 #include "shaders.h"
 #include "residency.h"
 #include "stream_io.h"
+#include "texture_quality.h"
 #include "workset.h"
 
 namespace tessera {
@@ -181,6 +182,7 @@ DWORD WINAPI writer_main(void*) {
         shaders_background_tick();
         nvapi_background_tick();
         if (config().stream_io == 1) stream_background_tick();
+        if (config().texture_quality == 1) quality_background_tick();
         if (config().mip_prediction && config().mip_residency) prediction_background_tick();
         if (config().mip_streaming && config().mip_residency) residency_streaming_tick();
         if (!stable) {

@@ -8,6 +8,7 @@ add_library(tessera_d3d11 SHARED
   vtable.cpp
   session.cpp
   stream_io.cpp
+  texture_quality.cpp
   log.cpp
   config.cpp
   dedup.cpp
@@ -16,6 +17,7 @@ add_library(tessera_d3d11 SHARED
   pacing.cpp
   prediction.cpp
   memory.cpp
+  mip_feedback.cpp
   nvapi.cpp
   flip.cpp
   shaders.cpp
