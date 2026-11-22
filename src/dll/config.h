@@ -7,6 +7,7 @@ namespace tessera {
 struct Config {
     bool process = true;        // P5: EcoQoS off, 1 ms timer resolution
     bool priority = true;       // P5: above-normal priority when the game runs at normal
+    bool present_cpu_sets = false;  // P4: select performance cores for the presenting thread
     bool residency = true;      // M2: eviction priority of render targets and buffers
     int fps_limit = 0;          // P1: frame limiter, 0 = off
     int ext_fps_limit = 0;      // P1: lowest limit of another tool (RTSS, NVIDIA), written by the app

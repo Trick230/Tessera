@@ -12,6 +12,7 @@ void on_swapchain(IDXGISwapChain* sc);
 
 // P2: true while the swapchain hooks flip model relies on can still be installed.
 bool flip_hooks_ready();
+DWORD last_present_thread();
 
 // A call the layer makes itself (proxy exports): hooked calls inside it pass straight through.
 struct InternalCall {

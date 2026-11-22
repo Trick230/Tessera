@@ -4,4 +4,5 @@
 namespace tessera {
 // P5: EcoQoS off and 1 ms timer resolution for this process only.
 void apply_process_tweaks();
+void present_cpu_sets_tick();
 }  // namespace tessera

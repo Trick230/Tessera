@@ -31,6 +31,7 @@ BOOL CALLBACK load_once(PINIT_ONCE, void*, void**) {
     Config c;
     c.process = get(L"process", 1) != 0;
     c.priority = get(L"priority", 1) != 0;
+    c.present_cpu_sets = get(L"present_cpu_sets", 0) != 0;
     // M2 off by default: in FF7R (NVIDIA 621.14) it crashed the driver (AV in
     // nvwgf2umx, render thread hang, device removed) in 7 of 7 runs.
     c.residency = get(L"residency", 0) != 0;

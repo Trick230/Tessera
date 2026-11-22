@@ -460,6 +460,8 @@ uint32_t bits_per_pixel(DXGI_FORMAT f) {
 }
 }  // namespace
 
+DWORD last_present_thread() { return g_present_tid.load(std::memory_order_relaxed); }
+
 uint64_t texture2d_bytes(const D3D11_TEXTURE2D_DESC& d) {
     uint32_t mips = d.MipLevels;
     if (mips == 0) {
