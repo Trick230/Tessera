@@ -23,6 +23,7 @@ struct Config {
     bool mip_force_evict = false;  // tests: evict every texture not bound in the current frame
     bool texture_dedup = false;  // M8: share identical immutable shader textures
     int stream_io = 0;           // I1-I3: 1 learn reads, 2 prefetch a saved trace
+    bool stream_io_diagnostics = false;  // Record demand and accepted prefetch ranges.
     bool mip_prediction = false;  // M7: predict texture use
     bool mip_feedback = false;    // M6: sample prepared pixel shaders at runtime
     bool mip_feedback_diagnostics = false;  // Record the pixel shaders skipped by feedback sampling.

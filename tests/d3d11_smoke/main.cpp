@@ -699,8 +699,9 @@ int stream() {
         for (auto* view : views) view->Release();
     }
     if (!read_asset(learning ? 33 : 1, 65536)) return fail("stream asset read");
-    CloseHandle(file);
     Sleep(650);  // the learning and prefetch workers run asynchronously
+    if (mode[0] == L'2' && !read_asset(33, 65536)) return fail("stream demand after material prefetch");
+    CloseHandle(file);
     ctx->Release();
     sc->Release();
     dev->Release();

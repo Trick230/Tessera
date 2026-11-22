@@ -50,8 +50,10 @@ struct OpenFile {
     std::atomic<unsigned> file;
 };
 OpenFile g_handles[kHandles];
+uint64_t g_file_keys[kFiles];
 SRWLOCK g_lock = SRWLOCK_INIT;
 std::atomic<bool> g_learning{false};
+std::atomic<bool> g_track_reads{false};
 std::atomic<uint64_t> g_material{0};
 wchar_t g_root[MAX_PATH], g_path[MAX_PATH];
 size_t g_root_length = 0;
@@ -72,13 +74,14 @@ bool in_root(const wchar_t* path, size_t n) {
            !wcschr(path + g_root_length, L':');
 }
 
-bool describe(HANDLE h, File& f) {
+bool describe(HANDLE h, File& f, uint64_t& key) {
     BY_HANDLE_FILE_INFORMATION info = {};
     if (GetFileType(h) != FILE_TYPE_DISK || !GetFileInformationByHandle(h, &info) ||
         (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
         return false;
     f.size = wide(info.nFileSizeHigh, info.nFileSizeLow);
     f.modified = wide(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
+    key = wide(info.nFileIndexHigh, info.nFileIndexLow) ^ (info.dwVolumeSerialNumber * 0x9e3779b97f4a7c15ull);
     return f.size >= kMinRead && in_root(f.path, final_path(h, f.path));
 }
 
@@ -89,16 +92,21 @@ void remember(HANDLE h, DWORD access, DWORD creation, DWORD flags) {
         (access & (GENERIC_WRITE | GENERIC_ALL | DELETE)) || (flags & FILE_FLAG_DELETE_ON_CLOSE))
         return;
     File f = {};
-    if (!describe(h, f) || !TryAcquireSRWLockExclusive(&g_lock)) return;
+    uint64_t key;
+    if (!describe(h, f, key) || !TryAcquireSRWLockExclusive(&g_lock)) return;
     unsigned i = 0;
     for (; i < g_trace.files; ++i) {
         const File& seen = g_trace.file[i];
-        if (seen.size == f.size && seen.modified == f.modified &&
+        if (g_file_keys[i] == key && seen.size == f.size && seen.modified == f.modified &&
             CompareStringOrdinal(seen.path, -1, f.path, -1, TRUE) == CSTR_EQUAL)
             break;
     }
     if (i < kFiles) {
-        if (i == g_trace.files) g_trace.file[g_trace.files++] = f;
+        if (i == g_trace.files) {
+            g_trace.file[i] = f;
+            g_file_keys[i] = key;
+            ++g_trace.files;
+        }
         auto& s = handle_slot(h);
         s.handle.store(nullptr, std::memory_order_relaxed);
         s.file.store(i, std::memory_order_relaxed);
@@ -112,6 +120,18 @@ unsigned tracked(HANDLE h) {
     if (!h || s.handle.load(std::memory_order_acquire) != h) return kFiles;
     const unsigned file = s.file.load(std::memory_order_relaxed);
     return s.handle.load(std::memory_order_acquire) == h ? file : kFiles;
+}
+
+void record_io(TesseraStreamIoKind kind, uint64_t key, uint64_t offset, DWORD count, LARGE_INTEGER time) {
+    TesseraRecord r = {};
+    r.qpc = static_cast<uint64_t>(time.QuadPart);
+    r.kind = TESSERA_REC_STREAM_IO;
+    r.format = static_cast<uint16_t>(kind);
+    r.a = count;
+    r.b = static_cast<uint32_t>(key);
+    r.c = static_cast<uint32_t>(key >> 32);
+    r.bytes = offset;
+    session_push(r);
 }
 
 void record(unsigned file, uint64_t offset, DWORD bytes) {
@@ -146,7 +166,7 @@ void record(unsigned file, uint64_t offset, DWORD bytes) {
 HANDLE WINAPI open_file(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security, DWORD creation,
                         DWORD flags, HANDLE template_file) {
     const HANDLE h = CreateFileW(name, access, share, security, creation, flags, template_file);
-    if (g_learning.load(std::memory_order_acquire)) {
+    if (g_track_reads.load(std::memory_order_acquire)) {
         const DWORD error = GetLastError();
         remember(h, access, creation, flags);
         SetLastError(error);
@@ -155,7 +175,7 @@ HANDLE WINAPI open_file(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTR
 }
 
 BOOL WINAPI read_file(HANDLE h, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED ov) {
-    if (!g_learning.load(std::memory_order_acquire) || bytes < kMinRead)
+    if (!g_track_reads.load(std::memory_order_acquire) || bytes < kMinRead)
         return ReadFile(h, buffer, bytes, read, ov);
     const unsigned file = tracked(h);
     LARGE_INTEGER offset = {};
@@ -165,19 +185,26 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVER
         offset.QuadPart = static_cast<int64_t>(wide(ov->OffsetHigh, ov->Offset));
     else if (valid)
         valid = SetFilePointerEx(h, {}, &offset, FILE_CURRENT) != 0;
+    const bool observe = valid && config().stream_io_diagnostics;
+    LARGE_INTEGER time = {};
+    if (observe) QueryPerformanceCounter(&time);
     SetLastError(before);
     const BOOL ok = ReadFile(h, buffer, bytes, read, ov);
     const DWORD error = GetLastError();
     if (valid && offset.QuadPart >= 0 && (ok || (ov && error == ERROR_IO_PENDING))) {
         const DWORD count = ok && !ov && read ? *read : bytes;
-        if (count >= kMinRead) record(file, static_cast<uint64_t>(offset.QuadPart), count);
+        if (count >= kMinRead) {
+            const auto start = static_cast<uint64_t>(offset.QuadPart);
+            if (g_learning.load(std::memory_order_acquire)) record(file, start, count);
+            if (observe) record_io(TESSERA_STREAM_DEMAND, g_file_keys[file], start, count, time);
+        }
     }
     SetLastError(error);
     return ok;
 }
 
 BOOL WINAPI close_file(HANDLE h) {
-    if (g_learning.load(std::memory_order_acquire)) {
+    if (g_track_reads.load(std::memory_order_acquire)) {
         auto& s = handle_slot(h);
         HANDLE expected = h;
         s.handle.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed);
@@ -185,7 +212,7 @@ BOOL WINAPI close_file(HANDLE h) {
     return CloseHandle(h);
 }
 
-DWORD warm_range(const Trace& trace, const Range& r, DWORD limit) {
+DWORD warm_range(const Trace& trace, const Range& r, DWORD limit, TesseraStreamIoKind kind) {
     if (r.file >= trace.files || r.bytes < kMinRead || r.bytes > kMaxRead) return 0;
     const File& known = trace.file[r.file];
     const wchar_t* end = static_cast<const wchar_t*>(wmemchr(known.path, 0, MAX_PATH));
@@ -202,7 +229,8 @@ DWORD warm_range(const Trace& trace, const Range& r, DWORD limit) {
     if (h == INVALID_HANDLE_VALUE) return 0;
     File actual = {};
     DWORD warmed = 0;
-    if (describe(h, actual) && actual.size == known.size && actual.modified == known.modified &&
+    uint64_t key;
+    if (describe(h, actual, key) && actual.size == known.size && actual.modified == known.modified &&
         CompareStringOrdinal(actual.path, -1, known.path, -1, TRUE) == CSTR_EQUAL) {
         SYSTEM_INFO sys = {};
         GetSystemInfo(&sys);
@@ -213,8 +241,14 @@ DWORD warm_range(const Trace& trace, const Range& r, DWORD limit) {
             if (void* view = MapViewOfFile(map, FILE_MAP_READ, static_cast<DWORD>(base >> 32),
                                           static_cast<DWORD>(base), length)) {
                 WIN32_MEMORY_RANGE_ENTRY range = {static_cast<BYTE*>(view) + (r.offset - base), std::min(r.bytes, limit)};
-                if (PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0))
+                if (PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
                     warmed = static_cast<DWORD>(range.NumberOfBytes);
+                    if (config().stream_io_diagnostics) {
+                        LARGE_INTEGER time;
+                        QueryPerformanceCounter(&time);
+                        record_io(kind, key, r.offset, warmed, time);
+                    }
+                }
                 UnmapViewOfFile(view);
             }
             CloseHandle(map);
@@ -240,7 +274,7 @@ void prefetch(const Trace& trace) {
         issued[i] = true;
         const DWORD cap = kPrefixBytes - used;
         used += std::min(r.bytes, cap);
-        prefix += warm_range(trace, r, cap);
+        prefix += warm_range(trace, r, cap, TESSERA_STREAM_STARTUP_PREFETCH);
     }
     logf("stream I/O: prefetched %lu KB from the startup list", prefix >> 10);
     if (!config().mip_prediction || used >= kSessionBytes) return;
@@ -265,7 +299,7 @@ void prefetch(const Trace& trace) {
             --remaining;
             batch += wanted;
             used += wanted;
-            const DWORD loaded = warm_range(trace, trace.range[i], cap);
+            const DWORD loaded = warm_range(trace, trace.range[i], cap, TESSERA_STREAM_MATERIAL_PREFETCH);
             warmed += loaded;
             warmed_ranges += loaded != 0;
         }
@@ -355,7 +389,12 @@ void stream_start(const wchar_t* exe) {
         g_trace.exe_size = g_exe_size;
         g_trace.exe_modified = g_exe_modified;
         g_learning.store(true, std::memory_order_release);
+    }
+    if (mode == 1 || config().stream_io_diagnostics) {
+        g_track_reads.store(true, std::memory_order_release);
         activate_stream_imports();
+    }
+    if (mode == 1) {
         logf("stream I/O: learning reads under %ls", g_root);
     } else if (HANDLE thread = CreateThread(nullptr, 0, prefetch_thread, nullptr, 0, nullptr)) {
         CloseHandle(thread);

@@ -25,6 +25,7 @@ pub const REC_SLOW_CREATE: u16 = 11;
 pub const REC_MIP_FEEDBACK: u16 = 12;
 pub const REC_SLOW_D3D11: u16 = 13;
 pub const REC_MIP_SHADER_MISS: u16 = 14;
+pub const REC_STREAM_IO: u16 = 15;
 pub const REC_END: u16 = 0xFFFF;
 
 pub const CALL_PRESENT_THREAD: u32 = 0x8000_0000;

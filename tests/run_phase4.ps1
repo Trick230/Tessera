@@ -19,6 +19,24 @@ function Test-Log([string]$Pattern) {
     return (Select-String -LiteralPath $log -Pattern $Pattern -Quiet)
 }
 
+function Read-StreamEvents {
+    $session = Get-ChildItem -LiteralPath "$env:TESSERA_DATA_DIR\sessions" -File -Filter "*.tsess" |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $data = [IO.File]::ReadAllBytes($session.FullName)
+    $header = [BitConverter]::ToUInt32($data, 12)
+    $size = [BitConverter]::ToUInt32($data, 16)
+    for ($p = $header; $p + $size -le $data.Length; $p += $size) {
+        if ([BitConverter]::ToUInt16($data, $p + 8) -ne 15) { continue }
+        [pscustomobject]@{
+            Qpc = [BitConverter]::ToUInt64($data, $p)
+            Event = [BitConverter]::ToUInt16($data, $p + 10)
+            Size = [BitConverter]::ToUInt32($data, $p + 16)
+            File = [BitConverter]::ToUInt64($data, $p + 20)
+            Offset = [BitConverter]::ToUInt64($data, $p + 32)
+        }
+    }
+}
+
 Set-Options @("present_cpu_sets=1")
 & $exe | Write-Host
 if ($LASTEXITCODE) { throw "Present CPU sets smoke run failed" }
@@ -43,13 +61,22 @@ if ($LASTEXITCODE -or -not (Test-Log "learning trace contains 2049 ranges, 1 wit
     throw "Stream learning failed to reserve room for the later material read"
 }
 
-Set-Options @("stream_io=2", "mip_prediction=1")
+if (@(Read-StreamEvents).Count) { throw "Recorded stream events with diagnostics disabled" }
+Set-Options @("stream_io=2", "mip_prediction=1", "stream_io_diagnostics=1")
 $env:TESSERA_SMOKE_PREDICT = "2"
 & $exe --stream | Write-Host
 if ($LASTEXITCODE -or -not (Test-Log "2048 KB from the startup list") -or
     -not (Test-Log "64 KB from a material match \(1 ranges\)")) {
     throw "Startup and material prefetch test failed"
 }
+$events = @(Read-StreamEvents)
+$material = $events | Where-Object Event -EQ 3 | Select-Object -First 1
+if (!$material -or $material.Offset -ne 33 * 65536 -or $material.Size -ne 65536 -or
+    !($events | Where-Object { $_.Event -eq 1 -and $_.File -eq $material.File -and
+        $_.Offset -eq $material.Offset -and $_.Size -eq $material.Size -and $_.Qpc -gt $material.Qpc })) {
+    throw "Missing material prefetch and later demand for the same file range"
+}
+"PASS opt-in stream range and timing diagnostics"
 (Get-Item -LiteralPath $env:TESSERA_SMOKE_ASSET).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-1)
 & $exe --stream | Write-Host
 if ($LASTEXITCODE -or -not (Test-Log "0 KB from the startup list") -or (Test-Log "from a material match")) {

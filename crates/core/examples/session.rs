@@ -5,13 +5,14 @@
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: session <file.tsess> [--mips | --mip-misses]");
+        eprintln!("usage: session <file.tsess> [--mips | --mip-misses | --stream-io]");
         std::process::exit(2)
     };
     let path = std::path::Path::new(&path);
     let detail = match args.next().as_deref() {
         Some("--mips") => Some(print_quality(path)),
         Some("--mip-misses") => Some(print_mip_misses(path)),
+        Some("--stream-io") => Some(print_stream_io(path)),
         _ => None,
     };
     if let Some(result) = detail {
@@ -91,6 +92,23 @@ fn print_mip_misses(path: &std::path::Path) -> Result<(), tessera_core::session:
             _ => "unknown",
         };
         println!("{},{:016x},{reason}", r.qpc, r.bytes);
+    }
+    Ok(())
+}
+
+fn print_stream_io(path: &std::path::Path) -> Result<(), tessera_core::session::Error> {
+    use tessera_core::session::{self, REC_STREAM_IO};
+    let data = std::fs::read(path)?;
+    let (_, header, record) = session::parse_header(&data)?;
+    println!("qpc,event,file_key,offset,bytes");
+    for r in session::records(&data, header, record).filter(|r| r.kind == REC_STREAM_IO) {
+        let event = match r.format {
+            1 => "demand",
+            2 => "startup_prefetch",
+            3 => "material_prefetch",
+            _ => "unknown",
+        };
+        println!("{},{event},{:08x}{:08x},{},{}", r.qpc, r.c, r.b, r.bytes, r.a);
     }
     Ok(())
 }
