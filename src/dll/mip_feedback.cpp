@@ -79,6 +79,11 @@ struct Capture;
 SRWLOCK g_active_lock = SRWLOCK_INIT;
 Capture* g_active = nullptr;  // the swapchain owns the state
 std::atomic<bool> g_armed{false};
+struct FeedbackStats {
+    std::atomic<unsigned> variants{0}, windows{0}, no_variant{0}, no_texture{0}, output_busy{0};
+    std::atomic<unsigned> submitted{0}, empty{0}, read_failed{0}, samples{0}, rehook_failed{0};
+};
+FeedbackStats g_stats;
 struct Slot {
     uint64_t texture;
     UINT first_mip, binding;
@@ -203,13 +208,21 @@ void draw(ID3D11DeviceContext* ctx, F original_draw, A... args) {
         return;
     }
     ComPtr<ID3D11PixelShader> original, variant;
-    if (cap->attempts && !cap->pending) {
-        if (--cap->attempts == 0) g_armed.store(false, std::memory_order_relaxed);
-        ctx->PSGetShader(&original, nullptr, nullptr);
-        UINT size = sizeof(ID3D11PixelShader*);
-        if (original) original->GetPrivateData(kVariant, &size, variant.GetAddressOf());
+    if (!cap->attempts || cap->pending) {
+        release(*cap);
+        original_draw(ctx, args...);
+        return;
     }
-    if (!variant || !capture_bindings(*cap, *original.Get()) || !free_output_slot(ctx)) {
+    if (--cap->attempts == 0) g_armed.store(false, std::memory_order_relaxed);
+    ctx->PSGetShader(&original, nullptr, nullptr);
+    UINT size = sizeof(ID3D11PixelShader*);
+    if (original) original->GetPrivateData(kVariant, &size, variant.GetAddressOf());
+    std::atomic<unsigned>* skipped = nullptr;
+    if (!variant) skipped = &g_stats.no_variant;
+    else if (!capture_bindings(*cap, *original.Get())) skipped = &g_stats.no_texture;
+    else if (!free_output_slot(ctx)) skipped = &g_stats.output_busy;
+    if (skipped) {
+        skipped->fetch_add(1, std::memory_order_relaxed);
         release(*cap);
         original_draw(ctx, args...);
         return;
@@ -228,6 +241,7 @@ void draw(ID3D11DeviceContext* ctx, F original_draw, A... args) {
                                                    kUav, 1, &uav, nullptr);
     ctx->CopyResource(cap->readback.Get(), cap->gpu.Get());
     cap->pending = true;
+    g_stats.submitted.fetch_add(1, std::memory_order_relaxed);
     release(*cap);
 }
 
@@ -268,8 +282,9 @@ void feedback_on_shader(ID3D11Device* dev, CreatePixelShaderFn create, ID3D11Pix
     const auto& entry = **match;
     ComPtr<ID3D11PixelShader> variant;
     if (SUCCEEDED(create(dev, &entry + 1, entry.bytes, nullptr, &variant)) &&
-        SUCCEEDED(original->SetPrivateData(kSlots, entry.count, entry.slots)))
-        original->SetPrivateDataInterface(kVariant, variant.Get());
+        SUCCEEDED(original->SetPrivateData(kSlots, entry.count, entry.slots)) &&
+        SUCCEEDED(original->SetPrivateDataInterface(kVariant, variant.Get())))
+        g_stats.variants.fetch_add(1, std::memory_order_relaxed);
 }
 
 void feedback_on_swapchain(IDXGISwapChain* sc) {
@@ -318,6 +333,7 @@ void feedback_present(IDXGISwapChain* sc) {
             const auto* levels = static_cast<const UINT*>(m.pData);
             LARGE_INTEGER time;
             QueryPerformanceCounter(&time);
+            unsigned samples = 0;
             for (unsigned i = 0; i < cap->count; ++i) {
                 const auto& slot = cap->slots[i];
                 const UINT mip = levels[slot.binding];
@@ -329,14 +345,19 @@ void feedback_present(IDXGISwapChain* sc) {
                 r.b = std::min(mip, 65535u) + slot.first_mip;
                 r.bytes = slot.texture;
                 session_push(r);
+                ++samples;
             }
             cap->context->Unmap(cap->readback.Get(), 0);
             cap->pending = false;
+            if (samples) g_stats.samples.fetch_add(samples, std::memory_order_relaxed);
+            else g_stats.empty.fetch_add(1, std::memory_order_relaxed);
         } else if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
             cap->pending = false;
+            g_stats.read_failed.fetch_add(1, std::memory_order_relaxed);
         }
     }
     cap->attempts = cap->frame++ % kInterval == 0 && !cap->pending ? 32 : 0;
+    if (cap->attempts) g_stats.windows.fetch_add(1, std::memory_order_relaxed);
     g_armed.store(cap->attempts != 0, std::memory_order_relaxed);
     release(*cap);
 }
@@ -348,8 +369,20 @@ void feedback_after_present(IDXGISwapChain* sc) {
         // Restore our chain only while a sample is armed.
         const bool ok = vt_rehook(g_draw, cap->context) && vt_rehook(g_draw_indexed, cap->context) &&
                         vt_rehook(g_draw_instanced, cap->context) && vt_rehook(g_draw_indexed_instanced, cap->context);
-        if (!ok) g_armed.store(false, std::memory_order_relaxed);
+        if (!ok) {
+            g_armed.store(false, std::memory_order_relaxed);
+            g_stats.rehook_failed.fetch_add(1, std::memory_order_relaxed);
+        }
         release(*cap);
     }
+}
+
+void feedback_log_summary() {
+    const auto count = [](const std::atomic<unsigned>& value) { return value.load(std::memory_order_relaxed); };
+    logf("mip feedback: variants=%u windows=%u no_variant=%u no_texture=%u output_busy=%u "
+         "submitted=%u empty=%u read_failed=%u samples=%u rehook_failed=%u",
+         count(g_stats.variants), count(g_stats.windows), count(g_stats.no_variant), count(g_stats.no_texture),
+         count(g_stats.output_busy), count(g_stats.submitted), count(g_stats.empty), count(g_stats.read_failed),
+         count(g_stats.samples), count(g_stats.rehook_failed));
 }
 }  // namespace tessera

@@ -637,6 +637,24 @@ int stream() {
         return fail("stream device");
     wchar_t mode[2] = {};
     GetEnvironmentVariableW(L"TESSERA_SMOKE_PREDICT", mode, _countof(mode));
+    wchar_t path[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"TESSERA_SMOKE_ASSET", path, MAX_PATH)) return fail("stream input path");
+    const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return fail("stream open asset");
+    std::vector<BYTE> pixels(65536);
+    const auto read_asset = [&](unsigned block, DWORD bytes) {
+        LARGE_INTEGER offset = {};
+        offset.QuadPart = 65536ull * block;
+        DWORD count = 0;
+        return SetFilePointerEx(file, offset, nullptr, FILE_BEGIN) &&
+               ReadFile(file, pixels.data(), bytes, &count, nullptr) && count == bytes && pixels[0] == 0x53;
+    };
+    const bool learning = mode[0] == L'1';
+    if (learning) {
+        // Fill the old trace before the first material bind without a large fixture.
+        for (unsigned i = 0; i < 4096; ++i)
+            if (!read_asset(1 + i % 32, i < 32 ? 65536 : 4096)) return fail("stream startup reads");
+    }
     if (mode[0]) {
         D3D11_TEXTURE2D_DESC d = {};
         d.Width = d.Height = 64;
@@ -658,20 +676,7 @@ int stream() {
         ctx->PSSetShaderResources(0, _countof(views), views);
         for (auto* view : views) view->Release();
     }
-    wchar_t path[MAX_PATH] = {};
-    if (!GetEnvironmentVariableW(L"TESSERA_SMOKE_ASSET", path, MAX_PATH)) return fail("stream input path");
-    const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return fail("stream open asset");
-    std::vector<BYTE> pixels(65536);
-    for (unsigned i = 1; i <= (mode[0] == L'1' ? 33u : 1u); ++i) {
-        LARGE_INTEGER offset = {};
-        offset.QuadPart = 65536ull * i;
-        DWORD count = 0;
-        if (!SetFilePointerEx(file, offset, nullptr, FILE_BEGIN) ||
-            !ReadFile(file, pixels.data(), static_cast<DWORD>(pixels.size()), &count, nullptr) ||
-            count != pixels.size() || pixels[0] != 0x53)
-            return fail("stream asset read");
-    }
+    if (!read_asset(learning ? 33 : 1, 65536)) return fail("stream asset read");
     CloseHandle(file);
     Sleep(650);  // the learning and prefetch workers run asynchronously
     ctx->Release();

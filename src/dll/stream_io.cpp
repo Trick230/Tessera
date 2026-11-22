@@ -17,6 +17,7 @@
 namespace tessera {
 namespace {
 constexpr unsigned kFiles = 128, kReads = 4096, kHandles = 512;
+constexpr unsigned kUntaggedWithPrediction = kReads / 2;
 constexpr DWORD kMinRead = 4096, kMaxRead = 2u << 20;
 constexpr DWORD kPrefixBytes = 8u << 20, kSessionBytes = 64u << 20;
 constexpr uint32_t kMagic = 0x314f4954;  // TIO1
@@ -39,6 +40,8 @@ struct Trace {
 static_assert(sizeof(File) == 536 && sizeof(Range) == 24 && offsetof(Trace, range) == 68640);
 
 Trace g_trace, g_snapshot;
+unsigned g_untagged_limit = kReads, g_material_ranges = 0;
+unsigned g_saved_ranges = 0, g_saved_material_ranges = 0;
 struct OpenFile {
     std::atomic<HANDLE> handle;
     std::atomic<unsigned> file;
@@ -113,10 +116,16 @@ void record(unsigned file, uint64_t offset, DWORD bytes) {
     const uint64_t size = g_trace.file[file].size;
     if (g_trace.ranges < kReads && offset < size) {
         const uint64_t material = g_material.load(std::memory_order_relaxed);
-        const auto n = static_cast<DWORD>(std::min<uint64_t>(std::min(bytes, kMaxRead), size - offset));
-        const Range& prev = g_trace.range[g_trace.ranges ? g_trace.ranges - 1 : 0];
-        if (!g_trace.ranges || prev.file != file || prev.offset != offset || prev.bytes != n || prev.material != material)
-            g_trace.range[g_trace.ranges++] = {offset, material, file, n};
+        // Early I/O can fill the trace before the first material binds.
+        if (material || g_trace.ranges - g_material_ranges < g_untagged_limit) {
+            const auto n = static_cast<DWORD>(std::min<uint64_t>(std::min(bytes, kMaxRead), size - offset));
+            const Range& prev = g_trace.range[g_trace.ranges ? g_trace.ranges - 1 : 0];
+            if (!g_trace.ranges || prev.file != file || prev.offset != offset || prev.bytes != n ||
+                prev.material != material) {
+                g_trace.range[g_trace.ranges++] = {offset, material, file, n};
+                g_material_ranges += material != 0;
+            }
+        }
     }
     ReleaseSRWLockExclusive(&g_lock);
 }
@@ -225,6 +234,7 @@ void prefetch(const Trace& trace) {
     unsigned remaining = 0;
     for (unsigned i = 0; i < trace.ranges; ++i)
         if (!issued[i] && trace.range[i].material) ++remaining;
+    logf("stream I/O: %u material ranges available after startup", remaining);
     uint64_t last = 0;
     while (remaining && used < kSessionBytes) {
         Sleep(250);
@@ -233,6 +243,7 @@ void prefetch(const Trace& trace) {
         last = current;
         DWORD batch = 0;
         DWORD warmed = 0;
+        unsigned warmed_ranges = 0;
         for (unsigned i = 0; i < trace.ranges && batch < kMaxRead && used < kSessionBytes; ++i) {
             if (issued[i] || trace.range[i].material != current) continue;
             const DWORD cap = std::min(kMaxRead - batch, kSessionBytes - used);
@@ -241,9 +252,12 @@ void prefetch(const Trace& trace) {
             --remaining;
             batch += wanted;
             used += wanted;
-            warmed += warm_range(trace, trace.range[i], cap);
+            const DWORD loaded = warm_range(trace, trace.range[i], cap);
+            warmed += loaded;
+            warmed_ranges += loaded != 0;
         }
-        if (warmed) logf("stream I/O: prefetched %lu KB from a material match", warmed >> 10);
+        if (warmed)
+            logf("stream I/O: prefetched %lu KB from a material match (%u ranges)", warmed >> 10, warmed_ranges);
     }
 }
 
@@ -323,6 +337,7 @@ void stream_start(const wchar_t* exe) {
     g_exe_size = wide(attr.nFileSizeHigh, attr.nFileSizeLow);
     g_exe_modified = wide(attr.ftLastWriteTime.dwHighDateTime, attr.ftLastWriteTime.dwLowDateTime);
     if (mode == 1) {
+        if (config().mip_prediction) g_untagged_limit = kUntaggedWithPrediction;
         g_trace.magic = kMagic;
         g_trace.exe_size = g_exe_size;
         g_trace.exe_modified = g_exe_modified;
@@ -336,13 +351,13 @@ void stream_start(const wchar_t* exe) {
 
 void stream_background_tick() {
     if (!g_learning.load(std::memory_order_acquire)) return;
-    static unsigned saved = 0;
     AcquireSRWLockExclusive(&g_lock);
-    if (saved == g_trace.ranges) {
+    if (g_saved_ranges == g_trace.ranges) {
         ReleaseSRWLockExclusive(&g_lock);
         return;
     }
     g_snapshot = g_trace;
+    const unsigned material_ranges = g_material_ranges;
     ReleaseSRWLockExclusive(&g_lock);
 
     wchar_t temp[MAX_PATH];
@@ -353,9 +368,16 @@ void stream_background_tick() {
     const BOOL ok = WriteFile(out, &g_snapshot, sizeof g_snapshot, &written, nullptr);
     CloseHandle(out);
     if (ok && written == sizeof g_snapshot && MoveFileExW(temp, g_path, MOVEFILE_REPLACE_EXISTING)) {
-        if (!saved) logf("stream I/O: saved learning trace");
-        saved = g_snapshot.ranges;
+        if (!g_saved_ranges) logf("stream I/O: saved learning trace");
+        g_saved_ranges = g_snapshot.ranges;
+        g_saved_material_ranges = material_ranges;
     }
+}
+
+void stream_log_summary() {
+    if (g_learning.load(std::memory_order_acquire))
+        logf("stream I/O: learning trace contains %u ranges, %u with materials", g_saved_ranges,
+             g_saved_material_ranges);
 }
 
 void stream_material(uint64_t key) { g_material.store(key, std::memory_order_relaxed); }

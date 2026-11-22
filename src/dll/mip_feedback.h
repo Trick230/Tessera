@@ -11,4 +11,5 @@ void feedback_on_shader(ID3D11Device* dev, CreatePixelShaderFn create, ID3D11Pix
 void feedback_on_swapchain(IDXGISwapChain* swapchain);
 void feedback_present(IDXGISwapChain* swapchain);
 void feedback_after_present(IDXGISwapChain* swapchain);
+void feedback_log_summary();
 }  // namespace tessera

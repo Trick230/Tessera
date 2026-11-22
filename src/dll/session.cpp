@@ -14,6 +14,7 @@
 #include "dedup.h"
 #include "log.h"
 #include "memory.h"
+#include "mip_feedback.h"
 #include "nvapi.h"
 #include "pacing.h"
 #include "prediction.h"
@@ -355,6 +356,8 @@ void session_shutdown() {
         log_exiting();
         flush(true);
         shaders_shutdown();
+        if (config().stream_io == 1) stream_log_summary();
+        if (config().mip_feedback) feedback_log_summary();
         g_dropped += g_claim_failed.load(std::memory_order_relaxed);
         TesseraRecord end = {};
         LARGE_INTEGER now;

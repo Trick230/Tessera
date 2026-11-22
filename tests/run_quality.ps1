@@ -73,6 +73,7 @@ Copy-Item -LiteralPath "$bin\tessera_test_feedback.exe" -Destination $case
 Copy-Item -LiteralPath "$root\build\src\dll\$Config\tessera_d3d11.dll" -Destination "$case\d3d11.dll"
 $env:TESSERA_DATA_DIR = Join-Path $case "data"
 $test = Join-Path $case "tessera_test_feedback.exe"
+$layerLog = Join-Path $env:TESSERA_DATA_DIR "logs\tessera_test_feedback.exe.log"
 function Read-Records([uint16]$Kind) {
     $log = Get-ChildItem -LiteralPath "$env:TESSERA_DATA_DIR\sessions" -Filter "*.tsess" |
         Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
@@ -116,10 +117,16 @@ foreach ($mode in "--textures", "--textures-hdr", "--textures-changed") {
     if ($feedback.Count -ne 1 -or $feedback[0].A -ne 3 -or $feedback[0].B -ne 2 -or !$feedback[0].Bytes) {
         throw "Missing texture feedback in $mode"
     }
+    if (!(Select-String -LiteralPath $layerLog -Pattern "mip feedback: variants=[1-9]\d* .* submitted=1 .* samples=1 " -Quiet)) {
+        throw "Missing mip feedback diagnostics in $mode"
+    }
 }
 "PASS runtime M6 and M9, including changed texture bypass"
 & $test --layer-occupied $in
 if ($LASTEXITCODE -or @(Read-Records 12).Count -ne 0) {
     throw "Feedback touched a draw whose UAV slot was occupied"
+}
+if (!(Select-String -LiteralPath $layerLog -Pattern "output_busy=[1-9]\d* submitted=0 .* samples=0 " -Quiet)) {
+    throw "Missing occupied UAV diagnostics"
 }
 "PASS occupied UAV left alone"

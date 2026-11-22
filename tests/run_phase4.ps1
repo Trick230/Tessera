@@ -39,12 +39,15 @@ for ($i = 1; $i -lt 34; ++$i) { $asset[$i * 65536] = 0x53 }
 Set-Options @("stream_io=1", "mip_prediction=1")
 $env:TESSERA_SMOKE_PREDICT = "1"
 & $exe --stream | Write-Host
-if ($LASTEXITCODE -or -not (Test-Log "saved learning trace")) { throw "Stream learning test failed" }
+if ($LASTEXITCODE -or -not (Test-Log "learning trace contains 2049 ranges, 1 with materials")) {
+    throw "Stream learning failed to reserve room for the later material read"
+}
 
 Set-Options @("stream_io=2", "mip_prediction=1")
 $env:TESSERA_SMOKE_PREDICT = "2"
 & $exe --stream | Write-Host
-if ($LASTEXITCODE -or -not (Test-Log "2048 KB from the startup list") -or -not (Test-Log "64 KB from a material match")) {
+if ($LASTEXITCODE -or -not (Test-Log "2048 KB from the startup list") -or
+    -not (Test-Log "64 KB from a material match \(1 ranges\)")) {
     throw "Startup and material prefetch test failed"
 }
 (Get-Item -LiteralPath $env:TESSERA_SMOKE_ASSET).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-1)
