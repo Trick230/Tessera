@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Layer smoke test: clean run + session check, then safe mode after two crashes.
-#   powershell -File tests/run_smoke.ps1 [-Config Release] [-PacingOnly]
-param([string]$Config = "Release", [switch]$PacingOnly)
+#   powershell -File tests/run_smoke.ps1 [-Config Release] [-PacingOnly] [-D3D11CallsOnly]
+param([string]$Config = "Release", [switch]$PacingOnly, [switch]$D3D11CallsOnly)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "build\tests\d3d11_smoke\$Config\d3d11_smoke.exe"
@@ -40,8 +40,40 @@ function CheckPacing {
     } finally { $env:TESSERA_DATA_DIR = $previousDataDir }
 }
 
-if ($PacingOnly) {
-    CheckPacing
+function CheckD3D11Calls {
+    $bin = Split-Path $exe
+    $run = Join-Path $root "build\d3d11-calls-smoke\$([guid]::NewGuid())"
+    New-Item -ItemType Directory -Path $run -Force | Out-Null
+    Copy-Item -LiteralPath $exe, "$bin\d3d11.dll", "$bin\load_probe.dll" -Destination $run
+    $previousDataDir = $env:TESSERA_DATA_DIR
+    try {
+        foreach ($enabled in @(0, 1)) {
+            $env:TESSERA_DATA_DIR = Join-Path $run "data-$enabled"
+            Set-Content "$run\tessera.ini" -Value "[tessera]`nnext=load_probe.dll`nd3d11_call_diagnostics=$enabled" -Encoding ascii
+            & "$run\d3d11_smoke.exe" --d3d11-calls | Write-Host
+            Check "D3D11 calls forward with diagnostics $enabled" ($LASTEXITCODE -eq 0)
+            $session = Get-ChildItem "$env:TESSERA_DATA_DIR\sessions\*.tsess" | Select-Object -First 1
+            $csv = & $layer calls $session.FullName
+            Check "D3D11 call CSV export" ($LASTEXITCODE -eq 0)
+            $calls = @($csv | ConvertFrom-Csv | Where-Object { $_.call -in @("Map", "GetData", "UpdateSubresource", "Flush", "UpdateSubresource1", "Flush1") })
+            if ($enabled -eq 0) {
+                Check "diagnostics off reports no context calls" ($calls.Count -eq 0)
+            } else {
+                Check "all six slow context calls logged" (@($calls.call | Sort-Object -Unique).Count -eq 6)
+                Check "context call intervals and thread IDs" ($calls.Count -gt 0 -and
+                    @($calls | Where-Object { [uint64]$_.start_qpc -ge [uint64]$_.end_qpc -or
+                        [int]$_.duration_us -lt 1000 -or [uint32]$_.thread_id -eq 0 }).Count -eq 0)
+                Check "Map mode and GetData flags retained" (
+                    @($calls | Where-Object { $_.call -eq 'Map' -and $_.argument -eq '1' -and $_.hresult -eq '0x00000000' }).Count -eq 1 -and
+                    @($calls | Where-Object { $_.call -eq 'GetData' -and $_.flags -eq '0x00000001' }).Count -gt 0)
+            }
+        }
+    } finally { $env:TESSERA_DATA_DIR = $previousDataDir }
+}
+
+if ($PacingOnly -or $D3D11CallsOnly) {
+    if ($PacingOnly) { CheckPacing }
+    if ($D3D11CallsOnly) { CheckD3D11Calls }
     if ($fails) { exit 1 }
     exit 0
 }
@@ -104,6 +136,7 @@ try {
 } finally { Remove-Item $ini; Remove-Item Env:TESSERA_SMOKE_CAP_MB }
 
 CheckPacing
+CheckD3D11Calls
 
 # R1: a released big render target comes back on the next matching create; held ones and initial data never.
 Set-Content -Path $ini -Value "[tessera]`nrt_recycle=1" -Encoding ascii

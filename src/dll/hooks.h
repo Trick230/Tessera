@@ -6,6 +6,10 @@
 #include <dxgi1_2.h>
 
 namespace tessera {
+
+// Flush is shared by the diagnostics and residency hooks.
+bool hook_context_flush(ID3D11DeviceContext* ctx, bool readopt = false);
+void rehook_context_flush(ID3D11DeviceContext* ctx);
 // Called after the real D3D11CreateDevice* succeeded.
 void on_device(ID3D11Device* dev, UINT create_flags);
 void on_swapchain(IDXGISwapChain* sc);

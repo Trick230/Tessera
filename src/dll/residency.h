@@ -24,6 +24,7 @@ void residency_on_context(ID3D11DeviceContext* ctx);
 // immediate-context methods then; patches them again (also the meter's).
 // imm: that device's immediate context; others are ignored.
 void residency_check_hooks(ID3D11DeviceContext* imm);
+void residency_after_flush(ID3D11DeviceContext* ctx);
 // Game texture creation (outer call). Creates a managed texture through the
 // original create and returns true when the texture qualifies; false leaves
 // the creation to the caller.

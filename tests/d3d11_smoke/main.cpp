@@ -6,7 +6,7 @@
 //   d3d11_smoke --pacing [driver]   measure recovery after a late frame or verify driver handoff
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
-#include <d3d11_2.h>
+#include <d3d11_3.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
@@ -566,6 +566,65 @@ int pacing_mode(bool driver) {
     sc->Release();
     dev->Release();
     DestroyWindow(wnd);
+    return 0;
+}
+
+int d3d11_calls_mode(bool bench) {
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                         D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+    if (FAILED(hr)) return fail("create diagnostics device", hr);
+    D3D11_QUERY_DESC query_desc = {D3D11_QUERY_EVENT, 0};
+    ID3D11Query* query = nullptr;
+    if (FAILED(dev->CreateQuery(&query_desc, &query))) return fail("create event query");
+
+    if (!bench) {
+        D3D11_BUFFER_DESC desc = {16, D3D11_USAGE_DEFAULT, 0, 0, 0, 0};
+        ID3D11Buffer* buffer = nullptr;
+        if (FAILED(dev->CreateBuffer(&desc, nullptr, &buffer))) return fail("create default buffer");
+        const UINT data[4] = {8, 6, 4, 2};
+        ctx->UpdateSubresource(buffer, 0, nullptr, data, 0, 0);
+        ID3D11DeviceContext1* c1 = nullptr;
+        if (FAILED(ctx->QueryInterface(IID_PPV_ARGS(&c1)))) return fail("get context1");
+        c1->UpdateSubresource1(buffer, 0, nullptr, data, 0, 0, 0);
+        c1->Release();
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Buffer* staging = nullptr;
+        if (FAILED(dev->CreateBuffer(&desc, nullptr, &staging))) return fail("create readback buffer");
+        ctx->CopyResource(staging, buffer);
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) return fail("read back updated buffer");
+        const bool data_ok = std::memcmp(mapped.pData, data, sizeof data) == 0;
+        ctx->Unmap(staging, 0);
+        staging->Release();
+        buffer->Release();
+        if (!data_ok) return fail("UpdateSubresource and Map data changed");
+    }
+
+    ctx->End(query);
+    ctx->Flush();
+    if (!bench) {
+        ID3D11DeviceContext3* c3 = nullptr;
+        if (FAILED(ctx->QueryInterface(IID_PPV_ARGS(&c3)))) return fail("get context3");
+        c3->Flush1(D3D11_CONTEXT_TYPE_ALL, nullptr);
+        c3->Release();
+    }
+    const HRESULT ready = ctx->GetData(query, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (FAILED(ready)) return fail("GetData event poll", ready);
+    if (bench) {
+        LARGE_INTEGER freq, start, stop;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&start);
+        for (unsigned i = 0; i < 2000000; ++i)
+            if (FAILED(ctx->GetData(query, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH))) return fail("GetData probe");
+        QueryPerformanceCounter(&stop);
+        std::printf("GetData %.1f ns/call\n", (stop.QuadPart - start.QuadPart) * 500.0 / freq.QuadPart);
+    }
+    query->Release();
+    ctx->Release();
+    dev->Release();
     return 0;
 }
 }  // namespace
@@ -1337,6 +1396,8 @@ int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--tiled") == 0) return tiled();
     if (argc >= 2 && wcscmp(argv[1], L"--nvapi") == 0) return nvapi_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--pacing") == 0) return pacing_mode(argc >= 3 && wcscmp(argv[2], L"driver") == 0);
+    if (argc >= 2 && wcscmp(argv[1], L"--d3d11-calls") == 0)
+        return d3d11_calls_mode(argc >= 3 && wcscmp(argv[2], L"bench") == 0);
     if (argc >= 3 && wcscmp(argv[1], L"--verify") == 0) return verify(argv[2], argc >= 4 ? _wtoi(argv[3]) : 0);
     return run(argc >= 2 && wcscmp(argv[1], L"--crash") == 0);
 }

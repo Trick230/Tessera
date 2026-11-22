@@ -29,7 +29,6 @@ constexpr int kCtxCopyResource = 47;
 constexpr int kCtxSetResourceMinLOD = 55;
 constexpr int kCtxGetResourceMinLOD = 56;
 constexpr int kCtxExecuteCommandList = 58;
-constexpr int kCtxFlush = 111;
 constexpr int kCtx1CopySubresourceRegion1 = 115;
 constexpr int kCtx1SwapDeviceContextState = 131;
 constexpr int kCtx2UpdateTileMappings = 134;
@@ -183,11 +182,9 @@ HRESULT STDMETHODCALLTYPE hk_CopyMap(ID3D11DeviceContext2*, ID3D11Resource*, con
                                      ID3D11Resource*, const D3D11_TILED_RESOURCE_COORDINATE*,
                                      const D3D11_TILE_REGION_SIZE*, UINT);
 HRESULT STDMETHODCALLTYPE hk_ResizePool(ID3D11DeviceContext2*, ID3D11Buffer*, UINT64);
-void STDMETHODCALLTYPE hk_Flush(ID3D11DeviceContext*);
 VtHook g_map = {kCtx2UpdateTileMappings, reinterpret_cast<void*>(&hk_Map)};
 VtHook g_copy_map = {kCtx2CopyTileMappings, reinterpret_cast<void*>(&hk_CopyMap)};
 VtHook g_resize_pool = {kCtx2ResizeTilePool, reinterpret_cast<void*>(&hk_ResizePool)};
-VtHook g_flush = {kCtxFlush, reinterpret_cast<void*>(&hk_Flush)};
 VtHook g_set_lod = {kCtxSetResourceMinLOD, reinterpret_cast<void*>(&hk_SetLod)};
 VtHook g_get_lod = {kCtxGetResourceMinLOD, reinterpret_cast<void*>(&hk_GetLod)};
 VtHook g_exec = {kCtxExecuteCommandList, reinterpret_cast<void*>(&hk_Exec)};
@@ -834,12 +831,6 @@ HRESULT STDMETHODCALLTYPE hk_ResizePool(ID3D11DeviceContext2* self, ID3D11Buffer
 }
 
 // Flush switches the copy methods too: a copy right after would go unseen.
-void STDMETHODCALLTYPE hk_Flush(ID3D11DeviceContext* self) {
-    using F = decltype(&hk_Flush);
-    orig<F>(g_flush, self)(self);
-    if (self == g_imm) residency_check_hooks(self);
-}
-
 // A swapped-in state rebinds views we never see bound: stop evicting.
 void STDMETHODCALLTYPE hk_SwapState(ID3D11DeviceContext1* self, ID3DDeviceContextState* state,
                                     ID3DDeviceContextState** prev) {
@@ -910,7 +901,7 @@ bool hook_context(ID3D11DeviceContext* ctx, bool immediate) {
     bool ok = vt_hook(g_copy_sub, ctx, re) && vt_hook(g_copy_res, ctx, re) && vt_hook(g_set_lod, ctx, re) &&
               vt_hook(g_get_lod, ctx, re);
     if (immediate) ok = ok && vt_hook(g_exec, ctx) && vt_hook(g_map, ctx) && vt_hook(g_copy_map, ctx) &&
-                        vt_hook(g_resize_pool, ctx) && vt_hook(g_flush, ctx);
+                        vt_hook(g_resize_pool, ctx) && hook_context_flush(ctx);
     ID3D11DeviceContext1* c1 = nullptr;
     if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&c1)))) {
         ok = ok && vt_hook(g_copy_sub1, c1, re) && vt_hook(g_swap_state, c1, re);
@@ -1267,11 +1258,15 @@ void residency_check_hooks(ID3D11DeviceContext* imm) {
                      &g_copy_sub1, &g_swap_state})
         if (h->n) ok = vt_rehook(*h, ours) && ok;
     // Flush only re-checks the others: another tool chained over it stops nothing.
-    if (g_flush.n) vt_rehook(g_flush, ours);
+    rehook_context_flush(ours);
     if (!ok && !g_evict_off.exchange(true)) {
         logf("residency: context hooks overwritten; evictions off");
         g_restore_due.store(true, std::memory_order_release);
     }
+}
+
+void residency_after_flush(ID3D11DeviceContext* ctx) {
+    if (ctx == g_imm) residency_check_hooks(ctx);
 }
 
 void residency_on_context(ID3D11DeviceContext* ctx) {

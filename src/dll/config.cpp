@@ -39,6 +39,7 @@ BOOL CALLBACK load_once(PINIT_ONCE, void*, void**) {
     if (c.fps_limit && c.fps_limit < 20) c.fps_limit = 0;  // nonsense values: off
     c.ext_fps_limit = clamp_int(get(L"ext_fps_limit", 0), 0, 1000);
     c.max_frame_latency = clamp_int(get(L"max_frame_latency", 0), 0, 16);
+    c.d3d11_call_diagnostics = get(L"d3d11_call_diagnostics", 0) != 0;
     c.vram_budget_mb = clamp_int(get(L"vram_budget_mb", 0), 0, 1 << 20);
     if (c.vram_budget_mb && c.vram_budget_mb < 1024) c.vram_budget_mb = 0;  // below 1 GB: a typo, off
     c.flip_model = get(L"flip_model", 0) != 0;

@@ -231,6 +231,7 @@ pub fn save_settings(dir: &Path, s: &Settings) -> io::Result<()> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdvancedSettings {
     pub max_frame_latency: u32,
+    pub d3d11_call_diagnostics: bool,
     pub present_cpu_sets: bool,
     pub mip_residency: bool,
     pub mip_prediction: bool,
@@ -249,6 +250,7 @@ pub fn advanced_settings(dir: &Path) -> AdvancedSettings {
         let value = value.trim().parse::<u32>().unwrap_or(0);
         match key.trim().to_ascii_lowercase().as_str() {
             "max_frame_latency" => out.max_frame_latency = value.min(16),
+            "d3d11_call_diagnostics" => out.d3d11_call_diagnostics = value != 0,
             "present_cpu_sets" => out.present_cpu_sets = value != 0,
             "mip_residency" => out.mip_residency = value != 0,
             "mip_prediction" => out.mip_prediction = value != 0,
@@ -276,7 +278,7 @@ pub fn save_advanced_setting(dir: &Path, key: &str, value: u32, stream_levels: O
         "max_frame_latency" => 16,
         "stream_io" | "texture_quality" => 2,
         "present_cpu_sets" | "mip_residency" | "mip_prediction" | "mip_streaming" |
-        "texture_dedup" | "mip_feedback" => 1,
+        "texture_dedup" | "mip_feedback" | "d3d11_call_diagnostics" => 1,
         _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown setting")),
     };
     if value > max {

@@ -34,6 +34,12 @@ constexpr int kDevCreateDeferredContext = 27;
 constexpr int kDev1CreateDeferredContext1 = 44;
 constexpr int kDev2CreateDeferredContext2 = 51;
 constexpr int kDev3CreateDeferredContext3 = 62;
+constexpr int kCtxMap = 14;
+constexpr int kCtxGetData = 29;
+constexpr int kCtxUpdate = 48;
+constexpr int kCtxFlush = 111;
+constexpr int kCtx1Update = 116;
+constexpr int kCtx3Flush = 144;
 constexpr int kFactoryCreateSwapChain = 10;
 constexpr int kFactory2CreateSwapChainForHwnd = 15;
 constexpr int kFactory2CreateSwapChainForCoreWindow = 16;
@@ -59,27 +65,64 @@ uint64_t now_qpc() {
 
 std::atomic<DWORD> g_present_tid{0};  // last thread that presented
 
-// After the record r of a game create that began at t0: a SLOW_CREATE record
-// when the call took >= 1 ms (where the driver stalls, and on which thread).
-void push_slow_create(const TesseraRecord& r, uint64_t t0) {
+uint32_t elapsed_us(uint64_t start, uint64_t end) {
     static const uint64_t freq = [] {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         return static_cast<uint64_t>(f.QuadPart);
     }();
-    const uint64_t us = (r.qpc - t0) * 1000000 / freq;
+    const uint64_t us = (end - start) * 1000000 / freq;
+    return us > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(us);
+}
+
+// After the record r of a game create that began at t0: a SLOW_CREATE record
+// when the call took >= 1 ms (where the driver stalls, and on which thread).
+void push_slow_create(const TesseraRecord& r, uint64_t t0) {
+    const uint32_t us = elapsed_us(t0, r.qpc);
     if (us < 1000) return;
     TesseraRecord s = {};
     s.qpc = r.qpc;
     s.kind = TESSERA_REC_SLOW_CREATE;
     s.format = r.format;
-    s.a = static_cast<uint32_t>(us);
+    s.a = us;
     s.b = GetCurrentThreadId();
     s.c = r.kind;
     s.d = s.b == g_present_tid.load(std::memory_order_relaxed);
     s.bytes = r.bytes;
     session_push(s);
 }
+
+void push_slow_context_call(uint64_t start, TesseraD3D11Call call, void* caller, UINT flags = 0,
+                            UINT arg = 0, HRESULT result = S_OK) {
+    if (!start) return;
+    const uint64_t end = now_qpc();
+    const uint32_t us = elapsed_us(start, end);
+    if (us < 1000 || !is_game_code(caller)) return;
+    TesseraRecord r = {};
+    r.qpc = end;
+    r.kind = TESSERA_REC_SLOW_D3D11;
+    r.format = static_cast<uint16_t>(call);
+    r.a = us;
+    r.b = GetCurrentThreadId();
+    r.c = arg;
+    r.d = static_cast<uint32_t>(result);
+    r.flags = flags | (r.b == g_present_tid.load(std::memory_order_relaxed) ? TESSERA_CALL_PRESENT_THREAD : 0);
+    r.bytes = start;
+    session_push(r);
+}
+
+HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
+HRESULT STDMETHODCALLTYPE hk_GetData(ID3D11DeviceContext*, ID3D11Asynchronous*, void*, UINT, UINT);
+void STDMETHODCALLTYPE hk_Update(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT);
+void STDMETHODCALLTYPE hk_Update1(ID3D11DeviceContext1*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT, UINT);
+void STDMETHODCALLTYPE hk_Flush(ID3D11DeviceContext*);
+void STDMETHODCALLTYPE hk_Flush1(ID3D11DeviceContext3*, D3D11_CONTEXT_TYPE, HANDLE);
+VtHook g_map = {kCtxMap, reinterpret_cast<void*>(&hk_Map)};
+VtHook g_get_data = {kCtxGetData, reinterpret_cast<void*>(&hk_GetData)};
+VtHook g_update = {kCtxUpdate, reinterpret_cast<void*>(&hk_Update)};
+VtHook g_update1 = {kCtx1Update, reinterpret_cast<void*>(&hk_Update1)};
+VtHook g_flush = {kCtxFlush, reinterpret_cast<void*>(&hk_Flush)};
+VtHook g_flush1 = {kCtx3Flush, reinterpret_cast<void*>(&hk_Flush1)};
 
 HRESULT STDMETHODCALLTYPE hk_CreateBuffer(ID3D11Device*, const D3D11_BUFFER_DESC*, const D3D11_SUBRESOURCE_DATA*,
                                           ID3D11Buffer**);
@@ -124,6 +167,77 @@ VtHook g_resize = {kSwapResizeBuffers, reinterpret_cast<void*>(&hk_ResizeBuffers
 template <class F>
 F orig(const VtHook& h, void* self) {
     return reinterpret_cast<F>(vt_orig(h, self));
+}
+
+HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* resource, UINT subresource,
+                                 D3D11_MAP mode, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
+    Depth depth;
+    const uint64_t start = depth.outer() ? now_qpc() : 0;
+    const HRESULT hr = orig<decltype(&hk_Map)>(g_map, self)(self, resource, subresource, mode, flags, mapped);
+    push_slow_context_call(start, TESSERA_CALL_MAP, _ReturnAddress(), flags, mode, hr);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hk_GetData(ID3D11DeviceContext* self, ID3D11Asynchronous* query, void* data,
+                                     UINT size, UINT flags) {
+    Depth depth;
+    const uint64_t start = depth.outer() ? now_qpc() : 0;
+    const HRESULT hr = orig<decltype(&hk_GetData)>(g_get_data, self)(self, query, data, size, flags);
+    push_slow_context_call(start, TESSERA_CALL_GET_DATA, _ReturnAddress(), flags, 0, hr);
+    return hr;
+}
+
+void STDMETHODCALLTYPE hk_Update(ID3D11DeviceContext* self, ID3D11Resource* resource, UINT subresource,
+                                 const D3D11_BOX* box, const void* data, UINT row_pitch, UINT depth_pitch) {
+    Depth depth;
+    const uint64_t start = depth.outer() ? now_qpc() : 0;
+    orig<decltype(&hk_Update)>(g_update, self)(self, resource, subresource, box, data, row_pitch, depth_pitch);
+    push_slow_context_call(start, TESSERA_CALL_UPDATE_SUBRESOURCE, _ReturnAddress());
+}
+
+void STDMETHODCALLTYPE hk_Update1(ID3D11DeviceContext1* self, ID3D11Resource* resource, UINT subresource,
+                                  const D3D11_BOX* box, const void* data, UINT row_pitch, UINT depth_pitch, UINT flags) {
+    Depth depth;
+    const uint64_t start = depth.outer() ? now_qpc() : 0;
+    orig<decltype(&hk_Update1)>(g_update1, self)(self, resource, subresource, box, data, row_pitch, depth_pitch, flags);
+    push_slow_context_call(start, TESSERA_CALL_UPDATE_SUBRESOURCE1, _ReturnAddress(), flags);
+}
+
+void STDMETHODCALLTYPE hk_Flush(ID3D11DeviceContext* self) {
+    if (config().d3d11_call_diagnostics) {
+        Depth depth;
+        const uint64_t start = depth.outer() ? now_qpc() : 0;
+        orig<decltype(&hk_Flush)>(g_flush, self)(self);
+        push_slow_context_call(start, TESSERA_CALL_FLUSH, _ReturnAddress());
+    } else {
+        orig<decltype(&hk_Flush)>(g_flush, self)(self);
+    }
+    residency_after_flush(self);
+}
+
+void STDMETHODCALLTYPE hk_Flush1(ID3D11DeviceContext3* self, D3D11_CONTEXT_TYPE type, HANDLE event) {
+    Depth depth;
+    const uint64_t start = depth.outer() ? now_qpc() : 0;
+    orig<decltype(&hk_Flush1)>(g_flush1, self)(self, type, event);
+    push_slow_context_call(start, TESSERA_CALL_FLUSH1, _ReturnAddress(), 0, type);
+}
+
+bool hook_d3d11_calls(ID3D11DeviceContext* ctx, bool deferred) {
+    bool ok = vt_hook(g_map, ctx, deferred);
+    ok = vt_hook(g_get_data, ctx, deferred) && ok;
+    ok = vt_hook(g_update, ctx, deferred) && ok;
+    ok = hook_context_flush(ctx, deferred) && ok;
+    ID3D11DeviceContext1* c1 = nullptr;
+    if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&c1)))) {
+        ok = vt_hook(g_update1, c1, deferred) && ok;
+        c1->Release();
+    }
+    ID3D11DeviceContext3* c3 = nullptr;
+    if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&c3)))) {
+        ok = vt_hook(g_flush1, c3, deferred) && ok;
+        c3->Release();
+    }
+    return ok;
 }
 
 constexpr UINT kSharedMisc = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
@@ -244,6 +358,8 @@ void on_deferred(ID3D11DeviceContext* ctx) {
     vt_track(ctx);
     workset_on_context(ctx);
     residency_on_context(ctx);
+    if (config().d3d11_call_diagnostics && !hook_d3d11_calls(ctx, true))
+        logf("D3D11 call diagnostics: incomplete deferred context hooks");
     if (config().texture_quality == 2) quality_context_hooks(ctx, true);
 }
 
@@ -540,6 +656,14 @@ bool flip_hooks_ready() {
 InternalCall::InternalCall() { ++t_depth; }
 InternalCall::~InternalCall() { --t_depth; }
 
+bool hook_context_flush(ID3D11DeviceContext* ctx, bool readopt) {
+    return vt_hook(g_flush, ctx, readopt);
+}
+
+void rehook_context_flush(ID3D11DeviceContext* ctx) {
+    if (g_flush.n) vt_rehook(g_flush, ctx);
+}
+
 
 void on_swapchain(IDXGISwapChain* sc) {
     {
@@ -593,6 +717,12 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
     workset_on_device(dev);
     rtpool_on_device(dev, ok);
     residency_on_device(dev);
+    if (config().d3d11_call_diagnostics) {
+        ID3D11DeviceContext* ctx = nullptr;
+        dev->GetImmediateContext(&ctx);
+        logf("D3D11 call diagnostics: %s", ctx && hook_d3d11_calls(ctx, false) ? "on" : "incomplete immediate context hooks");
+        if (ctx) ctx->Release();
+    }
     if (config().texture_quality == 2) quality_register_device(dev);
     // After the modules: a context made from here on gets their hooks.
     bool def_ok = vt_hook(g_create_def, dev);

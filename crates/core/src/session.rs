@@ -21,8 +21,14 @@ pub const REC_VRAM: u16 = 7;
 pub const REC_SHADER: u16 = 8;
 pub const REC_WORKSET: u16 = 9;
 pub const REC_RESIDENCY: u16 = 10;
+pub const REC_SLOW_CREATE: u16 = 11;
 pub const REC_MIP_FEEDBACK: u16 = 12;
+pub const REC_SLOW_D3D11: u16 = 13;
 pub const REC_END: u16 = 0xFFFF;
+
+pub const CALL_PRESENT_THREAD: u32 = 0x8000_0000;
+pub const D3D11_CALL_NAMES: [&str; 6] =
+    ["Map", "GetData", "Flush", "UpdateSubresource", "Flush1", "UpdateSubresource1"];
 
 /// Resource created by code outside the game's folder (overlay, SDK).
 pub const FLAG_FOREIGN: u32 = 0x8000_0000;
@@ -61,6 +67,12 @@ pub struct Header {
     pub exe_path: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlowCallStats {
+    pub count: u64,
+    pub max_us: u32,
+}
+
 /// Aggregates of one session, enough for the detail panel and the planner.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Summary {
@@ -95,6 +107,9 @@ pub struct Summary {
     /// D2: hitches while the game used more VRAM than the OS budget (and
     /// not creating resources): paging between VRAM and system memory.
     pub hitches_over_budget: u64,
+    /// Hitches overlapping at least one slow D3D11 context call, on any game thread.
+    pub hitches_overlapping_d3d11: u64,
+    pub d3d11_calls: [SlowCallStats; D3D11_CALL_NAMES.len()],
     /// M1 samples (about one a second): lowest real budget, highest usage
     /// and seconds spent over budget, in MB. Zero when the layer had no samples.
     pub vram_budget_mb: u32,
@@ -237,6 +252,43 @@ pub fn records(b: &[u8], header_size: usize, record_size: usize) -> impl Iterato
     })
 }
 
+/// Reconstruct a start when the log only contains a rounded duration.
+fn start_qpc(end: u64, duration_us: u32, frequency: u64) -> u64 {
+    let ticks = u128::from(duration_us) * u128::from(frequency) / 1_000_000;
+    end.saturating_sub(u64::try_from(ticks).unwrap_or(u64::MAX))
+}
+
+/// Export slow D3D11 calls with the same clock as PresentMon's QPC timestamps.
+pub fn write_d3d11_calls_csv(b: &[u8], mut out: impl std::io::Write) -> Result<(), Error> {
+    let (header, hs, rs) = parse_header(b)?;
+    if b.len() < hs {
+        return Err(Error::Format("tamanhos"));
+    }
+    writeln!(out, "pid,call,start_qpc,end_qpc,duration_us,thread_id,present_thread,argument,flags,hresult,resource_bytes")?;
+    for r in records(b, hs, rs) {
+        let (name, start, present, argument, flags, result, size) = match r.kind {
+            REC_SLOW_D3D11 if r.bytes < r.qpc => {
+                let Some(name) = r.format.checked_sub(1).and_then(|i| D3D11_CALL_NAMES.get(usize::from(i))) else {
+                    continue;
+                };
+                (*name, r.bytes, r.flags & CALL_PRESENT_THREAD != 0, r.c, r.flags & !CALL_PRESENT_THREAD, r.d, 0)
+            }
+            REC_SLOW_CREATE => {
+                let name = match u16::try_from(r.c).ok() {
+                    Some(REC_TEXTURE2D) => "CreateTexture2D",
+                    Some(REC_BUFFER) => "CreateBuffer",
+                    _ => continue,
+                };
+                (name, start_qpc(r.qpc, r.a, header.qpc_frequency), r.d != 0, 0, 0, 0, r.bytes)
+            }
+            _ => continue,
+        };
+        writeln!(out, "{},{name},{start},{},{},{},{},{argument},0x{flags:08X},0x{result:08X},{size}",
+            header.pid, r.qpc, r.a, r.b, u8::from(present))?;
+    }
+    Ok(())
+}
+
 /// Nearest-rank percentile of a sorted slice.
 fn percentile(sorted: &[u32], p: f64) -> u32 {
     if sorted.is_empty() {
@@ -258,6 +310,7 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
     let mut creating: Vec<bool> = Vec::with_capacity(frame_us.capacity());
     let mut over: Vec<bool> = Vec::with_capacity(frame_us.capacity());
     let mut compiling: Vec<bool> = Vec::with_capacity(frame_us.capacity());
+    let mut slow_call_spans = Vec::<(u64, u64)>::new();
     let mut shader_now = false;
     let mut shader_us = 0u64;
     let mut over_now = false;
@@ -304,6 +357,13 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
                 s.recompressed_textures += u64::from(r.flags & FLAG_RECOMPRESSED != 0);
             }
             REC_MIP_FEEDBACK => s.mip_feedback_samples += 1,
+            REC_SLOW_D3D11 if r.bytes < r.qpc => {
+                if let Some(stats) = r.format.checked_sub(1).and_then(|i| s.d3d11_calls.get_mut(usize::from(i))) {
+                    stats.count += 1;
+                    stats.max_us = stats.max_us.max(r.a);
+                    slow_call_spans.push((r.bytes, r.qpc));
+                }
+            }
             REC_BUFFER => {
                 s.buffers += 1;
                 s.buffer_bytes = s.buffer_bytes.saturating_add(r.bytes);
@@ -379,6 +439,23 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
                 s.hitches_shaders += sh as u64;
                 s.hitches_creating += (!sh && c) as u64;
                 s.hitches_over_budget += (!sh && !c && o) as u64;
+            }
+        }
+        if !slow_call_spans.is_empty() {
+            // Records from worker threads are published on return, possibly
+            // after the frame they overlapped. Index the intervals by QPC.
+            slow_call_spans.sort_unstable_by_key(|span| span.0);
+            let mut latest_end = 0;
+            for (_, end) in &mut slow_call_spans {
+                latest_end = latest_end.max(*end);
+                *end = latest_end;
+            }
+            for frame in records(b, hs, rs).filter(|r| r.kind == REC_FRAME && r.a > limit && r.a != u32::MAX) {
+                let first = start_qpc(frame.qpc, frame.a, s.header.qpc_frequency);
+                let upto = slow_call_spans.partition_point(|span| span.0 < frame.qpc);
+                if upto > 0 && slow_call_spans[upto - 1].1 > first {
+                    s.hitches_overlapping_d3d11 += 1;
+                }
             }
         }
     }
@@ -510,6 +587,33 @@ mod tests {
 
     fn header(freq: u64) -> Vec<u8> {
         header_for(freq, "C:\\g\\game.exe")
+    }
+
+    #[test]
+    fn d3d11_calls_overlap_earlier_frames_and_export_exact_qpc() {
+        let mut b = header(1_000_000);
+        for (end, us) in [(10_000, 10_000), (20_000, 10_000), (70_000, 50_000),
+                          (80_000, 10_000), (90_000, 10_000), (140_000, 50_000)] {
+            rec(&mut b, end, REC_FRAME, us, 0, 0);
+        }
+        // This worker's Map returned after the first hitch. The second span
+        // starts just after the second hitch and should not be counted.
+        for (start, end) in [(60_000, 75_000), (140_000, 144_000)] {
+            let offset = b.len();
+            rec_full(&mut b, end, REC_SLOW_D3D11, CALL_PRESENT_THREAD | 0x100000,
+                     [(end - start) as u32, 55, 1, 0x887a000a], start);
+            b[offset + 10..offset + 12].copy_from_slice(&1u16.to_le_bytes());
+        }
+        rec_full(&mut b, 150_000, REC_SLOW_CREATE, 0, [2_000, 55, u32::from(REC_TEXTURE2D), 0], 4096);
+        let sum = summarize(&b).unwrap();
+        assert_eq!(sum.hitches, 2);
+        assert_eq!(sum.hitches_overlapping_d3d11, 1);
+        assert_eq!(sum.d3d11_calls[0], SlowCallStats { count: 2, max_us: 15_000 });
+        let mut csv = Vec::new();
+        write_d3d11_calls_csv(&b, &mut csv).unwrap();
+        let csv = String::from_utf8(csv).unwrap();
+        assert!(csv.contains(",Map,60000,75000,15000,55,1,1,0x00100000,0x887A000A,0\n"));
+        assert!(csv.contains(",CreateTexture2D,148000,150000,2000,55,0,0,0x00000000,0x00000000,4096\n"));
     }
 
     fn header_for(freq: u64, exe: &str) -> Vec<u8> {

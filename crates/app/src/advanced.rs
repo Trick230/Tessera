@@ -63,6 +63,7 @@ impl Facts {
         let status = self.quality;
         AdvancedOptions {
             max_frame_latency: current.max_frame_latency as i32,
+            d3d11_call_diagnostics: current.d3d11_call_diagnostics,
             present_cpu_sets: current.present_cpu_sets,
             hybrid: self.hybrid,
             mip_residency: current.mip_residency,

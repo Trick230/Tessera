@@ -5,6 +5,7 @@
 //! `cargo run -p tessera-core --example layer -- status <game exe dir>`
 //! `cargo run -p tessera-core --example layer -- crashes <game exe>` (safe-mode counter)
 //! `cargo run -p tessera-core --example layer -- warm <game exe> <tessera_warm.exe>` (S5)
+//! `cargo run -p tessera-core --example layer -- calls <session.tsess>` (CSV to stdout)
 
 use std::path::Path;
 use tessera_core::{install, session};
@@ -12,10 +13,19 @@ use tessera_core::{install, session};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage = || -> ! {
-        eprintln!("usage: layer install <dir> <payload> | uninstall <dir> | status <dir> | ue <dir> <exe> | crashes <exe> | warm <exe> <warm exe>");
+        eprintln!("usage: layer install <dir> <payload> | uninstall <dir> | status <dir> | ue <dir> <exe> | crashes <exe> | warm <exe> <warm exe> | calls <session.tsess>");
         std::process::exit(2)
     };
     let dir = Path::new(args.get(1).unwrap_or_else(|| usage()));
+    if args[0] == "calls" {
+        let result = std::fs::read(dir).map_err(session::Error::from)
+            .and_then(|b| session::write_d3d11_calls_csv(&b, std::io::stdout().lock()));
+        if let Err(e) = result {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let result = match args[0].as_str() {
         "install" => install::install(dir, Path::new(args.get(2).unwrap_or_else(|| usage())), install::PROXY_D3D11),
         "uninstall" => install::uninstall(dir),

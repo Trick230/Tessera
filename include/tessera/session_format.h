@@ -56,7 +56,20 @@ enum TesseraRecordKind {
                                 // record: a = call us, b = thread id, c = kind of that record,
                                 // d = 1 if the thread also presents; format and bytes as there
     TESSERA_REC_MIP_FEEDBACK = 12,  // a = PS texture slot, b = requested mip, bytes = texture fingerprint
+    TESSERA_REC_SLOW_D3D11 = 13, // qpc = end, bytes = start, format = TesseraD3D11Call,
+                                // a = elapsed us, b = thread id, c = map mode or Flush1 context type,
+                                // d = HRESULT (0 for void), flags = API flags and TESSERA_CALL_PRESENT_THREAD
     TESSERA_REC_END = 0xFFFF,   // a = records dropped (ring overrun), bytes = records written
+};
+
+#define TESSERA_CALL_PRESENT_THREAD 0x80000000u
+enum TesseraD3D11Call {
+    TESSERA_CALL_MAP = 1,
+    TESSERA_CALL_GET_DATA = 2,
+    TESSERA_CALL_FLUSH = 3,
+    TESSERA_CALL_UPDATE_SUBRESOURCE = 4,
+    TESSERA_CALL_FLUSH1 = 5,
+    TESSERA_CALL_UPDATE_SUBRESOURCE1 = 6,
 };
 
 #pragma pack(push, 1)

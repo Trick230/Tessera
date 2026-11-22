@@ -257,6 +257,18 @@ fn session_info(exe: &Path) -> (SessionInfo, (u32, Option<u32>), Option<(u64, u6
         info.causes = s(format!("Stutters: {}.", causes.join(", ")));
     }
     let mut advice = Vec::new();
+    let slow_calls: Vec<_> = session::D3D11_CALL_NAMES
+        .iter()
+        .zip(sum.d3d11_calls)
+        .filter(|(_, stats)| stats.count > 0)
+        .map(|(name, stats)| format!("{name} {} (max {} ms)", stats.count, num(f64::from(stats.max_us) / 1000.0, 1)))
+        .collect();
+    if !slow_calls.is_empty() {
+        advice.push(format!(
+            "Slow D3D11 calls: {}. They overlapped {} of {} stutters.",
+            slow_calls.join(", "), sum.hitches_overlapping_d3d11, sum.hitches
+        ));
+    }
     if sum.vram_over_s > 0 {
         advice.push(format!(
             "The game spent {} over the available VRAM, swapping memory with system RAM. Lower texture quality, close other apps or set a VRAM cap.",

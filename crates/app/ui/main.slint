@@ -77,6 +77,7 @@ export struct ShaderState {
 
 export struct AdvancedOptions {
     max-frame-latency: int,
+    d3d11-call-diagnostics: bool,
     present-cpu-sets: bool,
     hybrid: bool,
     mip-residency: bool,
@@ -858,6 +859,13 @@ component Detail inherits Rectangle {
                             current-index: root.settings.advanced.max-frame-latency;
                             selected => { root.advanced-changed("max_frame_latency", self.current-index); }
                         }
+                    }
+                    OptionSwitch {
+                        label: "D3D11 call diagnostics";
+                        help: "Records context calls taking at least 1 ms. The session report shows timings and overlap with stutters.";
+                        checked: root.settings.advanced.d3d11-call-diagnostics;
+                        enabled: !root.busy;
+                        changed(value) => { root.advanced-changed("d3d11_call_diagnostics", value ? 1 : 0); }
                     }
                     if root.settings.advanced.hybrid: OptionSwitch {
                         label: "Performance cores";
