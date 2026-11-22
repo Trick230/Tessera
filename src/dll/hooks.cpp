@@ -299,8 +299,9 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
     const bool packed = game && d && init && out && quality_replace(self, create, *d, init, out, &bytes);
     const bool can_share = !packed && config().texture_dedup && game && d && init && out;
     bool shared = false;
+    DedupLookup lookup;
     if (can_share) {
-        if (auto* match = dedup_texture(self, *d, init, bytes)) {
+        if (auto* match = dedup_texture(self, *d, init, bytes, lookup)) {
             *out = match;
             shared = true;
         }
@@ -310,7 +311,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
     if (SUCCEEDED(hr) && game && d && init && out && *out && config().texture_quality == 1)
         quality_capture(*d, init);
     if (can_share && !shared && !tiled && SUCCEEDED(hr) && *out) {
-        if (auto* match = dedup_texture(self, *d, init, bytes, *out)) {
+        if (auto* match = dedup_texture(self, *d, init, bytes, lookup, *out)) {
             (*out)->Release();
             *out = match;
             shared = true;

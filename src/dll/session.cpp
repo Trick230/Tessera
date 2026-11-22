@@ -357,6 +357,7 @@ void session_shutdown() {
         flush(true);
         shaders_shutdown();
         if (config().stream_io == 1) stream_log_summary();
+        if (config().texture_dedup) dedup_log_summary();
         if (config().mip_feedback) feedback_log_summary();
         g_dropped += g_claim_failed.load(std::memory_order_relaxed);
         TesseraRecord end = {};

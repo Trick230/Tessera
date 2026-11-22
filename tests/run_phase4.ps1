@@ -49,6 +49,9 @@ foreach ($n in 0, 1) {
     if ($LASTEXITCODE) { throw "Texture dedup test failed with texture_dedup=$n" }
 }
 "PASS texture dedup"
+if (-not (Test-Log 'texture dedup: 515 eligible creates, 513 avoided, 0 shared after creation, 2 cached')) {
+    throw 'Texture dedup summary did not count the original create attempts and hits'
+}
 
 $env:TESSERA_SMOKE_ASSET = Join-Path $case "stream.asset"
 $asset = New-Object byte[] (34 * 65536)

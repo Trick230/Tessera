@@ -4,8 +4,10 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
+#include "log.h"
 #include "texture_data.h"
 
 namespace tessera {
@@ -24,6 +26,7 @@ struct Entry {
 Entry g_cache[48];
 uint64_t g_bytes = 0;
 SRWLOCK g_lock = SRWLOCK_INIT;
+std::atomic<uint64_t> g_eligible{0}, g_hits{0}, g_raced{0}, g_admitted{0}, g_avoided_bytes{0};
 
 struct Mip {
     const BYTE* data;
@@ -80,15 +83,21 @@ void copy_pixels(const Mip* mips, UINT n, BYTE* cached) {
 }  // namespace
 
 ID3D11Texture2D* dedup_texture(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& d,
-                              const D3D11_SUBRESOURCE_DATA* init, uint64_t bytes, ID3D11Texture2D* tex) {
-    if (!init || bytes < 4096 || bytes > kMaxTexture || d.Usage != D3D11_USAGE_IMMUTABLE ||
+                              const D3D11_SUBRESOURCE_DATA* init, uint64_t bytes, DedupLookup& lookup,
+                              ID3D11Texture2D* tex) {
+    if (tex && !lookup.eligible) return nullptr;
+    if (!tex && (!init || bytes < 4096 || bytes > kMaxTexture || d.Usage != D3D11_USAGE_IMMUTABLE ||
         d.BindFlags != D3D11_BIND_SHADER_RESOURCE || d.MiscFlags || d.CPUAccessFlags || d.ArraySize != 1 ||
-        d.SampleDesc.Count != 1 || d.SampleDesc.Quality || (dev->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED))
+        d.SampleDesc.Count != 1 || d.SampleDesc.Quality || (dev->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED)))
         return nullptr;
     Mip mips[15];
     const UINT n = describe(d, init, mips, bytes);
     if (!n) return nullptr;
-    const uint64_t hash = signature(mips, n);
+    if (!tex) {
+        lookup = {signature(mips, n), true};
+        g_eligible.fetch_add(1, std::memory_order_relaxed);
+    }
+    const uint64_t hash = lookup.signature;
     if (!TryAcquireSRWLockExclusive(&g_lock)) return nullptr;
     ID3D11Texture2D* hit = nullptr;
     Entry* free = nullptr;
@@ -102,6 +111,12 @@ ID3D11Texture2D* dedup_texture(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& d,
             continue;
         e.texture->AddRef();
         hit = e.texture;
+        if (tex) {
+            g_raced.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_hits.fetch_add(1, std::memory_order_relaxed);
+            g_avoided_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
         break;
     }
     if (!hit && tex && free && g_bytes + bytes <= kMaxCache) {
@@ -111,10 +126,20 @@ ID3D11Texture2D* dedup_texture(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& d,
             tex->AddRef();
             *free = {dev, tex, data, bytes, hash, d.Width, d.Height, n, d.Format};
             g_bytes += bytes;
+            g_admitted.fetch_add(1, std::memory_order_relaxed);
         }
     }
     ReleaseSRWLockExclusive(&g_lock);
     return hit;
+}
+
+void dedup_log_summary() {
+    logf("texture dedup: %llu eligible creates, %llu avoided, %llu shared after creation, %llu cached, %llu bytes avoided",
+         static_cast<unsigned long long>(g_eligible.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(g_hits.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(g_raced.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(g_admitted.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(g_avoided_bytes.load(std::memory_order_relaxed)));
 }
 
 void dedup_background_tick() {
