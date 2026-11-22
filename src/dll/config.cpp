@@ -47,6 +47,8 @@ BOOL CALLBACK load_once(PINIT_ONCE, void*, void**) {
     c.mip_ram_mb = clamp_int(get(L"mip_ram_mb", 0), 0, 1 << 20);
     c.mip_force_evict = get(L"mip_force_evict", 0) != 0;
     c.texture_dedup = get(L"texture_dedup", 0) != 0;
+    c.stream_io = clamp_int(get(L"stream_io", 0), 0, 2);
+    c.mip_prediction = get(L"mip_prediction", 0) != 0;
     c.rt_recycle = get(L"rt_recycle", 0) != 0;
     c.ue_cvars = get(L"ue_cvars", 1) != 0;
     g_config = c;

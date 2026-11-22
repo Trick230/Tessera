@@ -7,6 +7,7 @@ add_library(tessera_d3d11 SHARED
   hooks.cpp
   vtable.cpp
   session.cpp
+  stream_io.cpp
   log.cpp
   config.cpp
   dedup.cpp

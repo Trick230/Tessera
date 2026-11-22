@@ -19,6 +19,7 @@
 #include "process.h"
 #include "shaders.h"
 #include "residency.h"
+#include "stream_io.h"
 #include "workset.h"
 
 namespace tessera {
@@ -178,6 +179,7 @@ DWORD WINAPI writer_main(void*) {
         if ((tick & 7) == 0) pacing_background_tick();  // every 2 s
         shaders_background_tick();
         nvapi_background_tick();
+        if (config().stream_io == 1) stream_background_tick();
         if (!stable) {
             const int64_t last = g_last_present.load(std::memory_order_relaxed);
             if (last && static_cast<uint64_t>(last) - g_init_qpc > 60 * static_cast<uint64_t>(g_freq.QuadPart)) {
@@ -273,6 +275,7 @@ BOOL CALLBACK init_once(PINIT_ONCE, void*, void**) {
     SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL);
     CloseHandle(th);
     g_enabled = true;
+    stream_start(g_exe_path);
     return TRUE;
 }
 }  // namespace

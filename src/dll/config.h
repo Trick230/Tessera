@@ -20,6 +20,8 @@ struct Config {
                                 // lower while less than RAM / 8 (at least 1 GB) is free
     bool mip_force_evict = false;  // tests: evict every texture not bound in the current frame
     bool texture_dedup = false;  // M8: share identical immutable shader textures
+    int stream_io = 0;           // I1-I3: 1 learn reads, 2 prefetch a saved trace
+    bool mip_prediction = false;  // M7: predict texture use
     bool rt_recycle = false;    // R1: released big render targets handed back on the next matching create
     bool ue_cvars = true;       // U1: Unreal console variables from cvar.* lines (written by the app)
 };

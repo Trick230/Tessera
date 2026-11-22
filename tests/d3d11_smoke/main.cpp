@@ -463,6 +463,29 @@ int verify(const wchar_t* dir, int fps) {
 
 // Cost of the bind hooks (M11): 2M PSSetShaderResources of 16 views, taken
 // in turn from 4096 so lookups miss the cache as in a game.
+int stream() {
+    ID3D11Device* dev = nullptr;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                                 &dev, nullptr, nullptr)))
+        return fail("stream device");
+    wchar_t path[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"TESSERA_SMOKE_ASSET", path, MAX_PATH)) return fail("stream input path");
+    const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return fail("stream open asset");
+    LARGE_INTEGER offset = {};
+    offset.QuadPart = 65536;
+    std::vector<BYTE> pixels(65536);
+    DWORD count = 0;
+    if (!SetFilePointerEx(file, offset, nullptr, FILE_BEGIN) ||
+        !ReadFile(file, pixels.data(), static_cast<DWORD>(pixels.size()), &count, nullptr) ||
+        count != pixels.size() || pixels[0] != 0x53)
+        return fail("stream asset read");
+    CloseHandle(file);
+    Sleep(650);  // the learning and prefetch workers run asynchronously
+    dev->Release();
+    return 0;
+}
+
 int dedup() {
     ID3D11Device* dev = nullptr;
     if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
@@ -1137,6 +1160,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--uecvars") == 0) return uecvars_mode(argc >= 3 && wcscmp(argv[2], L"stale") == 0);
     if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0) return bench();
     if (argc >= 2 && wcscmp(argv[1], L"--dedup") == 0) return dedup();
+    if (argc >= 2 && wcscmp(argv[1], L"--stream") == 0) return stream();
     if (argc >= 2 && wcscmp(argv[1], L"--imports") == 0) return imports_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--recycle") == 0) return recycle_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--tiled") == 0) return tiled();

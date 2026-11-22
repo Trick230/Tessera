@@ -24,6 +24,7 @@
 #include "module.h"
 #include "pacing.h"
 #include "session.h"
+#include "stream_io.h"
 
 namespace tessera {
 namespace {
@@ -124,6 +125,8 @@ void* __cdecl hk_query_interface(unsigned id) {
     return p;
 }
 
+std::atomic<bool> g_stream_imports{false};
+
 FARPROC WINAPI hk_get_proc_address(HMODULE m, LPCSTR name) {
     const FARPROC p = g_get_proc(m, name);
     // HIWORD 0: lookup by ordinal, no name to read.
@@ -131,6 +134,8 @@ FARPROC WINAPI hk_get_proc_address(HMODULE m, LPCSTR name) {
     if (name[0] != 'n' || std::strcmp(name, "nvapi_QueryInterface") != 0) {
         // M1 (also delay-load imports, whose helper resolves through here).
         if (void* h = memory_import_hook(name, reinterpret_cast<void*>(p))) return reinterpret_cast<FARPROC>(h);
+        if (g_stream_imports.load(std::memory_order_relaxed))
+            if (void* h = stream_import_hook(name, reinterpret_cast<void*>(p))) return reinterpret_cast<FARPROC>(h);
         return p;
     }
     QueryInterface expected = nullptr;
@@ -177,7 +182,7 @@ bool in_image(const void* p) {
 }
 // Points one module's GetProcAddress imports at ours. False while the
 // loader has not bound them yet (it announces a DLL before binding it).
-bool patch_module(uint8_t* base) {
+bool patch_module(uint8_t* base, bool stream_only = false) {
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
     if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return true;
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
@@ -195,15 +200,16 @@ bool patch_module(uint8_t* base) {
             if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
             auto* by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
             const char* const name = reinterpret_cast<const char*>(by_name->Name);
-            const bool gpa = std::strcmp(name, "GetProcAddress") == 0;
-            if (!gpa && !memory_import_wanted(name)) continue;
+            const bool stream = g_stream_imports.load(std::memory_order_relaxed) && stream_import_wanted(name);
+            const bool gpa = !stream_only && std::strcmp(name, "GetProcAddress") == 0;
+            if (!stream && !gpa && (stream_only || !memory_import_wanted(name))) continue;
             void* const current = reinterpret_cast<void*>(iat->u1.Function);
             if (iat->u1.Function == names->u1.AddressOfData || (prebound && !in_image(current))) {
                 bound = false;  // still the name entry
                 continue;
             }
-            if (!gpa) {  // M1: DXGI factories, other APIs
-                if (void* h = memory_import_hook(name, current))
+            if (!gpa) {
+                if (void* h = stream ? stream_import_hook(name, current) : memory_import_hook(name, current))
                     write_slot(reinterpret_cast<void* volatile*>(&iat->u1.Function), h);
                 continue;
             }
@@ -337,5 +343,25 @@ void nvapi_background_tick() {
     retry_pending(true);
     note_pending();
     ReleaseSRWLockExclusive(&g_pending_lock);
+}
+
+void activate_stream_imports() {
+    g_stream_imports.store(true, std::memory_order_relaxed);
+    HMODULE mods[512];
+    DWORD bytes = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &bytes)) return;
+    const DWORD count = (bytes < sizeof mods ? bytes : sizeof mods) / sizeof(HMODULE);
+    const HMODULE exe = GetModuleHandleW(nullptr);
+    for (DWORD i = 0; i < count; ++i) {
+        if (mods[i] == g_self) continue;
+        HMODULE held = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(mods[i]), &held))
+            continue;
+        wchar_t path[MAX_PATH];
+        const DWORD len = GetModuleFileNameW(held, path, MAX_PATH);
+        if (held == exe || (len && len < MAX_PATH && in_game_dir(path, len)))
+            patch_module(reinterpret_cast<uint8_t*>(held), true);
+        FreeLibrary(held);
+    }
 }
 }  // namespace tessera
