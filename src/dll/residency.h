@@ -31,6 +31,7 @@ void residency_after_flush(ID3D11DeviceContext* ctx);
 // the creation to the caller.
 bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTURE2D_DESC& d,
                       const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out, uint64_t bytes);
+bool residency_candidate(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& d, const D3D11_SUBRESOURCE_DATA* init);
 // A view of managed texture i is bound (or it is a copy source) on ctx.
 // On the immediate context the texture is whole when this returns.
 void residency_on_use(uint32_t i, ID3D11DeviceContext* ctx);

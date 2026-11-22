@@ -1009,15 +1009,28 @@ bool hook_context(ID3D11DeviceContext* ctx, bool immediate) {
     return ok;
 }
 
+uint64_t residency_top_bytes(const D3D11_TEXTURE2D_DESC& d, const D3D11_SUBRESOURCE_DATA* init) {
+    if (d.Usage != D3D11_USAGE_IMMUTABLE || d.BindFlags != D3D11_BIND_SHADER_RESOURCE || d.CPUAccessFlags ||
+        d.MiscFlags || d.SampleDesc.Count != 1 || d.ArraySize != 1 || !init)
+        return 0;
+    if (d.MipLevels == 1 || (d.Width < 2 && d.Height < 2)) return 0;
+    D3D11_TEXTURE2D_DESC top = d;
+    top.MipLevels = 1;
+    return texture2d_bytes(top);
+}
+
+bool format_supports_tiles(ID3D11Device* dev, DXGI_FORMAT f) {
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT2 s = {f, 0};
+    return SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &s, sizeof s)) &&
+           (s.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED) != 0;
+}
+
 bool tiled_format(ID3D11Device* dev, DXGI_FORMAT f) {
     const unsigned v = static_cast<unsigned>(f);
     if (v >= 256) return false;
     uint8_t k = g_fmt[v].load(std::memory_order_relaxed);
     if (!k) {
-        D3D11_FEATURE_DATA_FORMAT_SUPPORT2 s = {f, 0};
-        const bool yes = SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &s, sizeof s)) &&
-                         (s.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED);
-        k = yes ? 1 : 2;
+        k = format_supports_tiles(dev, f) ? 1 : 2;
         g_fmt[v].store(k, std::memory_order_relaxed);
     }
     return k == 1;
@@ -1218,6 +1231,10 @@ void residency_on_swapchain(IDXGISwapChain* sc, ID3D11Device* dev) {
     dev5->Release();
 }
 
+bool residency_candidate(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& d, const D3D11_SUBRESOURCE_DATA* init) {
+    return residency_top_bytes(d, init) >= kMinTop && format_supports_tiles(dev, d.Format);
+}
+
 bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTURE2D_DESC& d,
                       const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out, uint64_t bytes) {
     // A waiting device creates a texture (it is alive) once the managed one
@@ -1235,14 +1252,8 @@ bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTU
     if (!g_on.load(std::memory_order_acquire) || dev != g_dev.load(std::memory_order_relaxed) ||
         g_evict_off.load(std::memory_order_relaxed))
         return false;
-    if (d.Usage != D3D11_USAGE_IMMUTABLE || d.BindFlags != D3D11_BIND_SHADER_RESOURCE || d.CPUAccessFlags ||
-        d.MiscFlags || d.SampleDesc.Count != 1 || d.ArraySize != 1 || !init || !out)
-        return false;
-    if (d.MipLevels == 1 || (d.Width < 2 && d.Height < 2)) return false;
-    D3D11_TEXTURE2D_DESC top_desc = d;
-    top_desc.MipLevels = 1;
-    const uint64_t top_bytes = texture2d_bytes(top_desc);
-    if (top_bytes < kMinTop || !tiled_format(dev, d.Format)) return false;
+    const uint64_t top_bytes = residency_top_bytes(d, init);
+    if (!out || top_bytes < kMinTop || !tiled_format(dev, d.Format)) return false;
     if (g_pending.fetch_add(bytes, std::memory_order_relaxed) + bytes > kPendingCap) {
         g_pending.fetch_sub(bytes, std::memory_order_relaxed);
         return false;

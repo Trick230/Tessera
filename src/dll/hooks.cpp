@@ -332,6 +332,8 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
         if (tiled) r.flags |= TESSERA_FLAG_TILED;
         if (reused) r.flags |= TESSERA_FLAG_RECYCLED;
         if (packed) r.flags |= TESSERA_FLAG_RECOMPRESSED;
+        if (game && config().d3d11_prefer_11_1 && (tiled || residency_candidate(self, *d, init)))
+            r.flags |= TESSERA_FLAG_RESIDENCY_CANDIDATE;
         r.bytes = bytes;
         // M11 tracks what M4 could manage: game textures that are only sampled
         // (managed ones were registered by residency_create).
@@ -673,6 +675,12 @@ void on_swapchain(IDXGISwapChain* sc) {
         // Inside D3D11CreateDeviceAndSwapChain that device is not hooked yet.
         ID3D11Device* dev = nullptr;
         if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&dev)))) {
+            if (config().d3d11_prefer_11_1) {
+                D3D11_FEATURE_DATA_D3D11_OPTIONS1 options = {};
+                if (SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &options, sizeof options)))
+                    logf("d3d11: swapchain %p device feature level 0x%x tiled tier %u", static_cast<void*>(sc),
+                         static_cast<unsigned>(dev->GetFeatureLevel()), static_cast<unsigned>(options.TiledResourcesTier));
+            }
             residency_on_swapchain(sc, dev);
             ID3D11DeviceContext* imm = nullptr;
             dev->GetImmediateContext(&imm);

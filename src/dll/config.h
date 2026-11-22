@@ -15,6 +15,7 @@ struct Config {
     bool d3d11_call_diagnostics = false;
     int vram_budget_mb = 0;     // M1: highest VRAM budget reported to the game, 0 = the real one
     bool flip_model = false;    // P2: windowed blit swapchains become flip model (+ tearing)
+    bool d3d11_prefer_11_1 = false;  // experiment: try feature level 11_1 before the game's 11_0 request
     bool workset = true;        // M11: texture working-set meter (bind hooks)
     bool mip_residency = false; // M3-M5: cold top mips of sampled textures move to system memory
     int mip_ram_mb = 0;         // M10: system memory for those mips, 0 = min(4 GB, RAM / 16);

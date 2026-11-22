@@ -43,6 +43,7 @@ BOOL CALLBACK load_once(PINIT_ONCE, void*, void**) {
     c.vram_budget_mb = clamp_int(get(L"vram_budget_mb", 0), 0, 1 << 20);
     if (c.vram_budget_mb && c.vram_budget_mb < 1024) c.vram_budget_mb = 0;  // below 1 GB: a typo, off
     c.flip_model = get(L"flip_model", 0) != 0;
+    c.d3d11_prefer_11_1 = get(L"d3d11_prefer_11_1", 0) != 0;
     c.workset = get(L"workset", 1) != 0;
     c.mip_residency = get(L"mip_residency", 0) != 0;
     c.mip_ram_mb = clamp_int(get(L"mip_ram_mb", 0), 0, 1 << 20);

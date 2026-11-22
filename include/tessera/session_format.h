@@ -26,6 +26,8 @@
 #define TESSERA_FLAG_INIT_DATA 0x08000000u
 // Texture bytes describe compressed storage rather than the visible format.
 #define TESSERA_FLAG_RECOMPRESSED 0x04000000u
+// A game texture that passes the descriptor and tiled format checks for mip residency.
+#define TESSERA_FLAG_RESIDENCY_CANDIDATE 0x02000000u
 
 enum TesseraRecordKind {
     TESSERA_REC_FRAME = 1,      // a = CPU frame time in us (0 on the first frame),
