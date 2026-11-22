@@ -10,6 +10,7 @@
 
 #include "config.h"
 #include "log.h"
+#include "mip_feedback.h"
 #include "prediction.h"
 #include "residency.h"
 #include "session.h"
@@ -244,6 +245,9 @@ void STDMETHODCALLTYPE hk_set(ID3D11DeviceContext* self, UINT start, UINT n, ID3
         mark<false>(self, start, n, v);
     using F = decltype(&hk_set<I>);
     reinterpret_cast<F>(vt_orig(g_set[I], self))(self, start, n, v);
+    if constexpr (I == 0) {
+        if (config().mip_feedback) feedback_after_ps_bind(self);
+    }
 }
 BOOL CALLBACK initialize(PINIT_ONCE, PVOID, PVOID*) {
     // Committed at once, but zero pages cost nothing until touched.

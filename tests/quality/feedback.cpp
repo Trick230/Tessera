@@ -141,13 +141,16 @@ int wmain(int argc, wchar_t** argv) {
     const bool changed = std::wcscmp(argv[1], L"--textures-changed") == 0;
     const bool hdr = std::wcscmp(argv[1], L"--textures-hdr") == 0;
     const bool occupied = std::wcscmp(argv[1], L"--layer-occupied") == 0;
+    const bool indirect = std::wcscmp(argv[1], L"--layer-indirect") == 0;
     const bool textures = changed || hdr || std::wcscmp(argv[1], L"--textures") == 0;
-    const bool layer = textures || occupied || std::wcscmp(argv[1], L"--layer") == 0;
+    const bool layer = textures || occupied || indirect || std::wcscmp(argv[1], L"--layer") == 0;
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
                                    D3D11_SDK_VERSION, &dev, nullptr, &ctx);
     if (FAILED(hr)) return fail("create D3D11 device", hr);
+    using IndirectDraw = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+    const auto draw_indirect = reinterpret_cast<IndirectDraw>((*reinterpret_cast<void***>(ctx.Get()))[40]);
     ComPtr<ID3D11PixelShader> original, instrumented;
     hr = pixel_shader(dev.Get(), argv[layer ? 2 : 1], &original);
     if (FAILED(hr)) return fail("create original shader", hr);
@@ -237,6 +240,16 @@ int wmain(int argc, wchar_t** argv) {
     ComPtr<ID3D11SamplerState> sampler;
     hr = dev->CreateSamplerState(&s, &sampler);
     if (FAILED(hr)) return fail("create sampler", hr);
+    ComPtr<ID3D11Buffer> args;
+    if (indirect) {
+        const D3D11_DRAW_INSTANCED_INDIRECT_ARGS draw_args = {3, 1, 0, 0};
+        D3D11_BUFFER_DESC desc = {};
+        desc.ByteWidth = sizeof draw_args;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
+        const D3D11_SUBRESOURCE_DATA initial = {&draw_args, 0, 0};
+        if (FAILED(dev->CreateBuffer(&desc, &initial, &args))) return fail("create indirect draw arguments");
+    }
     const auto render = [&](ID3D11PixelShader* ps, bool record, std::array<UINT, 16>& pixels) {
         const UINT sentinel[4] = {UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX};
         constexpr float clear[4] = {};
@@ -258,7 +271,8 @@ int wmain(int argc, wchar_t** argv) {
         auto* filter = sampler.Get();
         ctx->PSSetShaderResources(3, 1, &view);
         ctx->PSSetSamplers(1, 1, &filter);
-        ctx->Draw(3, 0);
+        if (indirect) draw_indirect(ctx.Get(), args.Get(), 0);
+        else ctx->Draw(3, 0);
         if (layer) {
             ComPtr<ID3D11PixelShader> actual;
             ctx->PSGetShader(&actual, nullptr, nullptr);
@@ -282,6 +296,7 @@ int wmain(int argc, wchar_t** argv) {
         hr = make_swapchain(dev.Get(), &sc);
         if (FAILED(hr)) return fail("create smoke swapchain", hr);
         sc->Present(0, 0);
+        if (indirect) sc->Present(0, 0);  // no suitable draw in the first frame of the window
         const UINT expected = textures ? 0xffffffff : colors[0];
         if (!render(original.Get(), occupied, before) ||
             !std::all_of(before.begin(), before.end(), [expected](UINT color) { return color == expected; }))

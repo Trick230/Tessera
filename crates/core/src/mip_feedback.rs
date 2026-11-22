@@ -5,6 +5,7 @@
 
 const PS_5_0: u32 = 0x50;
 const SAMPLE: u32 = 69;
+const SAMPLE_L: u32 = 72;
 const DECL_RESOURCE: u32 = 88;
 const DECL_TEMPS: u32 = 104;
 const DECL_GLOBAL_FLAGS: u32 = 106;
@@ -14,6 +15,7 @@ const MAX: u32 = 52;
 const FTOU: u32 = 28;
 const ATOMIC_UMIN: u32 = 177;
 const FEEDBACK_SLOT: u32 = 7;
+const IMMEDIATE: u32 = 0x00004001;
 const MAX_TEXTURES: usize = 8;
 const CACHE_LIMIT: usize = 128 * 1024 * 1024;
 
@@ -46,7 +48,7 @@ fn register(operand: &[u32]) -> Option<(u32, u32)> {
     Some(((token >> 12) & 0xff, *operand.get(1)?))
 }
 
-fn sample_operands(inst: &[u32]) -> Option<(&[u32], u32)> {
+fn sample_operands(inst: &[u32], explicit_lod: bool) -> Option<(&[u32], u32)> {
     let mut first = 1;
     let mut token = inst[0];
     if token & 0x00fff800 != 0 {
@@ -62,10 +64,17 @@ fn sample_operands(inst: &[u32]) -> Option<(&[u32], u32)> {
         first += 1;
     }
     let operands = inst.get(first..)?;
-    if operands.len() != 8
+    let operand_words = if explicit_lod { 10 } else { 8 };
+    if operands.len() != operand_words
         || !matches!(register(operands)?, (0 | 2, _))
         || !matches!(register(&operands[2..])?, (0 | 1, _))
         || !matches!(register(&operands[6..])?, (6, 0..=15))
+    {
+        return None;
+    }
+    if explicit_lod
+        && operands[8] != IMMEDIATE
+        && !matches!(register(&operands[8..]), Some((0 | 1, _)))
     {
         return None;
     }
@@ -80,24 +89,29 @@ fn emit_feedback(out: &mut Vec<u32>, operands: &[u32], slot: u32, temp: u32) {
     const SOURCE_X: u32 = 0x0010000a;
     const RESOURCE_Y: u32 = 0x0010701a;
     const UAV: u32 = 0x0011e000;
-    const IMMEDIATE: u32 = 0x00004001;
-    // lod's .y is the unclamped mip. Always compute it before the
-    // original sample, which may overwrite its own coordinate register.
+    let level = if operands.len() == 10 {
+        [operands[8], operands[9]]
+    } else {
+        // lod's .y is the unclamped mip. The sample can overwrite its inputs.
+        out.extend_from_slice(&[
+            instruction(LOD, 9),
+            DEST_X,
+            temp,
+            operands[2],
+            operands[3],
+            RESOURCE_Y,
+            slot,
+            operands[6],
+            operands[7],
+        ]);
+        [SOURCE_X, temp]
+    };
     out.extend_from_slice(&[
-        instruction(LOD, 9),
-        DEST_X,
-        temp,
-        operands[2],
-        operands[3],
-        RESOURCE_Y,
-        slot,
-        operands[6],
-        operands[7],
         instruction(MAX, 7),
         DEST_X,
         temp,
-        SOURCE_X,
-        temp,
+        level[0],
+        level[1],
         IMMEDIATE,
         0,
         instruction(FTOU, 5),
@@ -165,8 +179,8 @@ fn instrument_program(part: &[u8]) -> Option<(Vec<u8>, Vec<u32>)> {
         if matches!(op, 88..=106 | 143..=162) {
             declarations.extend_from_slice(inst);
         } else {
-            if op == SAMPLE && slots.len() < MAX_TEXTURES {
-                if let Some((operands, slot)) = sample_operands(inst) {
+            if matches!(op, SAMPLE | SAMPLE_L) && slots.len() < MAX_TEXTURES {
+                if let Some((operands, slot)) = sample_operands(inst, op == SAMPLE_L) {
                     if resources[slot as usize] && !slots.contains(&slot) {
                         emit_feedback(&mut body, operands, slot, temp.unwrap_or(0));
                         slots.push(slot);

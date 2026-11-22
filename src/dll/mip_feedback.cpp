@@ -23,6 +23,7 @@ constexpr GUID kSlots = {0x58a4d0c0, 0xe00b, 0x49ca, {0x83, 0x3c, 0xec, 0xcb, 0x
 constexpr GUID kCapture = {0x005a6bc5, 0xd1f9, 0x4e51, {0xb1, 0x51, 0x35, 0x1a, 0x60, 0x59, 0x09, 0xab}};
 constexpr UINT kUav = TESSERA_FEEDBACK_UAV, kTextures = TESSERA_FEEDBACK_TEXTURES;
 constexpr unsigned kInterval = 60;
+constexpr unsigned kWindowFrames = 8, kWindowAttempts = 32, kFrameAttempts = 8;
 
 const TesseraFeedbackEntry* g_entries[TESSERA_FEEDBACK_MAX_ENTRIES];
 uint32_t g_count = 0;
@@ -79,9 +80,11 @@ struct Capture;
 SRWLOCK g_active_lock = SRWLOCK_INIT;
 Capture* g_active = nullptr;  // the swapchain owns the state
 std::atomic<bool> g_armed{false};
+std::atomic<bool> g_check_bind{false};
 struct FeedbackStats {
     std::atomic<unsigned> variants{0}, windows{0}, no_variant{0}, no_texture{0}, output_busy{0};
     std::atomic<unsigned> submitted{0}, empty{0}, read_failed{0}, samples{0}, rehook_failed{0};
+    std::atomic<unsigned> bind_frames{0};
 };
 FeedbackStats g_stats;
 struct Slot {
@@ -96,7 +99,7 @@ struct Capture final : IUnknown {
     ComPtr<ID3D11Buffer> gpu, readback;
     ComPtr<ID3D11UnorderedAccessView> view;
     Slot slots[TESSERA_FEEDBACK_SLOTS] = {};
-    unsigned count = 0, frame = 0, attempts = 0;
+    unsigned count = 0, frame = 0, attempts = 0, window_frames = 0, window_attempts = 0;
     bool pending = false;
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
@@ -213,6 +216,7 @@ void draw(ID3D11DeviceContext* ctx, F original_draw, A... args) {
         original_draw(ctx, args...);
         return;
     }
+    --cap->window_attempts;
     if (--cap->attempts == 0) g_armed.store(false, std::memory_order_relaxed);
     ctx->PSGetShader(&original, nullptr, nullptr);
     UINT size = sizeof(ID3D11PixelShader*);
@@ -228,6 +232,7 @@ void draw(ID3D11DeviceContext* ctx, F original_draw, A... args) {
         return;
     }
     g_armed.store(false, std::memory_order_relaxed);
+    cap->window_frames = cap->window_attempts = cap->attempts = 0;
     constexpr UINT clear[4] = {UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX};
     ctx->ClearUnorderedAccessViewUint(cap->view.Get(), clear);
     auto* uav = cap->view.Get();
@@ -249,10 +254,24 @@ void STDMETHODCALLTYPE hk_draw(ID3D11DeviceContext*, UINT, UINT);
 void STDMETHODCALLTYPE hk_draw_indexed(ID3D11DeviceContext*, UINT, UINT, INT);
 void STDMETHODCALLTYPE hk_draw_instanced(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
 void STDMETHODCALLTYPE hk_draw_indexed_instanced(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
+void STDMETHODCALLTYPE hk_draw_auto(ID3D11DeviceContext*);
+void STDMETHODCALLTYPE hk_draw_indexed_indirect(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+void STDMETHODCALLTYPE hk_draw_indirect(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
 VtHook g_draw = {13, reinterpret_cast<void*>(&hk_draw)};
 VtHook g_draw_indexed = {12, reinterpret_cast<void*>(&hk_draw_indexed)};
 VtHook g_draw_instanced = {21, reinterpret_cast<void*>(&hk_draw_instanced)};
 VtHook g_draw_indexed_instanced = {20, reinterpret_cast<void*>(&hk_draw_indexed_instanced)};
+VtHook g_draw_auto = {38, reinterpret_cast<void*>(&hk_draw_auto)};
+VtHook g_draw_indexed_indirect = {39, reinterpret_cast<void*>(&hk_draw_indexed_indirect)};
+VtHook g_draw_indirect = {40, reinterpret_cast<void*>(&hk_draw_indirect)};
+
+bool hook_draws(ID3D11DeviceContext* ctx, bool refresh) {
+    bool ok = true;
+    for (auto* hook : {&g_draw, &g_draw_indexed, &g_draw_instanced, &g_draw_indexed_instanced, &g_draw_auto,
+                       &g_draw_indexed_indirect, &g_draw_indirect})
+        ok = (refresh ? vt_rehook(*hook, ctx) : vt_hook(*hook, ctx, true)) && ok;
+    return ok;
+}
 
 void STDMETHODCALLTYPE hk_draw(ID3D11DeviceContext* c, UINT n, UINT first) {
     draw(c, reinterpret_cast<decltype(&hk_draw)>(vt_orig(g_draw, c)), n, first);
@@ -267,6 +286,15 @@ void STDMETHODCALLTYPE hk_draw_indexed_instanced(ID3D11DeviceContext* c, UINT n,
                                                   UINT start) {
     draw(c, reinterpret_cast<decltype(&hk_draw_indexed_instanced)>(vt_orig(g_draw_indexed_instanced, c)),
          n, count, first, base, start);
+}
+void STDMETHODCALLTYPE hk_draw_auto(ID3D11DeviceContext* c) {
+    draw(c, reinterpret_cast<decltype(&hk_draw_auto)>(vt_orig(g_draw_auto, c)));
+}
+void STDMETHODCALLTYPE hk_draw_indexed_indirect(ID3D11DeviceContext* c, ID3D11Buffer* args, UINT offset) {
+    draw(c, reinterpret_cast<decltype(&hk_draw_indexed_indirect)>(vt_orig(g_draw_indexed_indirect, c)), args, offset);
+}
+void STDMETHODCALLTYPE hk_draw_indirect(ID3D11DeviceContext* c, ID3D11Buffer* args, UINT offset) {
+    draw(c, reinterpret_cast<decltype(&hk_draw_indirect)>(vt_orig(g_draw_indirect, c)), args, offset);
 }
 }  // namespace
 
@@ -287,6 +315,11 @@ void feedback_on_shader(ID3D11Device* dev, CreatePixelShaderFn create, ID3D11Pix
         g_stats.variants.fetch_add(1, std::memory_order_relaxed);
 }
 
+void feedback_on_context(ID3D11DeviceContext* ctx) {
+    // The game can retain draw entry points as soon as it receives its context.
+    if (ctx && config().mip_feedback && config().workset && have_cache()) hook_draws(ctx, false);
+}
+
 void feedback_on_swapchain(IDXGISwapChain* sc) {
     if (!config().mip_feedback || !config().workset || !have_cache()) return;
     ComPtr<IUnknown> existing;
@@ -300,8 +333,7 @@ void feedback_on_swapchain(IDXGISwapChain* sc) {
     if (!cap) return;
     cap->context = ctx.Get();
     cap->swapchain = sc;
-    if (ctx && create_buffers(*cap, dev.Get()) && vt_hook(g_draw, ctx.Get()) && vt_hook(g_draw_indexed, ctx.Get()) &&
-        vt_hook(g_draw_instanced, ctx.Get()) && vt_hook(g_draw_indexed_instanced, ctx.Get()) &&
+    if (ctx && create_buffers(*cap, dev.Get()) && hook_draws(ctx.Get(), false) &&
         SUCCEEDED(sc->SetPrivateDataInterface(kCapture, cap))) {
         AcquireSRWLockExclusive(&g_active_lock);
         if (!g_active) g_active = cap;
@@ -356,9 +388,18 @@ void feedback_present(IDXGISwapChain* sc) {
             g_stats.read_failed.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    cap->attempts = cap->frame++ % kInterval == 0 && !cap->pending ? 32 : 0;
-    if (cap->attempts) g_stats.windows.fetch_add(1, std::memory_order_relaxed);
+    if (cap->frame++ % kInterval == 0 && !cap->pending) {
+        cap->window_frames = kWindowFrames;
+        cap->window_attempts = kWindowAttempts;
+        g_stats.windows.fetch_add(1, std::memory_order_relaxed);
+    }
+    cap->attempts = 0;
+    if (cap->window_frames && !cap->pending) {
+        --cap->window_frames;
+        cap->attempts = std::min(kFrameAttempts, cap->window_attempts);
+    }
     g_armed.store(cap->attempts != 0, std::memory_order_relaxed);
+    g_check_bind.store(cap->attempts != 0, std::memory_order_relaxed);
     release(*cap);
 }
 
@@ -367,9 +408,7 @@ void feedback_after_present(IDXGISwapChain* sc) {
     if (auto* cap = acquire(nullptr, sc)) {
         // DXGI's Present may replace the immediate context's Draw methods.
         // Restore our chain only while a sample is armed.
-        const bool ok = vt_rehook(g_draw, cap->context) && vt_rehook(g_draw_indexed, cap->context) &&
-                        vt_rehook(g_draw_instanced, cap->context) && vt_rehook(g_draw_indexed_instanced, cap->context);
-        if (!ok) {
+        if (!hook_draws(cap->context, true)) {
             g_armed.store(false, std::memory_order_relaxed);
             g_stats.rehook_failed.fetch_add(1, std::memory_order_relaxed);
         }
@@ -377,12 +416,23 @@ void feedback_after_present(IDXGISwapChain* sc) {
     }
 }
 
+void feedback_after_ps_bind(ID3D11DeviceContext* ctx) {
+    if (!g_check_bind.load(std::memory_order_relaxed) || !g_armed.load(std::memory_order_relaxed)) return;
+    if (auto* cap = acquire(ctx, nullptr)) {
+        g_check_bind.store(false, std::memory_order_relaxed);
+        g_stats.bind_frames.fetch_add(1, std::memory_order_relaxed);
+        // Check at the first real pixel-shader bind as well as after Present.
+        if (!hook_draws(ctx, true)) g_stats.rehook_failed.fetch_add(1, std::memory_order_relaxed);
+        release(*cap);
+    }
+}
+
 void feedback_log_summary() {
     const auto count = [](const std::atomic<unsigned>& value) { return value.load(std::memory_order_relaxed); };
     logf("mip feedback: variants=%u windows=%u no_variant=%u no_texture=%u output_busy=%u "
-         "submitted=%u empty=%u read_failed=%u samples=%u rehook_failed=%u",
+         "submitted=%u empty=%u read_failed=%u samples=%u rehook_failed=%u bind_frames=%u",
          count(g_stats.variants), count(g_stats.windows), count(g_stats.no_variant), count(g_stats.no_texture),
          count(g_stats.output_busy), count(g_stats.submitted), count(g_stats.empty), count(g_stats.read_failed),
-         count(g_stats.samples), count(g_stats.rehook_failed));
+         count(g_stats.samples), count(g_stats.rehook_failed), count(g_stats.bind_frames));
 }
 }  // namespace tessera

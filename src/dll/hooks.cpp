@@ -721,10 +721,13 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
     workset_on_device(dev);
     rtpool_on_device(dev, ok);
     residency_on_device(dev);
-    if (config().d3d11_call_diagnostics) {
+    if (config().d3d11_call_diagnostics || config().mip_feedback) {
         ID3D11DeviceContext* ctx = nullptr;
         dev->GetImmediateContext(&ctx);
-        logf("D3D11 call diagnostics: %s", ctx && hook_d3d11_calls(ctx, false) ? "on" : "incomplete immediate context hooks");
+        feedback_on_context(ctx);
+        if (config().d3d11_call_diagnostics)
+            logf("D3D11 call diagnostics: %s",
+                 ctx && hook_d3d11_calls(ctx, false) ? "on" : "incomplete immediate context hooks");
         if (ctx) ctx->Release();
     }
     if (config().texture_quality == 2) quality_register_device(dev);

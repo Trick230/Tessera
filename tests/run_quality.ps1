@@ -67,6 +67,16 @@ if ($LASTEXITCODE -ne 2 -or (Test-Path -LiteralPath "$case\rejected.dxbc")) {
 if ($LASTEXITCODE) { throw "DXBC instrumentation failed" }
 & "$bin\tessera_test_feedback.exe" $in $out
 if ($LASTEXITCODE) { throw "D3D11 mip feedback test failed" }
+foreach ($mode in "EXPLICIT_LOD", "EXPLICIT_LOD_REGISTER") {
+    $explicit = Join-Path $case "$mode.dxbc"
+    $instrumented = Join-Path $case "$mode-instrumented.dxbc"
+    & $Fxc /nologo /T ps_5_0 /E main /O3 /D "$mode=1" /Fo $explicit $shader
+    if ($LASTEXITCODE) { throw "Explicit LOD test shader failed to compile" }
+    & $instrument $explicit $instrumented
+    if ($LASTEXITCODE) { throw "Explicit LOD instrumentation failed" }
+    & "$bin\tessera_test_feedback.exe" $explicit $instrumented
+    if ($LASTEXITCODE) { throw "Explicit LOD changed the draw output or reported the wrong mip" }
+}
 
 # Exercise both normal layer paths in a clean local installation.
 Copy-Item -LiteralPath "$bin\tessera_test_feedback.exe" -Destination $case
@@ -130,3 +140,11 @@ if (!(Select-String -LiteralPath $layerLog -Pattern "output_busy=[1-9]\d* submit
     throw "Missing occupied UAV diagnostics"
 }
 "PASS occupied UAV left alone"
+
+& $test --layer-indirect $in
+$feedback = @(Read-Records 12)
+if ($LASTEXITCODE -or $feedback.Count -ne 1 -or $feedback[0].A -ne 3 -or $feedback[0].B -ne 2 -or
+    !(Select-String -LiteralPath $layerLog -Pattern "bind_frames=[1-9]\d*" -Quiet)) {
+    throw "Feedback missed an indirect draw in the next frame of the sample window"
+}
+"PASS early-cached indirect draw and sampling across frames"
