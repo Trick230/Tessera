@@ -16,6 +16,7 @@
 #include "memory.h"
 #include "nvapi.h"
 #include "pacing.h"
+#include "prediction.h"
 #include "process.h"
 #include "shaders.h"
 #include "residency.h"
@@ -180,6 +181,8 @@ DWORD WINAPI writer_main(void*) {
         shaders_background_tick();
         nvapi_background_tick();
         if (config().stream_io == 1) stream_background_tick();
+        if (config().mip_prediction && config().mip_residency) prediction_background_tick();
+        if (config().mip_streaming && config().mip_residency) residency_streaming_tick();
         if (!stable) {
             const int64_t last = g_last_present.load(std::memory_order_relaxed);
             if (last && static_cast<uint64_t>(last) - g_init_qpc > 60 * static_cast<uint64_t>(g_freq.QuadPart)) {

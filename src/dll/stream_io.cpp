@@ -40,8 +40,8 @@ static_assert(sizeof(File) == 536 && sizeof(Range) == 24 && offsetof(Trace, rang
 
 Trace g_trace, g_snapshot;
 struct OpenFile {
-    HANDLE handle;
-    unsigned file;
+    std::atomic<HANDLE> handle;
+    std::atomic<unsigned> file;
 };
 OpenFile g_handles[kHandles];
 SRWLOCK g_lock = SRWLOCK_INIT;
@@ -93,17 +93,19 @@ void remember(HANDLE h, DWORD access, DWORD creation, DWORD flags) {
     }
     if (i < kFiles) {
         if (i == g_trace.files) g_trace.file[g_trace.files++] = f;
-        handle_slot(h) = {h, i};
+        auto& s = handle_slot(h);
+        s.handle.store(nullptr, std::memory_order_relaxed);
+        s.file.store(i, std::memory_order_relaxed);
+        s.handle.store(h, std::memory_order_release);
     }
     ReleaseSRWLockExclusive(&g_lock);
 }
 
 unsigned tracked(HANDLE h) {
-    if (!TryAcquireSRWLockShared(&g_lock)) return kFiles;
     const auto& s = handle_slot(h);
-    const unsigned file = s.handle == h ? s.file : kFiles;
-    ReleaseSRWLockShared(&g_lock);
-    return file;
+    if (!h || s.handle.load(std::memory_order_acquire) != h) return kFiles;
+    const unsigned file = s.file.load(std::memory_order_relaxed);
+    return s.handle.load(std::memory_order_acquire) == h ? file : kFiles;
 }
 
 void record(unsigned file, uint64_t offset, DWORD bytes) {
@@ -154,10 +156,9 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVER
 
 BOOL WINAPI close_file(HANDLE h) {
     if (g_learning.load(std::memory_order_acquire)) {
-        AcquireSRWLockExclusive(&g_lock);
         auto& s = handle_slot(h);
-        if (s.handle == h) s = {};
-        ReleaseSRWLockExclusive(&g_lock);
+        HANDLE expected = h;
+        s.handle.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed);
     }
     return CloseHandle(h);
 }
@@ -221,22 +222,28 @@ void prefetch(const Trace& trace) {
     }
     logf("stream I/O: prefetched %lu KB from the startup list", prefix >> 10);
     if (!config().mip_prediction || used >= kSessionBytes) return;
+    unsigned remaining = 0;
+    for (unsigned i = 0; i < trace.ranges; ++i)
+        if (!issued[i] && trace.range[i].material) ++remaining;
     uint64_t last = 0;
-    while (used < kSessionBytes) {
+    while (remaining && used < kSessionBytes) {
         Sleep(250);
         const uint64_t current = g_material.load(std::memory_order_relaxed);
         if (!current || current == last || !has_room()) continue;
         last = current;
         DWORD batch = 0;
+        DWORD warmed = 0;
         for (unsigned i = 0; i < trace.ranges && batch < kMaxRead && used < kSessionBytes; ++i) {
             if (issued[i] || trace.range[i].material != current) continue;
             const DWORD cap = std::min(kMaxRead - batch, kSessionBytes - used);
             const DWORD wanted = std::min(trace.range[i].bytes, cap);
             issued[i] = true;
+            --remaining;
             batch += wanted;
             used += wanted;
-            warm_range(trace, trace.range[i], cap);
+            warmed += warm_range(trace, trace.range[i], cap);
         }
+        if (warmed) logf("stream I/O: prefetched %lu KB from a material match", warmed >> 10);
     }
 }
 

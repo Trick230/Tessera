@@ -461,27 +461,52 @@ int verify(const wchar_t* dir, int fps) {
 }
 }  // namespace
 
-// Cost of the bind hooks (M11): 2M PSSetShaderResources of 16 views, taken
-// in turn from 4096 so lookups miss the cache as in a game.
 int stream() {
     ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
     if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
-                                 &dev, nullptr, nullptr)))
+                                 &dev, nullptr, &ctx)))
         return fail("stream device");
+    wchar_t mode[2] = {};
+    GetEnvironmentVariableW(L"TESSERA_SMOKE_PREDICT", mode, _countof(mode));
+    if (mode[0]) {
+        D3D11_TEXTURE2D_DESC d = {};
+        d.Width = d.Height = 64;
+        d.MipLevels = d.ArraySize = d.SampleDesc.Count = 1;
+        d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        d.Usage = D3D11_USAGE_IMMUTABLE;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        std::vector<uint32_t> texels(64 * 64, 0x76543210);
+        ID3D11ShaderResourceView* views[2] = {};
+        for (auto& view : views) {
+            ID3D11Texture2D* tex = nullptr;
+            const D3D11_SUBRESOURCE_DATA init = {texels.data(), 64 * 4, 0};
+            if (FAILED(dev->CreateTexture2D(&d, &init, &tex)) ||
+                FAILED(dev->CreateShaderResourceView(tex, nullptr, &view)))
+                return fail("stream material");
+            tex->Release();
+            texels.assign(texels.size(), 0x87654321);
+        }
+        ctx->PSSetShaderResources(0, _countof(views), views);
+        for (auto* view : views) view->Release();
+    }
     wchar_t path[MAX_PATH] = {};
     if (!GetEnvironmentVariableW(L"TESSERA_SMOKE_ASSET", path, MAX_PATH)) return fail("stream input path");
     const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (file == INVALID_HANDLE_VALUE) return fail("stream open asset");
-    LARGE_INTEGER offset = {};
-    offset.QuadPart = 65536;
     std::vector<BYTE> pixels(65536);
-    DWORD count = 0;
-    if (!SetFilePointerEx(file, offset, nullptr, FILE_BEGIN) ||
-        !ReadFile(file, pixels.data(), static_cast<DWORD>(pixels.size()), &count, nullptr) ||
-        count != pixels.size() || pixels[0] != 0x53)
-        return fail("stream asset read");
+    for (unsigned i = 1; i <= (mode[0] == L'1' ? 33u : 1u); ++i) {
+        LARGE_INTEGER offset = {};
+        offset.QuadPart = 65536ull * i;
+        DWORD count = 0;
+        if (!SetFilePointerEx(file, offset, nullptr, FILE_BEGIN) ||
+            !ReadFile(file, pixels.data(), static_cast<DWORD>(pixels.size()), &count, nullptr) ||
+            count != pixels.size() || pixels[0] != 0x53)
+            return fail("stream asset read");
+    }
     CloseHandle(file);
     Sleep(650);  // the learning and prefetch workers run asynchronously
+    ctx->Release();
     dev->Release();
     return 0;
 }
@@ -528,6 +553,7 @@ int dedup() {
     return 0;
 }
 
+// Cost of the bind hooks (M11): random 16-view binds across a large table.
 int bench() {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
@@ -751,6 +777,8 @@ int tiled() {
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     ID3D11Texture2D* tex[kTiledCount] = {};
     ID3D11ShaderResourceView* srv[kTiledCount] = {};
+    const bool stream = GetEnvironmentVariableW(L"TESSERA_SMOKE_MIP_STREAM", nullptr, 0) != 0;
+    const bool predict = GetEnvironmentVariableW(L"TESSERA_SMOKE_MIP_PREDICT", nullptr, 0) != 0;
     for (UINT t = 0; t < kTiledCount; ++t) {
         size_t at = 0;
         for (UINT m = 0; m < kTiledMips; ++m) {
@@ -763,6 +791,7 @@ int tiled() {
         hr = g.dev->CreateTexture2D(&td, init, &tex[t]);
         if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(tex[t], nullptr, &srv[t]);
         if (FAILED(hr)) return fail("tiled texture", hr);
+        if (stream && t == 0) Sleep(550);  // refill an exact-size spare before the next create
     }
     D3D11_TEXTURE2D_DESC seen = {};
     tex[0]->GetDesc(&seen);
@@ -770,9 +799,27 @@ int tiled() {
     if (seen.Usage != D3D11_USAGE_IMMUTABLE || seen.MiscFlags != 0 || seen.MipLevels != kTiledMips)
         return fail("the game must see the texture it asked for");
 
-    // Before any Present: the first bind uploads.
+    if (stream) {
+        LARGE_INTEGER f, start, end;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&start);
+        present_frames(g, 1);
+        QueryPerformanceCounter(&end);
+        std::printf("tiled: first upload Present %.0f us\n", (end.QuadPart - start.QuadPart) * 1e6 / f.QuadPart);
+        if (!probe_all_mips(g, srv[kTiledCount - 1], kTiledCount - 1)) return fail("content after a partial upload");
+    }
+    // The first bind must finish any outstanding copy.
     for (UINT t = 0; t < kTiledCount; ++t)
         if (!probe_all_mips(g, srv[t], t)) return fail("content at the first bind");
+    if (predict) {
+        present_frames(g, 1);  // start a fresh sampling window
+        for (unsigned i = 0; i < 4; ++i) g.ctx->PSSetShaderResources(0, 2, srv);
+        Sleep(300);
+        ID3D11ShaderResourceView* empty[2] = {};
+        g.ctx->PSSetShaderResources(0, 2, empty);
+        for (UINT t = 0; t < kTiledCount; ++t)
+            if (!probe_all_mips(g, srv[t], t)) return fail("content during prediction training");
+    }
     settle(g);
     const uint64_t before = local_usage(g.adapter);
     // Nothing is bound now: all evicted, and the freed memory trimmed a few
@@ -783,6 +830,13 @@ int tiled() {
     std::printf("tiled: local usage %llu MB -> %llu MB after eviction\n", before >> 20, evicted >> 20);
     if (evicted + (96ull << 20) > before) return fail("top mips must leave VRAM");
     if (g.ctx->GetResourceMinLOD(tex[3]) != 0.0f) return fail("the game's min LOD must stay 0");
+    if (predict) {
+        g.ctx->PSSetShaderResources(0, 1, srv);  // the learned partner remains unbound
+        Sleep(300);
+        present_frames(g, 1);
+        if (!probe_all_mips(g, srv[1], 1)) return fail("content of the predicted texture");
+        Sleep(1050);  // let the writer publish the prediction counter
+    }
 
     // M5: binding restores before the draw, immediate and deferred. The bind
     // itself carries the restore: its CPU cost is what the frame pays.
@@ -891,6 +945,14 @@ int tiled() {
     on_next->Release();
     // The game lets go of the first device: now the second one takes over.
     g.ctx->ClearState();
+    if (stream || predict) {
+        // Let queued uploads and readbacks finish, then give the writer its
+        // next pass to enqueue releases no longer held by GPU commands.
+        settle(g);
+        Sleep(1050);
+        present_frames(g, 2);
+        settle(g);
+    }
     g.ctx->Flush();
     for (IUnknown* u : {static_cast<IUnknown*>(g.ps), static_cast<IUnknown*>(g.vs), static_cast<IUnknown*>(g.cb),
                         static_cast<IUnknown*>(g.readback), static_cast<IUnknown*>(g.rtv), static_cast<IUnknown*>(g.rt),

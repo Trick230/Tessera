@@ -22,6 +22,7 @@ struct Config {
     bool texture_dedup = false;  // M8: share identical immutable shader textures
     int stream_io = 0;           // I1-I3: 1 learn reads, 2 prefetch a saved trace
     bool mip_prediction = false;  // M7: predict texture use
+    bool mip_streaming = false;   // I4-I5: spare tile pool and split background uploads
     bool rt_recycle = false;    // R1: released big render targets handed back on the next matching create
     bool ue_cvars = true;       // U1: Unreal console variables from cvar.* lines (written by the app)
 };

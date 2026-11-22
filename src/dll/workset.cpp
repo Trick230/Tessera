@@ -9,6 +9,7 @@
 
 #include "config.h"
 #include "log.h"
+#include "prediction.h"
 #include "residency.h"
 #include "session.h"
 #include "vtable.h"
@@ -52,6 +53,7 @@ struct Slot {
     std::atomic<int> views;       // texture: tracked views alive
     Hot* hot;                     // its key; written under g_lock before publishing
     std::atomic<uint64_t> bytes;  // texture: size estimate
+    std::atomic<uint64_t> asset;  // texture: content fingerprint for prediction
     std::atomic<Slot*> tex;       // SRV: the texture slot it views
     std::atomic<uint32_t> res;    // texture: residency index + 1 (M3), 0 = unmanaged
 };
@@ -134,11 +136,22 @@ bool attach(const Table& t, int j, ID3D11DeviceChild* obj) {
 }
 
 // One lookup per view; the texture is resolved in the tick, off the frame path.
+template <bool Predict>
 void mark(ID3D11DeviceContext* ctx, UINT start, UINT n, ID3D11ShaderResourceView* const* v) {
     // The runtime drops an out-of-range call without reading v: so must we.
     if (!v || start >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) return;
     if (n > D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - start) return;
     const uint32_t f = g_frame.load(std::memory_order_relaxed);
+    thread_local uint32_t t_frame = 0;
+    thread_local unsigned t_samples = 0;
+    if constexpr (Predict) {
+        if (t_frame != f) {
+            t_frame = f;
+            t_samples = 0;
+        }
+    }
+    TextureHint hints[kMaterialTextures];
+    unsigned count = 0;
     // Start every view's cache miss before waiting on the first.
     for (UINT i = 0; i < n; ++i)
         if (v[i]) _mm_prefetch(reinterpret_cast<const char*>(&g_srv.hot[hash(v[i], kSrvBits)]), _MM_HINT_T0);
@@ -150,7 +163,21 @@ void mark(ID3D11DeviceContext* ctx, UINT start, UINT n, ID3D11ShaderResourceView
         std::atomic<uint32_t>& last = g_srv.hot[j].last;
         if (last.load(std::memory_order_relaxed) != f) last.store(f, std::memory_order_relaxed);
         // M5: a managed texture is made whole before the draw that samples it.
-        if (const uint32_t r = g_srv.hot[j].res.load(std::memory_order_relaxed)) residency_on_use(r - 1, ctx);
+        const uint32_t r = g_srv.hot[j].res.load(std::memory_order_relaxed);
+        if (r) residency_on_use(r - 1, ctx);
+        if constexpr (Predict) {
+            if (count < kMaterialTextures && t_samples < 12) {
+                if (const auto* t = g_srv.slot[j].tex.load(std::memory_order_relaxed)) {
+                    if (const uint64_t key = t->asset.load(std::memory_order_relaxed)) hints[count++] = {key, r};
+                }
+            }
+        }
+    }
+    if constexpr (Predict) {
+        if (count) {
+            ++t_samples;
+            prediction_material(hints, count);
+        }
     }
 }
 
@@ -165,7 +192,10 @@ VtHook g_set[6] = {
 
 template <int I>
 void STDMETHODCALLTYPE hk_set(ID3D11DeviceContext* self, UINT start, UINT n, ID3D11ShaderResourceView* const* v) {
-    mark(self, start, n, v);
+    if (config().mip_prediction)
+        mark<true>(self, start, n, v);
+    else
+        mark<false>(self, start, n, v);
     using F = decltype(&hk_set<I>);
     reinterpret_cast<F>(vt_orig(g_set[I], self))(self, start, n, v);
 }
@@ -228,7 +258,7 @@ void workset_on_context(ID3D11DeviceContext* ctx) {
     if (!ok && !s_logged.exchange(true)) logf("workset: deferred context hooks FAILED, its binds go uncounted");
 }
 
-std::atomic<int>* workset_on_texture(ID3D11Texture2D* tex, uint64_t bytes, uint32_t res) {
+std::atomic<int>* workset_on_texture(ID3D11Texture2D* tex, uint64_t bytes, uint32_t res, uint64_t key) {
     if (!g_on.load(std::memory_order_acquire)) return nullptr;
     AcquireSRWLockExclusive(&g_lock);
     std::atomic<int>* views = nullptr;
@@ -236,6 +266,7 @@ std::atomic<int>* workset_on_texture(ID3D11Texture2D* tex, uint64_t bytes, uint3
     if (j >= 0) {
         Slot& s = g_tex.slot[j];
         s.bytes.store(bytes, std::memory_order_relaxed);
+        s.asset.store(key, std::memory_order_relaxed);
         s.mark.store(0, std::memory_order_relaxed);
         s.mark10.store(0, std::memory_order_relaxed);
         s.views.store(0, std::memory_order_relaxed);

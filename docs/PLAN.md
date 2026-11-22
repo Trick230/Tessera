@@ -261,7 +261,19 @@ were built side by side. Everything below is on `master`.
    bind would stall; needs predictive restore first), AGS (AMD), safe mode does not cover a crash in the IAT
    patch before the first device.
 5. Validate P2 in a real blit-model game and mip residency in a tier 2 game that runs over budget.
-6. Then phase 4 (prediction and I/O) and phase 6 (D3D12).
+6. Measure phase 4 in a game with reproducible traversal stutter, then move on to the next phases.
+
+### Phase 4 — preview in D3D11
+
+These settings are off by default. Set them in the game's `[tessera]` section and restart the game:
+
+- **P4** `present_cpu_sets=1` selects performance cores for the presenting thread on a hybrid CPU, when the game has not already selected CPU sets.
+- **M8** `texture_dedup=1` shares matching immutable shader textures on the same device. It verifies every pixel or compressed block, excluding row padding. The preview covers single-slice BC and 8-bit RGBA/BGRA textures up to 2 MiB.
+- **I1–I3** `stream_io=1` records file ranges from a learning session. `stream_io=2` reuses the trace for bounded startup prefetch at low I/O priority. Add `mip_prediction=1` in both sessions to associate reads with sampled materials and prefetch matching ranges during play. The executable's folder is the default root. Set `stream_root` to the install folder when asset files live above it. The trace is keyed by the executable path and version, and playback checks the asset file's size and modification time.
+- **M7** `mip_prediction=1` learns which textures are bound together. With `mip_residency=1` and tiled resources Tier 2, it can restore likely partners in advance when VRAM has room. Mip prediction uses the workset bind hooks.
+- **I4–I5** `mip_streaming=1` with `mip_residency=1` reuses an exact-size spare tile pool when available. It uploads the smallest mips first, with up to 2 MiB of speculative copies per Present. First use finishes any outstanding copies before the draw.
+
+The targeted smoke test is `powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_phase4.ps1` after building the `d3d11_smoke` target. Traversal benefits in a real game and performance-core assignment on hybrid hardware still need validation.
 
 ### Phase 0 — concrete tasks
 

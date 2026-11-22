@@ -14,6 +14,7 @@
 #include "memory.h"
 #include "shaders.h"
 #include "pacing.h"
+#include "prediction.h"
 #include "residency.h"
 #include "rtpool.h"
 #include "uecvars.h"
@@ -217,7 +218,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
         if (game && !tiled && (d->BindFlags & D3D11_BIND_SHADER_RESOURCE) &&
             !(d->BindFlags & kTargetBinds) && !(d->MiscFlags & kSharedMisc) &&
             (d->Usage == D3D11_USAGE_DEFAULT || d->Usage == D3D11_USAGE_IMMUTABLE))
-            workset_on_texture(*out, r.bytes);
+            workset_on_texture(*out, r.bytes, 0, config().mip_prediction ? texture_prediction_key(*d, init) : 0);
         r.a = d->Width;
         r.b = d->Height;
         r.c = d->MipLevels | (d->ArraySize << 8);

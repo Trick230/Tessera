@@ -49,6 +49,7 @@ BOOL CALLBACK load_once(PINIT_ONCE, void*, void**) {
     c.texture_dedup = get(L"texture_dedup", 0) != 0;
     c.stream_io = clamp_int(get(L"stream_io", 0), 0, 2);
     c.mip_prediction = get(L"mip_prediction", 0) != 0;
+    c.mip_streaming = get(L"mip_streaming", 0) != 0;
     c.rt_recycle = get(L"rt_recycle", 0) != 0;
     c.ue_cvars = get(L"ue_cvars", 1) != 0;
     g_config = c;
@@ -63,9 +64,11 @@ void config_load() { InitOnceExecuteOnce(&g_once, load_once, nullptr, nullptr); 
 void config_log() {
     const Config& c = g_config;
     logf("config: process %d priority %d residency %d fps_limit %d ext_fps_limit %d max_frame_latency %d vram_budget_mb %d "
-         "flip_model %d workset %d mip_residency %d mip_ram_mb %d mip_force_evict %d rt_recycle %d ue_cvars %d",
+         "flip_model %d workset %d mip_residency %d mip_ram_mb %d mip_force_evict %d rt_recycle %d ue_cvars %d "
+         "present_cpu_sets %d texture_dedup %d stream_io %d mip_prediction %d mip_streaming %d",
          c.process, c.priority, c.residency, c.fps_limit, c.ext_fps_limit, c.max_frame_latency, c.vram_budget_mb,
-         c.flip_model, c.workset, c.mip_residency, c.mip_ram_mb, c.mip_force_evict, c.rt_recycle, c.ue_cvars);
+         c.flip_model, c.workset, c.mip_residency, c.mip_ram_mb, c.mip_force_evict, c.rt_recycle, c.ue_cvars,
+         c.present_cpu_sets, c.texture_dedup, c.stream_io, c.mip_prediction, c.mip_streaming);
 }
 
 const Config& config() { return g_config; }

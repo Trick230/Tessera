@@ -14,6 +14,7 @@ add_library(tessera_d3d11 SHARED
   module.cpp
   process.cpp
   pacing.cpp
+  prediction.cpp
   memory.cpp
   nvapi.cpp
   flip.cpp

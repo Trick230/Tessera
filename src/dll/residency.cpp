@@ -14,7 +14,9 @@
 #include "log.h"
 #include "memory.h"
 #include "module.h"
+#include "prediction.h"
 #include "session.h"
+#include "texture_data.h"
 #include "vtable.h"
 #include "workset.h"
 
@@ -41,6 +43,8 @@ constexpr uint64_t kTile = 64 * 1024;
 constexpr uint64_t kMinTop = 1ull << 20;             // top mips below 1 MB are not worth managing
 constexpr uint64_t kPendingCap = 512ull << 20;       // staging copies waiting for their upload
 constexpr uint64_t kUploadPerFrame = 64ull << 20;
+constexpr uint64_t kStreamPerFrame = 2ull << 20;
+constexpr uint32_t kSpareMaxTiles = 512;  // 32 MiB
 constexpr uint64_t kEvictPerFrameBytes = 64ull << 20;
 constexpr int kEvictPerFrame = 16;
 constexpr int kCand = 256;
@@ -64,6 +68,7 @@ struct Res {
     std::atomic<uint32_t> flags;
     std::atomic<uint32_t> epoch;  // g_epoch when found bound at an eviction batch
     std::atomic<uint32_t> restores;  // since it was created: each doubles the cold time before eviction (M4)
+    std::atomic<uint64_t> asset;
     std::atomic<std::atomic<int>*> views;  // its tracked views alive (workset)
     ID3D11Texture2D* tex;      // our own reference
     ID3D11Buffer* pool;        // tile pool: the tail (mips 1..) at 0, then mip 0 unless evicted
@@ -71,6 +76,8 @@ struct Res {
     uint32_t tiles0, tail;     // tiles of mip 0 and of the rest
     uint64_t up_bytes, top_bytes;
     uint32_t width, height, mips;
+    uint32_t upload_mips, upload_row;
+    bool upload_mapped;
     DXGI_FORMAT format;
     float lod;  // the game's resource min LOD
 };
@@ -135,6 +142,22 @@ uint32_t g_cand[kCand];
 int g_cand_n = 0, g_cand_pos = 0;
 uint32_t g_cand_cutoff = 0;
 uint64_t g_want = 0;
+SRWLOCK g_predict_lock = SRWLOCK_INIT;
+TextureHint g_predicted[8];
+unsigned g_predicted_count = 0;
+std::atomic<uint32_t> g_on_demand{0};
+std::atomic<uint32_t> g_predicted_restores{0};
+SRWLOCK g_spare_lock = SRWLOCK_INIT;
+struct SparePool {
+    ID3D11Device* requested_device;
+    ID3D11Buffer* buffer;
+    ID3D11Device* buffer_device;  // held by buffer
+    ID3D11Device* blocked_device;  // compared only; a replacement may need to take over
+    uint64_t last_request;
+    uint32_t requested_tiles, buffer_tiles;
+};
+SparePool g_spare;
+std::atomic<uint32_t> g_spare_hits{0}, g_split_batches{0};
 
 void STDMETHODCALLTYPE hk_CopySub(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT,
                                   const D3D11_BOX*);
@@ -296,6 +319,83 @@ ID3D11Buffer* make_pool(ID3D11Device* dev, uint32_t tiles) {
     return SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &b)) ? b : nullptr;
 }
 
+ID3D11Buffer* initial_pool(ID3D11Device* dev, uint32_t tiles) {
+    if (!config().mip_streaming || tiles > kSpareMaxTiles || (dev->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED) ||
+        !TryAcquireSRWLockExclusive(&g_spare_lock))
+        return make_pool(dev, tiles);
+    if (dev == g_spare.blocked_device) {
+        ReleaseSRWLockExclusive(&g_spare_lock);
+        return make_pool(dev, tiles);
+    }
+    ID3D11Buffer* hit = nullptr;
+    if (g_spare.buffer_device == dev && g_spare.buffer_tiles == tiles) {
+        hit = g_spare.buffer;
+        g_spare.buffer = nullptr;
+        g_spare.buffer_device = nullptr;
+        g_spare.buffer_tiles = 0;
+        g_spare_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    ID3D11Device* previous = g_spare.requested_device;
+    dev->AddRef();
+    g_spare.requested_device = dev;
+    g_spare.requested_tiles = tiles;
+    g_spare.last_request = GetTickCount64();
+    ReleaseSRWLockExclusive(&g_spare_lock);
+    if (previous) previous->Release();
+    return hit ? hit : make_pool(dev, tiles);
+}
+
+void retire_spare(ID3D11Device* device) {
+    AcquireSRWLockExclusive(&g_spare_lock);
+    g_spare.blocked_device = device;
+    auto* requested = g_spare.requested_device;
+    auto* buffer = g_spare.buffer;
+    g_spare.requested_device = nullptr;
+    g_spare.buffer = nullptr;
+    g_spare.buffer_device = nullptr;
+    g_spare.buffer_tiles = 0;
+    ReleaseSRWLockExclusive(&g_spare_lock);
+    if (buffer) buffer->Release();
+    if (requested) requested->Release();
+}
+
+void warm_pool_tick() {
+    const uint64_t now = GetTickCount64();
+    uint64_t usage = 0, budget = 0;
+    const bool room = memory_local(&usage, &budget) && usage < budget / 10 * 9;
+    AcquireSRWLockExclusive(&g_spare_lock);
+    auto* dev = g_spare.requested_device;
+    const uint32_t tiles = g_spare.requested_tiles;
+    const uint64_t requested_at = g_spare.last_request;
+    g_spare.requested_device = nullptr;
+    const bool valid = room && now - requested_at < 1500;
+    auto* old = g_spare.buffer;
+    const bool same = old && (!dev || (g_spare.buffer_device == dev && g_spare.buffer_tiles == tiles));
+    if (same && valid) old = nullptr;
+    if (old) {
+        g_spare.buffer = nullptr;
+        g_spare.buffer_device = nullptr;
+        g_spare.buffer_tiles = 0;
+    }
+    ReleaseSRWLockExclusive(&g_spare_lock);
+    if (old) old->Release();
+    if (!dev) return;
+    if (valid && !same && uint64_t(tiles) * kTile < budget / 10 * 9 - usage) {
+        if (auto* b = make_pool(dev, tiles)) {
+            AcquireSRWLockExclusive(&g_spare_lock);
+            const bool keep = dev == g_dev.load(std::memory_order_acquire) && dev != g_spare.blocked_device;
+            if (keep) {
+                g_spare.buffer = b;
+                g_spare.buffer_device = dev;
+                g_spare.buffer_tiles = tiles;
+            }
+            ReleaseSRWLockExclusive(&g_spare_lock);
+            if (!keep) b->Release();
+        }
+    }
+    dev->Release();
+}
+
 // The tail (standard mips 1.. and the packed ones, walked linearly from
 // subresource 1) at pool offset 0, mip 0 after it when with_top; the rest
 // unmapped. A texture maps from one pool at a time.
@@ -372,14 +472,53 @@ bool grow_top(Res& r) {
     residency_check_hooks(g_imm);
     return SUCCEEDED(hr);  // a failed map leaves the grown pool: no harm, freed with it
 }
-// Under g_op on the immediate context's thread. Pending -> Resident.
-bool upload(Res& r) {
-    if (FAILED(map_tiles(r.tex, r.pool, r.tiles0, r.tail, true))) return false;
-    orig<CopyResFn>(g_copy_res, g_imm)(g_imm, r.tex, r.staging);
+void finish_upload(Res& r) {
     r.staging->Release();
     r.staging = nullptr;
     g_pending.fetch_sub(r.up_bytes, std::memory_order_relaxed);
     r.state.store(kResident, std::memory_order_release);
+}
+
+// Under g_op. Upload small mips first and limit the large mip by complete
+// rows of blocks. Keep staging until every copy has been queued.
+uint64_t upload_parts(Res& r, uint64_t budget) {
+    const TextureLayout layout = texture_layout(r.format);
+    if (!r.upload_mapped) {
+        if (FAILED(map_tiles(r.tex, r.pool, r.tiles0, r.tail, true))) return 0;
+        r.upload_mapped = true;
+    }
+    uint64_t copied = 0;
+    while (r.upload_mips && copied < budget) {
+        const uint32_t mip = r.upload_mips - 1;
+        const uint32_t w = std::max(1u, r.width >> mip), h = std::max(1u, r.height >> mip);
+        const uint32_t total_rows = blocks(h, layout.block), pitch = blocks(w, layout.block) * layout.bytes;
+        const uint32_t left = total_rows - r.upload_row;
+        const uint32_t rows = static_cast<uint32_t>(std::min<uint64_t>(left, (budget - copied) / pitch));
+        if (!rows || (rows < left && (w % layout.block || h % layout.block))) break;
+        const uint32_t y = r.upload_row * layout.block;
+        const D3D11_BOX box = {0, y, 0, w, std::min(h, y + rows * layout.block), 1};
+        orig<CopySubFn>(g_copy_sub, g_imm)(g_imm, r.tex, mip, 0, y, 0, r.staging, mip,
+                                          !y && rows == total_rows ? nullptr : &box);
+        r.upload_row += rows;
+        if (r.upload_row == total_rows) {
+            r.upload_row = 0;
+            --r.upload_mips;
+        }
+        copied += uint64_t(rows) * pitch;
+    }
+    if (!r.upload_mips) finish_upload(r);
+    return copied;
+}
+
+// Under g_op on the immediate context's thread. Pending -> Resident.
+bool upload(Res& r) {
+    if (r.upload_mapped) {
+        upload_parts(r, UINT64_MAX);
+        return r.state.load(std::memory_order_relaxed) == kResident;
+    }
+    if (FAILED(map_tiles(r.tex, r.pool, r.tiles0, r.tail, true))) return false;
+    orig<CopyResFn>(g_copy_res, g_imm)(g_imm, r.tex, r.staging);
+    finish_upload(r);
     return true;
 }
 
@@ -399,7 +538,7 @@ bool restore(Res& r) {
 }
 
 // On the immediate context's thread: makes texture i whole now.
-void make_whole(uint32_t i) {
+void make_whole(uint32_t i, bool on_demand = false) {
     Res& r = g_res[i];
     const bool outer = !t_in_op;
     t_in_op = true;
@@ -408,6 +547,7 @@ void make_whole(uint32_t i) {
     if (st == kPending) {
         if (!upload(r)) push(g_up, i);
     } else if (st == kEvicted) {
+        if (on_demand && config().mip_prediction) g_on_demand.fetch_add(1, std::memory_order_relaxed);
         if (!restore(r)) {
             g_late.fetch_add(1, std::memory_order_relaxed);
             push(g_need, i);
@@ -417,6 +557,52 @@ void make_whole(uint32_t i) {
     if (outer) t_in_op = false;
     // Our copies ran through the switched-in thunk, which switched back over our patch.
     if (st == kPending || st == kEvicted) residency_check_hooks(g_imm);
+}
+
+void restore_predictions() {
+    if (g_evict_off.load(std::memory_order_relaxed)) return;
+    TextureHint next[_countof(g_predicted)];
+    unsigned count = 0;
+    if (TryAcquireSRWLockExclusive(&g_predict_lock)) {
+        count = g_predicted_count;
+        std::copy_n(g_predicted, count, next);
+        g_predicted_count = 0;
+        ReleaseSRWLockExclusive(&g_predict_lock);
+    }
+    if (!count) return;
+    uint64_t usage = 0, budget = 0;
+    if (!memory_local(&usage, &budget)) return;
+    const uint64_t ceiling = budget / 100 * 92;
+    if (usage >= ceiling) return;
+    static uint32_t last_misses = 0;
+    static unsigned margin = 16;
+    const uint32_t misses = g_on_demand.load(std::memory_order_relaxed);
+    if (misses != last_misses)
+        margin = std::min(margin + 1, 32u);
+    else
+        margin = std::max(margin - 1, 16u);
+    last_misses = misses;
+    uint64_t room = std::min<uint64_t>(ceiling - usage, uint64_t(margin) << 20);
+    if (!TryAcquireSRWLockExclusive(&g_op)) return;
+    t_in_op = true;
+    unsigned restored = 0;
+    for (unsigned k = 0; k < count && restored < 2; ++k) {
+        Res& r = g_res[next[k].resident_index - 1];
+        if (r.state.load(std::memory_order_acquire) != kEvicted ||
+            r.asset.load(std::memory_order_relaxed) != next[k].key || r.top_bytes > room)
+            continue;
+        if (restore(r)) {
+            r.last.store(g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            room -= r.top_bytes;
+            ++restored;
+        }
+    }
+    t_in_op = false;
+    ReleaseSRWLockExclusive(&g_op);
+    if (restored) {
+        g_predicted_restores.fetch_add(restored, std::memory_order_relaxed);
+        residency_check_hooks(g_imm);
+    }
 }
 
 // Under g_op, Present thread. Resident -> Evicted, unless used since cutoff.
@@ -779,8 +965,10 @@ bool track_device(ID3D11Device* dev) {
 }
 
 void on_device_locked(ID3D11Device* dev) {
+    ID3D11Device* previous = g_dev.load(std::memory_order_relaxed);
+    if (previous && previous != dev && config().mip_streaming) retire_spare(previous);
     if (g_on.load(std::memory_order_acquire) && !g_dev_gone.load(std::memory_order_acquire)) {
-        if (dev == g_dev.load(std::memory_order_relaxed)) return;
+        if (dev == previous) return;
         // The managed device is alive: this one takes over once it is
         // destroyed and this one creates a texture (residency_create).
         const auto d = reinterpret_cast<uintptr_t>(dev);
@@ -799,6 +987,7 @@ void on_device_locked(ID3D11Device* dev) {
     // The previous device is gone (or never managed): forget it before trying
     // this one, so a failure below leaves nothing pointing at a freed device.
     forget_device();
+    if (config().mip_streaming) retire_spare(nullptr);
     g_dev_gone.store(false, std::memory_order_relaxed);
     // Its textures went with it: nothing is evicted, nothing is left to
     // restore. What the game itself does still holds (replayed lists too).
@@ -893,10 +1082,10 @@ bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTU
     // A waiting device creates a texture (it is alive) once the managed one
     // is destroyed: the first to do so takes over.
     if (!g_on.load(std::memory_order_acquire) || g_dev_gone.load(std::memory_order_acquire)) {
-        const auto d = reinterpret_cast<uintptr_t>(dev);
+        const auto device_key = reinterpret_cast<uintptr_t>(dev);
         for (auto& w : g_waiting) {
-            uintptr_t seen = d;
-            if (w.load(std::memory_order_relaxed) != d || !w.compare_exchange_strong(seen, 0)) continue;
+            uintptr_t seen = device_key;
+            if (w.load(std::memory_order_relaxed) != device_key || !w.compare_exchange_strong(seen, 0)) continue;
             logf("residency: the managed device is gone, the new device takes over");
             residency_on_device(dev);
             break;
@@ -918,6 +1107,7 @@ bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTU
         return false;
     }
     uint32_t i;
+    uint64_t asset = 0;
     ID3D11Texture2D* staging = nullptr;
     ID3D11Texture2D* tex = nullptr;
     ID3D11Buffer* pool = nullptr;
@@ -943,9 +1133,10 @@ bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTU
     tiles0 = sub0.WidthInTiles * sub0.HeightInTiles * sub0.DepthInTiles;
     if (packed.NumStandardMips < 1 || n_sub != 1 || tiles0 < 4 || total <= tiles0) goto fail;
     tex->GetDesc(&got);  // the mip count when the game asked for a full chain
-    pool = make_pool(dev, total);  // memory committed when the tiles are mapped
+    pool = initial_pool(dev, total);
     if (!pool || !attach_holder(tex, pool)) goto fail;
-    views = workset_on_texture(tex, bytes, i + 1);
+    asset = config().mip_prediction ? texture_prediction_key(d, init) : 0;
+    views = workset_on_texture(tex, bytes, i + 1, asset);
     if (!views) goto fail;
     {
         Res& r = g_res[i];
@@ -959,9 +1150,13 @@ bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTU
         r.width = d.Width;
         r.height = d.Height;
         r.mips = got.MipLevels;
+        r.upload_mips = r.mips;
+        r.upload_row = 0;
+        r.upload_mapped = false;
         r.format = d.Format;
         r.lod = 0.0f;
         r.restores.store(0, std::memory_order_relaxed);
+        r.asset.store(asset, std::memory_order_relaxed);
         r.views.store(views, std::memory_order_relaxed);
         r.epoch.store(0, std::memory_order_relaxed);
         r.last.store(g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -1008,7 +1203,23 @@ void residency_on_use(uint32_t i, ID3D11DeviceContext* ctx) {
     if (deferred)
         push(g_need, i);
     else
-        make_whole(i);
+        make_whole(i, true);
+}
+
+void residency_predict(uint32_t i, uint64_t key) {
+    if (!g_on.load(std::memory_order_acquire) || i >= g_hi.load(std::memory_order_acquire)) return;
+    const Res& r = g_res[i];
+    if (r.state.load(std::memory_order_acquire) != kEvicted || r.asset.load(std::memory_order_relaxed) != key ||
+        !TryAcquireSRWLockExclusive(&g_predict_lock))
+        return;
+    if (g_predicted_count < _countof(g_predicted)) {
+        const auto* end = g_predicted + g_predicted_count;
+        if (std::find_if(static_cast<const TextureHint*>(g_predicted), end, [i](const TextureHint& hint) {
+                return hint.resident_index == i + 1;
+            }) == end)
+            g_predicted[g_predicted_count++] = {key, i + 1};
+    }
+    ReleaseSRWLockExclusive(&g_predict_lock);
 }
 
 void residency_after_present() {
@@ -1080,11 +1291,35 @@ bool residency_present(IDXGISwapChain* sc) {
     trim_if_due();
 
     drain_need();
+    if (config().mip_prediction) restore_predictions();
     uint64_t up = 0;
-    while (up < kUploadPerFrame && pop(g_up, &i)) {
+    const bool split = config().mip_streaming;
+    const uint64_t upload_limit = split ? kStreamPerFrame : kUploadPerFrame;
+    for (unsigned jobs = 0; up < upload_limit && (!split || jobs < 4) && pop(g_up, &i); ++jobs) {
         if (g_res[i].state.load(std::memory_order_acquire) != kPending) continue;
-        up += g_res[i].up_bytes;
-        make_whole(i);
+        Res& r = g_res[i];
+        if (!split || !texture_layout(r.format).block) {
+            if (split && r.up_bytes > upload_limit - up) continue;  // first use will upload it whole
+            up += r.up_bytes;
+            make_whole(i);
+            continue;
+        }
+        if (!TryAcquireSRWLockExclusive(&g_op)) {
+            push(g_up, i);
+            break;
+        }
+        t_in_op = true;
+        const uint64_t copied = r.state.load(std::memory_order_acquire) == kPending ? upload_parts(r, upload_limit - up) : 0;
+        const bool pending = r.state.load(std::memory_order_relaxed) == kPending;
+        t_in_op = false;
+        ReleaseSRWLockExclusive(&g_op);
+        if (copied) residency_check_hooks(g_imm);
+        if (pending) {
+            push(g_up, i);
+            if (copied) g_split_batches.fetch_add(1, std::memory_order_relaxed);
+            break;  // continue this upload next frame, or finish before its first use
+        }
+        up += copied;
     }
     if (g_evict_off.load(std::memory_order_relaxed)) {
         if (g_restore_due.exchange(false)) restore_all(0);
@@ -1177,6 +1412,18 @@ static void trim_if_due() {
 
 void residency_frame() { g_frame.fetch_add(1, std::memory_order_relaxed); }
 
+void residency_streaming_tick() {
+    warm_pool_tick();
+    static uint32_t last_spares = 0, last_batches = 0;
+    const auto spares = g_spare_hits.load(std::memory_order_relaxed);
+    const auto batches = g_split_batches.load(std::memory_order_relaxed);
+    if (spares != last_spares || batches != last_batches) {
+        logf("mip streaming: %u spare pool hits, %u partial upload batches", spares, batches);
+        last_spares = spares;
+        last_batches = batches;
+    }
+}
+
 void residency_background_tick() {
     if (!g_on.load(std::memory_order_acquire)) return;
     // The frame counter of each of the last 80 ticks (1 s apart).
@@ -1255,5 +1502,11 @@ void residency_background_tick() {
     session_push(rec);
     last_restores = restores;
     last_evictions = evictions;
+    static uint32_t last_predictions = 0;
+    const uint32_t predictions = g_predicted_restores.load(std::memory_order_relaxed);
+    if (predictions != last_predictions) {
+        logf("mip prediction: %u predictive restores", predictions);
+        last_predictions = predictions;
+    }
 }
 }  // namespace tessera

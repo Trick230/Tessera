@@ -32,6 +32,7 @@ bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTU
 // A view of managed texture i is bound (or it is a copy source) on ctx.
 // On the immediate context the texture is whole when this returns.
 void residency_on_use(uint32_t i, ID3D11DeviceContext* ctx);
+void residency_predict(uint32_t i, uint64_t key);
 // Its use cannot be seen (untracked or foreign view): never evict it.
 void residency_pin(uint32_t i);
 void residency_pin_resource(ID3D11Resource* res);
@@ -46,4 +47,5 @@ void residency_frame();
 // From the writer thread, about once a second: picks cold textures and
 // pushes a RESIDENCY record.
 void residency_background_tick();
+void residency_streaming_tick();
 }  // namespace tessera

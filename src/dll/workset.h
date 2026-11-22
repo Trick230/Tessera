@@ -27,7 +27,7 @@ bool workset_adopt(ID3D11DeviceContext* imm);
 // its M3 residency index + 1 (0 = not managed): binds of its views then
 // call residency_on_use. Returns the texture's live-view counter, nullptr
 // when it could not be tracked.
-std::atomic<int>* workset_on_texture(ID3D11Texture2D* tex, uint64_t bytes, uint32_t res = 0);
+std::atomic<int>* workset_on_texture(ID3D11Texture2D* tex, uint64_t bytes, uint32_t res = 0, uint64_t key = 0);
 // Any SRV; kept only when it views a tracked texture. A view of a managed
 // texture that cannot be tracked pins the texture (residency_pin).
 void workset_on_srv(ID3D11Resource* res, ID3D11ShaderResourceView* view);
