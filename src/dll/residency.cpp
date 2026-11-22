@@ -2,7 +2,7 @@
 #include "residency.h"
 
 #include <windows.h>
-#include <d3d11_3.h>
+#include <d3d11_4.h>
 #include <intrin.h>
 
 #include <algorithm>
@@ -18,6 +18,7 @@
 #include "session.h"
 #include "texture_data.h"
 #include "texture_quality.h"
+#include "upload_flight.h"
 #include "vtable.h"
 #include "workset.h"
 
@@ -158,6 +159,94 @@ struct SparePool {
 };
 SparePool g_spare;
 std::atomic<uint32_t> g_spare_hits{0}, g_split_batches{0};
+
+// Counts Tessera's copies from staging, including mandatory uploads that
+// bypass the speculative limit. The old CPU-side staging cap is separate.
+UploadFlight g_upload_flight;  // g_op
+std::atomic<uint64_t> g_upload_bytes{0}, g_upload_peak{0}, g_upload_defers{0};
+constexpr GUID kUploadMarker = {0x6ca31f89, 0x17b4, 0x4d87, {0x9d, 0x21, 0x8c, 0x4c, 0xd4, 0x42, 0x7f, 0x35}};
+
+// The swap chain owns this reference. A fence kept on the device or in a
+// process global would keep a replaced device alive.
+struct UploadMarker final : IUnknown {
+    std::atomic<long> refs{1};
+    ID3D11Fence* fence = nullptr;
+    uint64_t signaled = 0;  // g_op
+    std::atomic<bool> failed{false};
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (id != __uuidof(IUnknown)) return E_NOINTERFACE;
+        *out = static_cast<IUnknown*>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(refs.fetch_add(1) + 1); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const long n = refs.fetch_sub(1) - 1;
+        if (!n) {
+            if (fence) fence->Release();
+            delete this;
+        }
+        return static_cast<ULONG>(n);
+    }
+};
+
+UploadMarker* get_upload_marker(IDXGISwapChain* sc) {
+    UploadMarker* marker = nullptr;
+    UINT size = sizeof marker;
+    return SUCCEEDED(sc->GetPrivateData(kUploadMarker, &size, &marker)) ? marker : nullptr;
+}
+
+struct UploadFrame {
+    UploadMarker* marker;
+
+    explicit UploadFrame(IDXGISwapChain* sc) : marker(config().mip_streaming ? get_upload_marker(sc) : nullptr) {
+        if (!tracked() || !TryAcquireSRWLockExclusive(&g_op)) return;
+        if (g_upload_flight.bytes()) {
+            const uint64_t done = marker->fence->GetCompletedValue();
+            if (done == UINT64_MAX) fail();
+            else g_upload_flight.observe(done);
+        }
+        ReleaseSRWLockExclusive(&g_op);
+    }
+    bool tracked() const { return marker && !marker->failed.load(std::memory_order_relaxed); }
+
+    ~UploadFrame() {
+        if (!marker) return;
+        if (tracked() && TryAcquireSRWLockExclusive(&g_op)) {
+            const uint64_t queued = g_upload_flight.bytes();
+            if (queued && marker->signaled != g_upload_flight.submitted) {
+                t_in_op = true;
+                ID3D11DeviceContext4* ctx4 = nullptr;
+                HRESULT hr = g_imm->QueryInterface(IID_PPV_ARGS(&ctx4));
+                if (SUCCEEDED(hr)) {
+                    hr = ctx4->Signal(marker->fence, g_upload_flight.submitted);
+                    ctx4->Release();
+                }
+                t_in_op = false;
+                if (FAILED(hr)) fail();
+                else marker->signaled = g_upload_flight.submitted;
+            }
+            if (tracked()) {
+                g_upload_bytes.store(queued, std::memory_order_relaxed);
+                g_upload_peak.store(std::max(queued, g_upload_peak.load(std::memory_order_relaxed)),
+                                    std::memory_order_relaxed);
+            }
+            ReleaseSRWLockExclusive(&g_op);
+        }
+        marker->Release();
+    }
+    void fail() {
+        marker->failed.store(true, std::memory_order_relaxed);
+        g_upload_bytes.store(0, std::memory_order_relaxed);
+    }
+};
+
+void note_upload(uint64_t copied) {
+    if (config().mip_streaming) g_upload_flight.submitted += copied;
+}
 
 void STDMETHODCALLTYPE hk_CopySub(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT,
                                   const D3D11_BOX*);
@@ -504,6 +593,7 @@ uint64_t upload_parts(Res& r, uint64_t budget) {
         }
         copied += uint64_t(rows) * pitch;
     }
+    note_upload(copied);
     if (!r.upload_mips) finish_upload(r);
     return copied;
 }
@@ -516,6 +606,7 @@ bool upload(Res& r) {
     }
     if (FAILED(map_tiles(r.tex, r.pool, r.tiles0, r.tail, true))) return false;
     orig<CopyResFn>(g_copy_res, g_imm)(g_imm, r.tex, r.staging);
+    note_upload(r.up_bytes);
     finish_upload(r);
     return true;
 }
@@ -525,6 +616,7 @@ bool upload(Res& r) {
 bool restore(Res& r) {
     if (!grow_top(r)) return false;
     copy_top(r.tex, r.staging);
+    note_upload(r.top_bytes);
     set_lod(r.tex, r.lod);
     r.staging->Release();
     r.staging = nullptr;
@@ -557,7 +649,7 @@ void make_whole(uint32_t i, bool on_demand = false) {
     if (st == kPending || st == kEvicted) residency_check_hooks(g_imm);
 }
 
-void restore_predictions() {
+void restore_predictions(bool tracked_uploads) {
     if (g_evict_off.load(std::memory_order_relaxed)) return;
     TextureHint next[_countof(g_predicted)];
     unsigned count = 0;
@@ -583,12 +675,17 @@ void restore_predictions() {
     uint64_t room = std::min<uint64_t>(ceiling - usage, uint64_t(margin) << 20);
     if (!TryAcquireSRWLockExclusive(&g_op)) return;
     t_in_op = true;
-    unsigned restored = 0;
+    unsigned restored = 0, deferred = 0;
     for (unsigned k = 0; k < count && restored < 2; ++k) {
         Res& r = g_res[next[k].resident_index - 1];
         if (r.state.load(std::memory_order_acquire) != kEvicted ||
             r.asset.load(std::memory_order_relaxed) != next[k].key || r.top_bytes > room)
             continue;
+        if (tracked_uploads && !g_upload_flight.can_restore(r.top_bytes)) {
+            g_upload_defers.fetch_add(1, std::memory_order_relaxed);
+            next[deferred++] = next[k];
+            continue;
+        }
         if (restore(r)) {
             r.last.store(g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
             room -= r.top_bytes;
@@ -597,6 +694,8 @@ void restore_predictions() {
     }
     t_in_op = false;
     ReleaseSRWLockExclusive(&g_op);
+    for (unsigned k = 0; k < deferred; ++k)
+        residency_predict(next[k].resident_index - 1, next[k].key);
     if (restored) {
         g_predicted_restores.fetch_add(restored, std::memory_order_relaxed);
         residency_check_hooks(g_imm);
@@ -932,6 +1031,12 @@ void forget_device() {
     g_dev2 = nullptr;
     g_dxgi3 = nullptr;
     g_trim_after = 0;
+    if (config().mip_streaming) {
+        AcquireSRWLockExclusive(&g_op);
+        g_upload_flight = {};
+        g_upload_bytes.store(0, std::memory_order_relaxed);
+        ReleaseSRWLockExclusive(&g_op);
+    }
 }
 
 // Set when the managed device is destroyed: only then may another device
@@ -1092,6 +1197,25 @@ void residency_on_device(ID3D11Device* dev) {
     AcquireSRWLockExclusive(&g_dev_lock);
     on_device_locked(dev);
     ReleaseSRWLockExclusive(&g_dev_lock);
+}
+
+void residency_on_swapchain(IDXGISwapChain* sc, ID3D11Device* dev) {
+    if (!config().mip_residency || !config().mip_streaming) return;
+    if (auto* old = get_upload_marker(sc)) {
+        old->Release();
+        return;
+    }
+    D3D11_FEATURE_DATA_D3D11_OPTIONS1 caps = {};
+    if (FAILED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &caps, sizeof caps)) ||
+        caps.TiledResourcesTier < D3D11_TILED_RESOURCES_TIER_2) return;
+    ID3D11Device5* dev5 = nullptr;
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dev5)))) return;
+    if (auto* marker = new (std::nothrow) UploadMarker()) {
+        if (SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&marker->fence))))
+            sc->SetPrivateDataInterface(kUploadMarker, marker);
+        marker->Release();
+    }
+    dev5->Release();
 }
 
 bool residency_create(ID3D11Device* dev, CreateTex2DFn create, const D3D11_TEXTURE2D_DESC& d,
@@ -1293,7 +1417,8 @@ void residency_pin_resource(ID3D11Resource* res) {
 static void trim_if_due();
 
 bool residency_present(IDXGISwapChain* sc) {
-    if (!g_on.load(std::memory_order_acquire) || !g_live.load(std::memory_order_relaxed) || t_in_op) return false;
+    if (!g_on.load(std::memory_order_acquire) || t_in_op) return false;
+    if (!g_live.load(std::memory_order_relaxed) && !g_upload_bytes.load(std::memory_order_relaxed)) return false;
     if (g_present_sc.load(std::memory_order_relaxed) != sc) {
         ID3D11Device* d = nullptr;
         bool ours = false;
@@ -1311,16 +1436,18 @@ bool residency_present(IDXGISwapChain* sc) {
     if (!g_present_ours.load(std::memory_order_relaxed)) return false;
     trim_if_due();
 
+    UploadFrame uploads(sc);
+    // The last texture can be dropped while its last upload is still in flight.
+    if (!g_live.load(std::memory_order_relaxed)) return false;
     drain_need();
-    if (config().mip_prediction) restore_predictions();
+    if (config().mip_prediction) restore_predictions(uploads.tracked());
     uint64_t up = 0;
     const bool split = config().mip_streaming;
     const uint64_t upload_limit = split ? kStreamPerFrame : kUploadPerFrame;
     for (unsigned jobs = 0; up < upload_limit && (!split || jobs < 4) && pop(g_up, &i); ++jobs) {
         if (g_res[i].state.load(std::memory_order_acquire) != kPending) continue;
         Res& r = g_res[i];
-        if (!split || !texture_layout(r.format).block) {
-            if (split && r.up_bytes > upload_limit - up) continue;  // first use will upload it whole
+        if (!split) {
             up += r.up_bytes;
             make_whole(i);
             continue;
@@ -1330,12 +1457,22 @@ bool residency_present(IDXGISwapChain* sc) {
             break;
         }
         t_in_op = true;
-        const uint64_t copied = r.state.load(std::memory_order_acquire) == kPending ? upload_parts(r, upload_limit - up) : 0;
+        const uint64_t frame_room = upload_limit - up;
+        const uint64_t budget = uploads.tracked() ? g_upload_flight.budget(frame_room) : frame_room;
+        uint64_t copied = 0;
+        bool speculatable = false;
+        if (r.state.load(std::memory_order_acquire) == kPending) {
+            const bool partial = texture_layout(r.format).block != 0;
+            speculatable = partial || r.up_bytes <= upload_limit;
+            if (budget && partial) copied = upload_parts(r, budget);
+            else if (speculatable && r.up_bytes <= budget && upload(r)) copied = r.up_bytes;
+        }
         const bool pending = r.state.load(std::memory_order_relaxed) == kPending;
         t_in_op = false;
         ReleaseSRWLockExclusive(&g_op);
         if (copied) residency_check_hooks(g_imm);
-        if (pending) {
+        if (pending && speculatable) {
+            if (budget < frame_room) g_upload_defers.fetch_add(1, std::memory_order_relaxed);
             push(g_up, i);
             if (copied) g_split_batches.fetch_add(1, std::memory_order_relaxed);
             break;  // continue this upload next frame, or finish before its first use
@@ -1442,6 +1579,18 @@ void residency_streaming_tick() {
         logf("mip streaming: %u spare pool hits, %u partial upload batches", spares, batches);
         last_spares = spares;
         last_batches = batches;
+    }
+    static uint64_t last_bytes = 0, last_peak = 0, last_defers = 0;
+    const auto bytes = g_upload_bytes.load(std::memory_order_relaxed);
+    const auto peak = g_upload_peak.load(std::memory_order_relaxed);
+    const auto defers = g_upload_defers.load(std::memory_order_relaxed);
+    if (bytes != last_bytes || peak != last_peak || defers != last_defers) {
+        logf("mip streaming backlog: %llu KiB in flight, peak %llu KiB, %llu speculative deferrals",
+             static_cast<unsigned long long>(bytes >> 10), static_cast<unsigned long long>(peak >> 10),
+             static_cast<unsigned long long>(defers));
+        last_bytes = bytes;
+        last_peak = peak;
+        last_defers = defers;
     }
 }
 

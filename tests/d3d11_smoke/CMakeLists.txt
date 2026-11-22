@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Runs a tiny D3D11 app with the layer next to it as d3d11.dll (app-folder
 # DLLs win over System32 for d3d11, which is not a KnownDLL).
-add_executable(d3d11_smoke main.cpp)
-target_include_directories(d3d11_smoke PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_executable(d3d11_smoke main.cpp upload_flight.cpp)
+target_include_directories(d3d11_smoke PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/dll)
 target_link_libraries(d3d11_smoke PRIVATE d3d11 dxgi d3dcompiler)
 target_compile_options(d3d11_smoke PRIVATE /EHsc)
 add_dependencies(d3d11_smoke tessera_d3d11)

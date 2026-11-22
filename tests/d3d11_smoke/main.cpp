@@ -1015,6 +1015,10 @@ int tiled() {
         g.ctx->PSSetShaderResources(0, 1, srv);  // the learned partner remains unbound
         Sleep(300);
         present_frames(g, 1);
+        if (stream) {
+            settle(g);  // let a deferred prediction retry after the preceding upload
+            present_frames(g, 1);
+        }
         if (!probe_all_mips(g, srv[1], 1)) return fail("content of the predicted texture");
         Sleep(1050);  // let the writer publish the prediction counter
     }
@@ -1399,7 +1403,10 @@ int uecvars_mode(bool stale) {
     return rc;
 }
 
+int upload_flight_probe();
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 2 && wcscmp(argv[1], L"--upload-flight") == 0) return upload_flight_probe();
     if (argc >= 2 && wcscmp(argv[1], L"--uecvars") == 0) return uecvars_mode(argc >= 3 && wcscmp(argv[2], L"stale") == 0);
     if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0)
         return bench(argc >= 3 && wcscmp(argv[2], L"repeated") == 0);

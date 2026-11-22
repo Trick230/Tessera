@@ -17,6 +17,7 @@ using CreateTex2DFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_TEX
 // From device creation, after workset_on_device: adopts the device when
 // nothing is managed yet and it supports tiled resources tier 2.
 void residency_on_device(ID3D11Device* dev);
+void residency_on_swapchain(IDXGISwapChain* sc, ID3D11Device* dev);
 // Every new deferred context: each has a vtable of its own. nullptr: new
 // contexts cannot be hooked (evictions off).
 void residency_on_context(ID3D11DeviceContext* ctx);

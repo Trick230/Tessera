@@ -57,6 +57,9 @@ if ($LASTEXITCODE -or -not (Test-Log "0 KB from the startup list") -or (Test-Log
 Set-Options @("mip_residency=1", "mip_force_evict=1", "mip_streaming=1", "mip_prediction=1")
 $env:TESSERA_SMOKE_MIP_STREAM = "1"
 $env:TESSERA_SMOKE_MIP_PREDICT = "1"
+$flight = & $exe --upload-flight
+$flight | Write-Host
+if ($LASTEXITCODE) { throw "Upload backpressure test failed ($LASTEXITCODE)" }
 $tiled = & $exe --tiled
 $tiled | Write-Host
 if ($LASTEXITCODE) { throw "Tier 2 render and device replacement test failed" }
@@ -66,6 +69,10 @@ if ("$tiled" -match "skipped") {
     if (-not (Test-Log "[1-9]\d* spare pool hits, [1-9]\d* partial upload batches") -or
         -not (Test-Log "[1-9]\d* predictive restores") -or -not (Test-Log "new device takes over")) {
         throw "Mip streaming, prediction or device replacement was not exercised"
+    }
+    if ("$flight" -match "PASS native D3D11 copy" -and
+        -not (Test-Log "mip streaming backlog: \d+ KiB in flight, peak [1-9]\d* KiB")) {
+        throw "The mip streaming fence did not report queued work"
     }
     "PASS spare tiles, split uploads, predictive restore and device replacement"
 }

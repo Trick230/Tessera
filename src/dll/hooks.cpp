@@ -671,6 +671,7 @@ void on_swapchain(IDXGISwapChain* sc) {
         // Inside D3D11CreateDeviceAndSwapChain that device is not hooked yet.
         ID3D11Device* dev = nullptr;
         if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&dev)))) {
+            residency_on_swapchain(sc, dev);
             ID3D11DeviceContext* imm = nullptr;
             dev->GetImmediateContext(&imm);
             residency_check_hooks(imm);
