@@ -420,14 +420,13 @@ fn shader_state(
             "No shaders stored yet. The warm-up is for D3D11: play once on D3D11 with the layer on, then Prepare shaders compiles what it stored."
         }.to_string());
         ("Nothing stored".to_string(), NEUTRAL)
-    } else if c.all_compiled() {
-        d.push(format!("The warm-up exercised all {} supported stored shaders on the installed driver.", c.compiled));
-        (format!("All {}", c.compiled), OK)
+    } else if warmable == 0 {
+        ("No supported shaders".to_string(), NEUTRAL)
     } else {
         d.push(format!("{} exercised in a test draw or dispatch.", c.compiled));
         let created = c.compiled + c.created_only;
         let v = format!("{created} of {warmable} created");
-        (v, if c.pending > 0 || c.failed > 0 || c.created_only > 0 { WARN } else { OK })
+        (v, if created == warmable { OK } else { WARN })
     };
     if c.skipped > 0 {
         d.push(format!("{} are D3D12 shaders (DXIL) the D3D11 warm-up cannot take.", c.skipped));
@@ -435,7 +434,7 @@ fn shader_state(
     if c.created_only > 0 {
         d.push(format!("{} created without a compatible draw or dispatch.", c.created_only));
     }
-    if c.stored > 0 {
+    if c.pending > 0 || c.failed > 0 {
         d.push(format!("{} pending, {} failed.", c.pending, c.failed));
     }
     if let Some(n) = c.unsupported_in_install.filter(|&n| n > 0) {
@@ -452,14 +451,14 @@ fn shader_state(
     }
     rows.push(line("Shader preparation", value, d, tone));
 
-    // Coverage: how many of the shaders the last run created were already stored.
+    // Newly captured shaders from the last recorded game session.
     let (value, tone, d) = match run {
         Some((n, new)) => {
-            let mut d = vec![format!("The last run created {n} shaders; {} were already stored.", n - new)];
+            let mut d = vec![format!("{n} shader creations recorded during play.")];
             if new > 0 {
-                d.push(format!("The other {new} are stored now and compile in the next preparation."));
+                d.push("New shaders are saved for the next preparation.".to_string());
             }
-            (format!("{} of {n} already stored", n - new), if new == 0 { OK } else { WARN }, d)
+            (format!("{new} new"), if new == 0 { OK } else { WARN }, d)
         }
         None => (
             "Unknown".to_string(),
