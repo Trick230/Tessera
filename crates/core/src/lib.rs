@@ -11,6 +11,7 @@ pub mod library;
 pub mod limits;
 pub mod mip_feedback;
 pub mod oodle;
+mod unreal_key;
 mod unreal_pak;
 pub mod pe;
 pub mod paths;

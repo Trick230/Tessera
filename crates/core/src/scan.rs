@@ -471,15 +471,19 @@ pub fn files(dir: &Path) -> Vec<PathBuf> {
 
 /// Scans `dir`; returns the D3D11-creatable shaders (sorted by hash) and stats.
 pub fn scan_dir(dir: &Path) -> (Vec<Shader>, ScanStats) {
-    scan_dir_with_key(dir, None)
+    scan_paths(dir, &files(dir), None, None)
 }
 
-fn scan_dir_with_key(dir: &Path, key: Option<&PakKey>) -> (Vec<Shader>, ScanStats) {
+fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
+              detected: Option<&crate::unreal_key::DetectedKeys>) -> (Vec<Shader>, ScanStats) {
     let oodle = oodle::find(dir).and_then(|p| oodle::load(&p));
     // Each thread may hold a few STREAM_CAP buffers (a stream and the streams
     // inside it), so the thread count bounds the scan's memory.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(SCAN_THREADS);
-    let scan = || files(dir).par_iter().map(|p| scan_file(p, oodle, key)).reduce(Found::default, Found::merge);
+    let scan = || paths.par_iter().map(|p| {
+        let key = detected.and_then(|keys| keys.for_archive(p)).or(key);
+        scan_file(p, oodle, key)
+    }).reduce(Found::default, Found::merge);
     let found = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
         Ok(pool) => pool.install(scan),
         Err(_) => scan(),
@@ -529,7 +533,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         m.len().hash(&mut key);
         m.modified().ok().hash(&mut key);
     }
-    format!("tessera-scan 4 {:016x}", key.finish())
+    format!("tessera-scan 5 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -581,6 +585,7 @@ pub struct ScanRecord {
     pub unreal_packages: Option<u64>,
     pub unreadable_unreal_packages: Option<u64>,
     pub locked_unreal_paks: Option<u64>,
+    pub auto_key_archives: Option<u64>,
 }
 
 pub fn record_at(base: &Path) -> Option<ScanRecord> {
@@ -592,6 +597,7 @@ pub fn record_at(base: &Path) -> Option<ScanRecord> {
         key, invalid: value("invalid "), unsupported: value("unsupported "),
         unreal_packages: value("unreal_packages "), unreadable_unreal_packages: value("unreadable_unreal_packages "),
         locked_unreal_paks: value("locked_unreal_paks "),
+        auto_key_archives: value("auto_key_archives "),
     })
 }
 
@@ -611,13 +617,15 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     let base = scan_base(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
     let key = install_key(exe, root);
     let pak_key = unreal_key_file(exe).and_then(|(p, _)| PakKey::from_file(&p));
-    let (mut shaders, stats) = scan_dir_with_key(root, pak_key.as_ref());
+    let paths = files(root);
+    let detected = crate::unreal_key::detect(exe, &paths);
+    let (mut shaders, stats) = scan_paths(root, &paths, pak_key.as_ref(), Some(&detected));
     let stored: std::collections::HashSet<u64> = crate::shaders::read(exe).iter().map(|s| s.hash).collect();
     shaders.retain(|s| !stored.contains(&s.hash));
     crate::shaders::write_base(&base, &shaders)?;
     fs::write(key_path(&base), format!(
-        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\n",
-        stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks
+        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\n",
+        stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks, detected.count()
     ))?;
     Ok(stats)
 }

@@ -27,10 +27,14 @@ impl PakKey {
         for (byte, hex) in key.iter_mut().zip(value.chunks_exact(2)) {
             *byte = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
         }
-        Some(Self(aes::Aes256::new((&key).into())))
+        Some(Self::from_bytes(&key))
     }
 
-    fn decode(&self, bytes: &mut [u8]) -> Option<()> {
+    pub(crate) fn from_bytes(key: &[u8; 32]) -> Self {
+        Self(aes::Aes256::new(key.into()))
+    }
+
+    pub(crate) fn decode(&self, bytes: &mut [u8]) -> Option<()> {
         if bytes.len() % 16 != 0 { return None; }
         for block in bytes.chunks_exact_mut(16) {
             self.0.decrypt_block(aes::cipher::Block::<aes::Aes256>::from_mut_slice(block));
@@ -53,7 +57,7 @@ fn offset(data: &mut &[u8]) -> Option<usize> {
     usize::try_from(u64::from_le_bytes(take(data, 8)?.try_into().ok()?)).ok()
 }
 
-fn path(data: &mut &[u8]) -> Option<String> {
+pub(crate) fn path(data: &mut &[u8]) -> Option<String> {
     let len = number(data)? as i32;
     let chars = usize::try_from(len.unsigned_abs()).ok()?;
     if !(1..=32768).contains(&chars) { return None; }
