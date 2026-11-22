@@ -56,6 +56,9 @@ export struct SessionInfo {
     display: string,
     note: string,
     safe-mode: bool,
+    tiled-tier: int,
+    recompressed-textures: int,
+    mip-feedback-samples: int,
 }
 
 // One line of the Shaders tab; tone 0 neutral, 1 good, 2 warning, 3 bad.
@@ -72,11 +75,33 @@ export struct ShaderState {
     rows: [ShaderRow],
 }
 
+export struct AdvancedOptions {
+    max-frame-latency: int,
+    present-cpu-sets: bool,
+    hybrid: bool,
+    mip-residency: bool,
+    mip-prediction: bool,
+    mip-streaming: bool,
+    tiled: bool,
+    tiled-hint: string,
+    texture-dedup: bool,
+    stream-io: int,
+    trace: bool,
+    texture-quality: int,
+    quality-ready: bool,
+    quality-status: string,
+    compressor: bool,
+    mip-feedback: bool,
+    feedback-ready: bool,
+    prepared-shaders: int,
+}
+
 // tessera.ini switches for an installed game.
 export struct GameSettings {
     present: bool,
     process: bool,
     residency: bool,
+    priority-blocked: bool,
     flip-model: bool,
     rt-recycle: bool,
     ue-streaming: bool,
@@ -85,6 +110,7 @@ export struct GameSettings {
     vram-options: [string],
     vram-index: int,
     vram-hint: string,
+    advanced: AdvancedOptions,
 }
 
 // Neutral greys; colour is kept for state only (ok, warning, error). The
@@ -222,10 +248,12 @@ component Btn inherits Rectangle {
 // stretches while pressed.
 component Toggle inherits Rectangle {
     in-out property <bool> checked;
+    in property <bool> enabled: true;
     callback toggled;
     width: 44px;
     height: 24px;
     border-radius: 6px;
+    opacity: root.enabled ? 1 : 0.45;
     background: root.checked
         ? (ta.has-hover ? Theme.graphite.brighter(0.1) : Theme.graphite)
         : (ta.has-hover ? #ffffff26 : #ffffff1c);
@@ -245,6 +273,7 @@ component Toggle inherits Rectangle {
         animate width { duration: 80ms; }
     }
     ta := TouchArea {
+        enabled: root.enabled;
         clicked => {
             root.checked = !root.checked;
             root.toggled();
@@ -275,6 +304,8 @@ component StepArrow inherits Rectangle {
 component Stepper inherits Rectangle {
     in property <[string]> model;
     in-out property <int> current-index;
+    in property <int> max-index: root.model.length - 1;
+    in property <bool> enabled: true;
     callback selected;
     width: 180px;
     height: 34px;
@@ -286,7 +317,7 @@ component Stepper inherits Rectangle {
         padding: 2px;
         StepArrow {
             glyph: "\u{E76B}";
-            enabled: root.current-index > 0;
+            enabled: root.enabled && root.current-index > 0;
             clicked => {
                 root.current-index -= 1;
                 root.selected();
@@ -305,7 +336,7 @@ component Stepper inherits Rectangle {
         }
         StepArrow {
             glyph: "\u{E76C}";
-            enabled: root.current-index < root.model.length - 1;
+            enabled: root.enabled && root.current-index < root.max-index;
             clicked => {
                 root.current-index += 1;
                 root.selected();
@@ -575,17 +606,27 @@ component PropRow inherits VerticalLayout {
     Hairline { }
 }
 
+component OptionSwitch inherits PropRow {
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    callback changed(bool);
+    Toggle { checked: root.checked; enabled: root.enabled; toggled => { root.changed(self.checked); } }
+}
+
 component Detail inherits Rectangle {
     in property <GameRow> game;
     in property <SessionInfo> session;
     in property <GameSettings> settings;
     in property <ShaderState> shaders;
+    in property <bool> busy;
     in-out property <int> tab;
     // Steam's key art for the game; empty when there is none.
     in property <image> hero;
     property <bool> has-hero: root.hero.width > 0;
     callback reset-safe-mode();
     callback settings-changed(bool, bool, bool, bool, bool, int, int);
+    callback advanced-changed(string, int);
+    callback prepare-quality();
 
     VerticalLayout {
         // The game and what Tessera knows about it at a glance, over its
@@ -662,6 +703,7 @@ component Detail inherits Rectangle {
                 Tab { text: "Session"; active: root.tab == 0; clicked => { root.tab = 0; } }
                 Tab { text: "Shaders"; active: root.tab == 3; clicked => { root.tab = 3; } }
                 Tab { text: "Settings"; active: root.tab == 1; clicked => { root.tab = 1; } }
+                Tab { text: "Textures"; active: root.tab == 4; clicked => { root.tab = 4; } }
                 Tab { text: "Files"; active: root.tab == 2; clicked => { root.tab = 2; } }
             }
             Hairline { }
@@ -763,9 +805,12 @@ component Detail inherits Rectangle {
                     }
                     PropRow {
                         label: "Memory priority";
-                        help: "Keeps render targets and large buffers in VRAM when memory runs short.";
+                        help: root.settings.priority-blocked
+                            ? "Can crash NVIDIA driver 621.14. Leave this off."
+                            : "Gives render targets and large buffers higher priority when VRAM runs short.";
                         residency := Toggle {
                             checked: root.settings.residency;
+                            enabled: !root.settings.priority-blocked || root.settings.residency;
                             toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
                         }
                     }
@@ -801,9 +846,112 @@ component Detail inherits Rectangle {
                             toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
                         }
                     }
+                    PropRow {
+                        label: "Maximum frame latency";
+                        help: "Limits how many frames can be queued ahead. Game default leaves the existing limit alone.";
+                        Stepper {
+                            width: 170px;
+                            enabled: !root.busy;
+                            model: ["Game default", "1 frame", "2 frames", "3 frames", "4 frames", "5 frames", "6 frames",
+                                    "7 frames", "8 frames", "9 frames", "10 frames", "11 frames", "12 frames",
+                                    "13 frames", "14 frames", "15 frames", "16 frames"];
+                            current-index: root.settings.advanced.max-frame-latency;
+                            selected => { root.advanced-changed("max_frame_latency", self.current-index); }
+                        }
+                    }
+                    if root.settings.advanced.hybrid: OptionSwitch {
+                        label: "Performance cores";
+                        help: "Uses the CPU's performance cores for the thread that presents frames.";
+                        checked: root.settings.advanced.present-cpu-sets;
+                        enabled: !root.busy;
+                        changed(value) => { root.advanced-changed("present_cpu_sets", value ? 1 : 0); }
+                    }
                     Text { text: "Changes apply the next time the game starts."; color: Theme.faint; font-size: 13px; }
                 }
-                if root.tab == 1 && !root.settings.present: Text {
+                if root.tab == 4 && root.settings.present: VerticalLayout {
+                    Text { text: "Streaming"; color: Theme.text; font-size: 16px; font-weight: 700; }
+                    OptionSwitch {
+                        label: "Mip residency";
+                        help: root.settings.advanced.tiled-hint;
+                        checked: root.settings.advanced.mip-residency;
+                        enabled: !root.busy && (root.settings.advanced.tiled || self.checked);
+                        changed(value) => { root.advanced-changed("mip_residency", value ? 1 : 0); }
+                    }
+                    OptionSwitch {
+                        label: "Mip prediction";
+                        help: "Learns which textures are used together. Helps prefetch and restores likely mips when residency is on.";
+                        checked: root.settings.advanced.mip-prediction;
+                        enabled: !root.busy;
+                        changed(value) => { root.advanced-changed("mip_prediction", value ? 1 : 0); }
+                    }
+                    OptionSwitch {
+                        label: "Split mip uploads";
+                        help: "Reuses spare tiles and spreads larger uploads over several frames. Needs mip residency.";
+                        checked: root.settings.advanced.mip-streaming;
+                        enabled: !root.busy && ((root.settings.advanced.tiled && root.settings.advanced.mip-residency) || self.checked);
+                        changed(value) => { root.advanced-changed("mip_streaming", value ? 1 : 0); }
+                    }
+                    OptionSwitch {
+                        label: "Texture deduplication";
+                        help: "Shares eligible immutable textures with identical pixels.";
+                        checked: root.settings.advanced.texture-dedup;
+                        enabled: !root.busy;
+                        changed(value) => { root.advanced-changed("texture_dedup", value ? 1 : 0); }
+                    }
+                    PropRow {
+                        label: "File prefetch";
+                        help: root.settings.advanced.trace
+                            ? "A trace is ready. Prefetch warms previously read file ranges at low priority."
+                            : "Select Learn, play once, then refresh to make Prefetch available.";
+                        Stepper {
+                            width: 170px;
+                            model: ["Off", "Learn", "Prefetch"];
+                            enabled: !root.busy;
+                            max-index: root.settings.advanced.trace ? 2 : 1;
+                            current-index: root.settings.advanced.stream-io;
+                            selected => { root.advanced-changed("stream_io", self.current-index); }
+                        }
+                    }
+                    Text {
+                        text: "Quality"; color: Theme.text; font-size: 16px; font-weight: 700;
+                        height: 38px; vertical-alignment: bottom;
+                    }
+                    PropRow {
+                        label: "Texture recompression";
+                        help: root.settings.advanced.compressor
+                            ? "Capture in one run, then prepare quality with the game closed. Apply uses approved textures."
+                            : "The texture compressor is missing. Already prepared textures can still be applied.";
+                        Stepper {
+                            width: 170px;
+                            model: ["Off", "Capture", "Apply"];
+                            enabled: !root.busy;
+                            max-index: root.settings.advanced.quality-ready ? 2 : 1;
+                            current-index: root.settings.advanced.texture-quality;
+                            selected => { root.advanced-changed("texture_quality", self.current-index); }
+                        }
+                    }
+                    PropRow {
+                        label: "Quality cache";
+                        help: root.settings.advanced.quality-status + (root.session.tiled-tier >= 0
+                            ? " Last run applied " + root.session.recompressed-textures + "." : "");
+                        Btn { text: "Prepare quality"; enabled: !root.busy; clicked => { root.prepare-quality(); } }
+                    }
+                    OptionSwitch {
+                        label: "Mip feedback";
+                        help: root.settings.advanced.feedback-ready
+                            ? root.settings.advanced.prepared-shaders
+                                + (root.settings.advanced.prepared-shaders == 1 ? " shader prepared." : " shaders prepared.")
+                                + (root.session.tiled-tier < 0 ? "" : " Last run recorded "
+                                  + root.session.mip-feedback-samples
+                                  + (root.session.mip-feedback-samples == 1 ? " mip sample." : " mip samples."))
+                            : "Records the mips requested by supported shaders. Play once and prepare quality first.";
+                        checked: root.settings.advanced.mip-feedback;
+                        enabled: !root.busy && (root.settings.advanced.feedback-ready || self.checked);
+                        changed(value) => { root.advanced-changed("mip_feedback", value ? 1 : 0); }
+                    }
+                    Text { text: "Changes apply the next time the game starts."; color: Theme.faint; font-size: 13px; }
+                }
+                if (root.tab == 1 || root.tab == 4) && !root.settings.present: Text {
                     color: Theme.dim;
                     font-size: 14px;
                     wrap: word-wrap;
@@ -860,6 +1008,8 @@ export component MainWindow inherits Window {
     callback uninstall(int);
     callback open-folder(int);
     callback settings-changed(int, bool, bool, bool, bool, bool, int, int);
+    callback advanced-changed(int, string, int);
+    callback prepare-quality(int);
 
     property <length> row-h: 40px;
     property <bool> has-sel: root.selected >= 0 && root.selected < root.games.length;
@@ -956,10 +1106,13 @@ export component MainWindow inherits Window {
                 hero: root.hero;
                 session: root.session;
                 settings: root.settings;
+                busy: root.busy;
                 shaders: root.shader-state;
                 tab <=> root.tab;
                 reset-safe-mode => { root.reset-safe-mode(root.selected); }
                 settings-changed(p, r, fl, rc, u, f, v) => { root.settings-changed(root.selected, p, r, fl, rc, u, f, v); }
+                advanced-changed(key, value) => { root.advanced-changed(root.selected, key, value); }
+                prepare-quality => { root.prepare-quality(root.selected); }
             }
             if !root.has-sel: VerticalLayout {
                 horizontal-stretch: 1;

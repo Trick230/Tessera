@@ -4,6 +4,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod advanced;
+
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -185,6 +187,7 @@ fn session_info(exe: &Path) -> (SessionInfo, (u32, Option<u32>), Option<(u64, u6
     let mut info = SessionInfo {
         safe_mode: session::safe_mode_active(exe),
         shaders: s(shader_text(exe, None)),
+        tiled_tier: -1,
         ..Default::default()
     };
     let Some(path) = session::latest(exe) else { return (info, (0, None), None) };
@@ -314,6 +317,11 @@ fn session_info(exe: &Path) -> (SessionInfo, (u32, Option<u32>), Option<(u64, u6
     }
     info.shaders = s(shader_text(exe, Some(&sum)));
     let fl = sum.feature_level;
+    if fl != 0 {
+        info.tiled_tier = sum.tiled_tier as i32;
+    }
+    info.recompressed_textures = sum.recompressed_textures.min(i32::MAX as u64) as i32;
+    info.mip_feedback_samples = sum.mip_feedback_samples.min(i32::MAX as u64) as i32;
     info.display = s(match sum.swapchain {
         Some((w, h)) => format!("{w}×{h}, D3D feature level {}_{}", fl >> 12, (fl >> 8) & 0xF),
         None => "no swapchain recorded".into(),
@@ -454,6 +462,7 @@ struct SettingsLists {
     ue_exe: Option<PathBuf>,
     /// U1: memory the streaming profile sizes for (ue_vram_mb).
     ue_vram_mb: u32,
+    advanced: advanced::Facts,
     fps: Vec<u32>,
     vram: Vec<u32>,
 }
@@ -473,6 +482,7 @@ fn game_settings(
     dir: &Path,
     ue_exe: Option<PathBuf>,
     (budget_mb, suggest_mb): (u32, Option<u32>),
+    facts: advanced::Facts,
 ) -> (GameSettings, SettingsLists) {
     let cur = install::settings(dir);
     let mut fps: Vec<u32> = FPS_CHOICES.to_vec();
@@ -508,6 +518,7 @@ fn game_settings(
         present: true,
         process: cur.process,
         residency: cur.residency,
+        priority_blocked: facts.priority_blocked,
         flip_model: cur.flip_model,
         rt_recycle: cur.rt_recycle,
         ue_streaming: cur.ue_streaming,
@@ -518,8 +529,11 @@ fn game_settings(
         }),
         vram_index: idx(&vram, cur.vram_budget_mb),
         vram_hint: hint.into(),
+        advanced: facts.view(install::advanced_settings(dir)),
     };
-    (gs, SettingsLists { dir: dir.to_path_buf(), ue_exe, ue_vram_mb: ue_vram_mb(budget_mb), fps, vram })
+    (gs, SettingsLists {
+        dir: dir.to_path_buf(), ue_exe, ue_vram_mb: ue_vram_mb(budget_mb), fps, vram, advanced: facts,
+    })
 }
 
 /// Loads the selected game's last session off the UI thread; a 1 h log is tens of MB.
@@ -550,6 +564,8 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
             let _ = install::note_external_limit(d, name);
         }
         let (info, budget, run) = session_info(&exe);
+        let gpus = tessera_core::driver::gpus();
+        let facts = dir.as_deref().map(|d| advanced::Facts::read(&exe, d, root.as_deref(), info.tiled_tier, &gpus));
         // U1: slots from this build of the executable (an update moves them).
         if let (Some(d), Some(e)) = (&dir, &ue_exe) {
             let _ = install::apply_ue_cvars(d, e, ue_vram_mb(budget.0));
@@ -560,13 +576,13 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
                 return;
             }
             ui.set_session(info);
-            if let Some((gs, lists)) = dir.map(|d| game_settings(&d, ue_exe, budget)) {
+            if let Some((gs, lists)) = dir.zip(facts).map(|(d, facts)| game_settings(&d, ue_exe, budget, facts)) {
                 *SETTINGS.lock().unwrap() = Some(lists);
                 ui.set_settings(gs);
             }
         });
         // Reads whole stores (checksums): after the session, which shows first.
-        let drivers: Vec<u64> = tessera_core::driver::gpus()
+        let drivers: Vec<u64> = gpus
             .iter()
             .filter_map(|g| tessera_core::driver::umd_version(&g.driver_version))
             .collect();
@@ -615,7 +631,7 @@ fn refresh(ui: &MainWindow, state: &Shared) {
                 if let Some(i) = st.view.iter().position(|&gi| st.games[gi].entry.name.to_lowercase().contains(&want)) {
                     ui.set_selected(i as i32);
                     load_session(&ui, &mut st, i as i32, true);
-                    // TESSERA_TAB=<0..3>: open that tab (3 = Shaders) (scripted screenshots).
+                    // TESSERA_TAB=<0..4>: open that tab (4 = Textures) (scripted screenshots).
                     if let Some(t) = std::env::var("TESSERA_TAB").ok().and_then(|v| v.parse().ok()) {
                         ui.set_tab(t);
                     }
@@ -720,6 +736,44 @@ fn layer_action(ui: &MainWindow, state: &Shared, view_idx: i32, do_install: bool
     apply_view(ui, &mut st);
     load_session(ui, &mut st, view_idx, true); // the settings card follows the install state
     ui.set_status_text(msg.into());
+}
+
+fn quality_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
+    if ui.get_busy() {
+        return;
+    }
+    let exe = {
+        let st = state.lock().unwrap();
+        st.view.get(view_idx as usize).and_then(|&i| {
+            let game = &st.games[i];
+            (game.install.is_installed() && game.can_install()).then(|| game.exe.clone()).flatten()
+        })
+    };
+    let Some(exe) = exe else { return };
+    let gen = SESSION_GEN.load(Ordering::Relaxed);
+    ui.set_busy(true);
+    ui.set_status_text("Preparing quality caches…".into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let texcomp = app_dir().join(tessera_core::quality::TEXCOMP_EXE);
+        let msg = match tessera_core::quality::prepare(&exe, &texcomp) {
+            Ok(report) => report.lines().collect::<Vec<_>>().join(" "),
+            Err(error) => format!("Could not prepare quality: {error}"),
+        };
+        let status = tessera_core::quality::status(&exe);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_busy(false);
+            if SESSION_GEN.load(Ordering::Relaxed) == gen {
+                if let Some(lists) = SETTINGS.lock().unwrap().as_mut() {
+                    lists.advanced.quality = status;
+                    let mut view = ui.get_settings();
+                    view.advanced = lists.advanced.view(install::advanced_settings(&lists.dir));
+                    ui.set_settings(view);
+                }
+            }
+            ui.set_status_text(msg.into());
+        });
+    });
 }
 
 /// Runs the install scan (S1) in a child `tessera.exe --scan`, so a crash in
@@ -835,6 +889,35 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_warm_shaders(move |i| warm_action(&w.unwrap(), &s, i));
     }
     {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_prepare_quality(move |i| quality_action(&w.unwrap(), &s, i));
+    }
+    {
+        let w = ui.as_weak();
+        ui.on_advanced_changed(move |i, key, value| {
+            let ui = w.unwrap();
+            if i != ui.get_selected() || ui.get_busy() {
+                return;
+            }
+            let slot = SETTINGS.lock().unwrap();
+            let Some(l) = slot.as_ref() else { return };
+            let mut view = ui.get_settings();
+            let current = install::advanced_settings(&l.dir);
+            let msg = match u32::try_from(value) {
+                Ok(value) if l.advanced.permits(key.as_str(), value, current) => {
+                    match install::save_advanced_setting(&l.dir, key.as_str(), value, l.advanced.root_levels) {
+                        Ok(()) => "Saved. Applies the next time the game starts".to_owned(),
+                        Err(e) => format!("Could not save tessera.ini: {e}"),
+                    }
+                }
+                _ => "This option is unavailable for the selected game.".to_owned(),
+            };
+            view.advanced = l.advanced.view(install::advanced_settings(&l.dir));
+            ui.set_settings(view);
+            ui.set_status_text(msg.into());
+        });
+    }
+    {
         let w = ui.as_weak();
         ui.on_settings_changed(move |_i, process, residency, flip_model, rt_recycle, ue_streaming, fps_i, vram_i| {
             let ui = w.unwrap();
@@ -843,7 +926,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let pick = |list: &[u32], i: i32| list.get(i as usize).copied().unwrap_or(0);
             let new = install::Settings {
                 process,
-                residency,
+                residency: residency && !l.advanced.priority_blocked,
                 fps_limit: pick(&l.fps, fps_i),
                 vram_budget_mb: pick(&l.vram, vram_i),
                 flip_model,
@@ -851,7 +934,18 @@ fn main() -> Result<(), slint::PlatformError> {
                 ue_streaming,
             };
             let msg = match install::save_settings(&l.dir, &new) {
-                Ok(()) => "Saved. Applies the next time the game starts".to_string(),
+                Ok(()) => {
+                    let mut view = ui.get_settings();
+                    view.process = new.process;
+                    view.residency = new.residency;
+                    view.flip_model = new.flip_model;
+                    view.rt_recycle = new.rt_recycle;
+                    view.ue_streaming = new.ue_streaming;
+                    view.fps_index = fps_i;
+                    view.vram_index = vram_i;
+                    ui.set_settings(view);
+                    "Saved. Applies the next time the game starts".to_string()
+                }
                 Err(e) => format!("Could not save tessera.ini: {e}"),
             };
             ui.set_status_text(msg.into());

@@ -109,14 +109,20 @@ fn write_ini(dir: &Path, next: &str) -> io::Result<()> {
 /// Sets (or with None removes) one key in tessera.ini, keeping every other
 /// line. Caller holds INI_LOCK.
 fn set_key(dir: &Path, name: &str, value: Option<&str>) -> io::Result<()> {
+    set_keys(dir, &[(name, value)])
+}
+
+fn set_keys(dir: &Path, keys: &[(&str, Option<&str>)]) -> io::Result<()> {
     let old = fs::read_to_string(dir.join(INI)).unwrap_or_default();
     let mut out = String::from("[tessera]\n");
-    if let Some(v) = value {
-        out.push_str(&format!("{name}={v}\n"));
+    for &(name, value) in keys {
+        if let Some(v) = value {
+            out.push_str(&format!("{name}={v}\n"));
+        }
     }
     for line in old.lines().map(str::trim) {
         let key = line.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
-        if line.is_empty() || line.starts_with('[') || key == name {
+        if line.is_empty() || line.starts_with('[') || keys.iter().any(|(name, _)| key == *name) {
             continue;
         }
         out.push_str(line);
@@ -219,6 +225,74 @@ pub fn save_settings(dir: &Path, s: &Settings) -> io::Result<()> {
         s.ue_streaming as u8
     ));
     fs::write(dir.join(INI), out)
+}
+
+/// Settings edited independently of the main FPS and VRAM controls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdvancedSettings {
+    pub max_frame_latency: u32,
+    pub present_cpu_sets: bool,
+    pub mip_residency: bool,
+    pub mip_prediction: bool,
+    pub mip_streaming: bool,
+    pub texture_dedup: bool,
+    pub stream_io: u32,
+    pub texture_quality: u32,
+    pub mip_feedback: bool,
+}
+
+pub fn advanced_settings(dir: &Path) -> AdvancedSettings {
+    let mut out = AdvancedSettings::default();
+    let text = fs::read_to_string(dir.join(INI)).unwrap_or_default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let value = value.trim().parse::<u32>().unwrap_or(0);
+        match key.trim().to_ascii_lowercase().as_str() {
+            "max_frame_latency" => out.max_frame_latency = value.min(16),
+            "present_cpu_sets" => out.present_cpu_sets = value != 0,
+            "mip_residency" => out.mip_residency = value != 0,
+            "mip_prediction" => out.mip_prediction = value != 0,
+            "mip_streaming" => out.mip_streaming = value != 0,
+            "texture_dedup" => out.texture_dedup = value != 0,
+            "stream_io" => out.stream_io = value.min(2),
+            "texture_quality" => out.texture_quality = value.min(2),
+            "mip_feedback" => out.mip_feedback = value != 0,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The executable lives under the library's install folder. Store the depth
+/// instead of writing a Unicode path to a Win32 profile string.
+pub fn stream_root_levels(exe_dir: &Path, install_root: &Path) -> Option<u32> {
+    let exe_dir = fs::canonicalize(exe_dir).ok()?;
+    let install_root = fs::canonicalize(install_root).ok()?;
+    exe_dir.ancestors().take(13).position(|p| p == install_root).map(|n| n as u32)
+}
+
+pub fn save_advanced_setting(dir: &Path, key: &str, value: u32, stream_levels: Option<u32>) -> io::Result<()> {
+    let max = match key {
+        "max_frame_latency" => 16,
+        "stream_io" | "texture_quality" => 2,
+        "present_cpu_sets" | "mip_residency" | "mip_prediction" | "mip_streaming" |
+        "texture_dedup" | "mip_feedback" => 1,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown setting")),
+    };
+    if value > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "setting out of range"));
+    }
+    let _g = INI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if read_marker(dir).is_none() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "the layer is not installed"));
+    }
+    let value_string = value.to_string();
+    if key == "stream_io" && value != 0 {
+        if let Some(levels) = stream_levels.filter(|&n| n <= 12) {
+            return set_keys(dir, &[(key, Some(&value_string)), ("stream_root_up", Some(&levels.to_string()))]);
+        }
+    }
+    set_key(dir, key, Some(&value_string))
 }
 
 fn is_ue_key(key: &str) -> bool {
@@ -383,6 +457,31 @@ mod tests {
         let ini = fs::read_to_string(t.path().join(INI)).unwrap();
         assert!(ini.starts_with("[tessera]\nnext=d3d11.next.dll\nmax_frame_latency=1\n"), "{ini}");
     }
+    #[test]
+    fn advanced_options_preserve_unrelated_settings_and_stream_root() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("Jogo Á");
+        let exe_dir = root.join("Binaries").join("Win64");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::write(exe_dir.join(MARKER), "proxy=d3d11.dll\n").unwrap();
+        fs::write(exe_dir.join(INI), "[tessera]\nnext=d3d11.next.dll\nfps_limit=60\ntexture_dedup=1\n").unwrap();
+        let levels = stream_root_levels(&exe_dir, &root);
+        assert_eq!(levels, Some(2));
+        save_advanced_setting(&exe_dir, "stream_io", 1, levels).unwrap();
+        save_advanced_setting(&exe_dir, "texture_quality", 2, None).unwrap();
+        assert!(save_advanced_setting(&exe_dir, "texture_quality", 3, None).is_err());
+        assert!(save_advanced_setting(&exe_dir, "next", 1, None).is_err());
+        let advanced = advanced_settings(&exe_dir);
+        assert_eq!(advanced.stream_io, 1);
+        assert_eq!(advanced.texture_quality, 2);
+        assert!(advanced.texture_dedup);
+        save_settings(&exe_dir, &settings(&exe_dir)).unwrap();
+        assert_eq!(advanced_settings(&exe_dir), advanced);
+        let ini = fs::read_to_string(exe_dir.join(INI)).unwrap();
+        assert!(ini.contains("stream_root_up=2\n") && ini.contains("next=d3d11.next.dll\n"));
+        assert_eq!(settings(&exe_dir).fps_limit, 60);
+    }
+
     #[test]
     fn ue_cvar_lines_follow_the_setting() {
         let t = tempfile::tempdir().unwrap();

@@ -4733,6 +4733,7 @@ dependencies = [
  "slint",
  "slint-build",
  "tessera-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

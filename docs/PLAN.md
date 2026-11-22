@@ -265,11 +265,12 @@ were built side by side. Everything below is on `master`.
 
 ### Phase 4 — preview in D3D11
 
-These settings are off by default. Set them in the game's `[tessera]` section and restart the game:
+These settings are off by default. Use the app's Textures tab for streaming options and Settings for
+performance cores. The following keys can also be set in the game's `[tessera]` section:
 
 - **P4** `present_cpu_sets=1` selects performance cores for the presenting thread on a hybrid CPU, when the game has not already selected CPU sets.
 - **M8** `texture_dedup=1` shares matching immutable shader textures on the same device. It verifies every pixel or compressed block, excluding row padding. The preview covers single-slice BC and 8-bit RGBA/BGRA textures up to 2 MiB.
-- **I1–I3** `stream_io=1` records file ranges from a learning session. `stream_io=2` reuses the trace for bounded startup prefetch at low I/O priority. Add `mip_prediction=1` in both sessions to associate reads with sampled materials and prefetch matching ranges during play. The executable's folder is the default root. Set `stream_root` to the install folder when asset files live above it. The trace is keyed by the executable path and version, and playback checks the asset file's size and modification time.
+- **I1–I3** `stream_io=1` records file ranges from a learning session. `stream_io=2` reuses the trace for bounded startup prefetch at low I/O priority. Add `mip_prediction=1` in both sessions to associate reads with sampled materials and prefetch matching ranges during play. The app sets the install folder relative to the executable. A manual `stream_root` overrides it. The trace is keyed by the executable path and version, and playback checks the asset file's size and modification time.
 - **M7** `mip_prediction=1` learns which textures are bound together. With `mip_residency=1` and tiled resources Tier 2, it can restore likely partners in advance when VRAM has room. Mip prediction uses the workset bind hooks.
 - **I4–I5** `mip_streaming=1` with `mip_residency=1` reuses an exact-size spare tile pool when available. It uploads the smallest mips first, with up to 2 MiB of speculative copies per Present. First use finishes any outstanding copies before the draw.
 
@@ -281,9 +282,11 @@ The targeted smoke test is `powershell -NoProfile -ExecutionPolicy Bypass -File 
 - **M9:** `texture_quality=1` records up to 32 eligible immutable textures within a 32 MiB capture budget. Preparation converts opaque RGBA8 or nonnegative RGBA16F to BC7 or BC6H and checks every mip with FLIP and channel bounds. `texture_quality=2` applies a prepared replacement only when the input pixels match the captured data. Texture and view descriptions keep the original format. A copy from the resource uses the exact original pixels. Textures that need that fallback retain the original allocation for subsequent copies.
 
 Both options are off by default. Build with `powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Quality`.
-Play a learning session with `texture_quality=1` if testing recompression. Afterwards, with the game closed,
-run `& .\target\release\tessera.exe --prepare-quality "<game executable>" | Out-Host`. Then enable the options
-to be tested in `tessera.ini`. Use `cargo run -p tessera-core --example session -- <file.tsess> --mips` to inspect the results.
+In the Textures tab, select Capture and play a session if testing recompression. With the game closed, select
+Prepare quality. The tab shows captured, approved and applied textures. Apply becomes available once textures
+are approved. Mip feedback becomes available once compatible shaders are prepared.
+For scripts, use `& .\target\release\tessera.exe --prepare-quality "<game executable>" | Out-Host` and
+`cargo run -p tessera-core --example session -- <file.tsess> --mips` to inspect the results.
 Real game impact still needs measurement.
 
 On Windows, build the optional targets and run the focused test:

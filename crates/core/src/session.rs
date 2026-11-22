@@ -111,6 +111,8 @@ pub struct Summary {
     pub prioritized: u64,
     pub textures: u64,
     pub texture_bytes: u64,
+    pub recompressed_textures: u64,
+    pub mip_feedback_samples: u64,
     pub buffers: u64,
     pub buffer_bytes: u64,
     pub feature_level: u32,
@@ -299,7 +301,9 @@ pub fn summarize(b: &[u8]) -> Result<Summary, Error> {
             REC_TEXTURE2D => {
                 s.textures += 1;
                 s.texture_bytes = s.texture_bytes.saturating_add(r.bytes);
+                s.recompressed_textures += u64::from(r.flags & FLAG_RECOMPRESSED != 0);
             }
+            REC_MIP_FEEDBACK => s.mip_feedback_samples += 1,
             REC_BUFFER => {
                 s.buffers += 1;
                 s.buffer_bytes = s.buffer_bytes.saturating_add(r.bytes);

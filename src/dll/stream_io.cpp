@@ -295,6 +295,17 @@ void stream_start(const wchar_t* exe) {
         wchar_t* basename = wcsrchr(dir, L'\\');
         if (!basename) return;
         basename[1] = 0;
+        const UINT levels = std::min(GetPrivateProfileIntW(L"tessera", L"stream_root_up", 0, config_ini_path()), 12u);
+        for (UINT i = 0; i < levels; ++i) {
+            *basename = 0;
+            wchar_t* parent = wcsrchr(dir, L'\\');
+            if (!parent) {
+                *basename = L'\\';
+                break;
+            }
+            basename = parent;
+            basename[1] = 0;
+        }
     }
     HANDLE root = CreateFileW(dir, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
