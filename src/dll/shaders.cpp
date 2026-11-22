@@ -141,7 +141,7 @@ void append_blob(uint64_t hash, uint16_t stage, uint16_t flags, const void* code
 }
 
 // Shared by all stages: time the real call, record it, keep new bytecode.
-uint64_t after_create(uint16_t stage, const void* code, SIZE_T n, uint64_t t0, void* ret) {
+TesseraRecord after_create(uint16_t stage, const void* code, SIZE_T n, uint64_t t0, void* ret) {
     const uint64_t t1 = now_qpc();
     uint64_t hash = 0;
     uint16_t flags = identify(code, n, &hash);
@@ -162,7 +162,7 @@ uint64_t after_create(uint16_t stage, const void* code, SIZE_T n, uint64_t t0, v
     }
     r.d |= flags;
     session_push(r);
-    return r.flags & TESSERA_FLAG_FOREIGN ? 0 : hash;
+    return r;
 }
 
 template <class F>
@@ -182,9 +182,11 @@ HRESULT STDMETHODCALLTYPE hk_create(ID3D11Device* self, const void* code, SIZE_T
     const auto create = orig<CreateFn<T>>(H, self);
     const HRESULT hr = create(self, code, n, link, out);
     if (SUCCEEDED(hr) && code && n && depth.outer()) {
-        const uint64_t game_hash = after_create(Stage, code, n, t0, ret);
+        const TesseraRecord record = after_create(Stage, code, n, t0, ret);
         if constexpr (Stage == TESSERA_STAGE_PS) {
-            if (game_hash && out && *out) feedback_on_shader(self, create, *out, code, n, game_hash, link != nullptr);
+            if (out && *out)
+                feedback_on_shader(self, create, *out, code, n, record.bytes, link != nullptr,
+                                   (record.flags & TESSERA_FLAG_FOREIGN) != 0);
         }
     }
     return hr;

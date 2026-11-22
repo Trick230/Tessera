@@ -77,21 +77,26 @@ fn main() {
 }
 
 fn print_mip_misses(path: &std::path::Path) -> Result<(), tessera_core::session::Error> {
-    use tessera_core::session::{self, REC_MIP_SHADER_MISS};
+    use tessera_core::session::{self, FLAG_FOREIGN, REC_MIP_SHADER_CREATE, REC_MIP_SHADER_MISS};
     let data = std::fs::read(path)?;
     let (_, header, record) = session::parse_header(&data)?;
-    println!("qpc,shader_hash,reason");
-    for r in session::records(&data, header, record).filter(|r| r.kind == REC_MIP_SHADER_MISS) {
-        let reason = match r.a {
-            1 => "no_pixel_shader",
-            2 => "untracked_shader",
-            3 => "class_linkage",
-            4 => "unsupported_bytecode",
-            5 => "cache_miss",
-            6 => "variant_install_failed",
-            _ => "unknown",
+    println!("qpc,shader_object,shader_hash,reason");
+    for r in session::records(&data, header, record) {
+        let reason = match r.kind {
+            REC_MIP_SHADER_CREATE if r.flags & FLAG_FOREIGN != 0 => "created_foreign",
+            REC_MIP_SHADER_CREATE => "created_game",
+            REC_MIP_SHADER_MISS => match r.a {
+                1 => "no_pixel_shader",
+                2 => "untracked_shader",
+                3 => "class_linkage",
+                4 => "unsupported_bytecode",
+                5 => "cache_miss",
+                6 => "variant_install_failed",
+                _ => "unknown",
+            },
+            _ => continue,
         };
-        println!("{},{:016x},{reason}", r.qpc, r.bytes);
+        println!("{},{:08x}{:08x},{:016x},{reason}", r.qpc, r.c, r.b, r.bytes);
     }
     Ok(())
 }

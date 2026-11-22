@@ -94,6 +94,7 @@ function Read-Records([uint16]$Kind) {
                 Flags = [BitConverter]::ToUInt32($bytes, $p + 12)
                 A = [BitConverter]::ToUInt32($bytes, $p + 16)
                 B = [BitConverter]::ToUInt32($bytes, $p + 20)
+                C = [BitConverter]::ToUInt32($bytes, $p + 24)
                 Bytes = [BitConverter]::ToUInt64($bytes, $p + 32)
             }
         }
@@ -156,9 +157,15 @@ foreach ($diagnostics in 0, 1) {
     & $test --layer $uncached
     if ($LASTEXITCODE) { throw "Uncached shader draw failed" }
     $misses = @(Read-Records 14)
-    if (!$diagnostics -and $misses.Count) { throw "Shader misses recorded with diagnostics disabled" }
-    if ($diagnostics -and !($misses | Where-Object { $_.A -eq 5 -and $_.Bytes -eq $shaderHash })) {
-        throw "Uncached shader hash or reason was not recorded"
+    $creations = @(Read-Records 16)
+    if (!$diagnostics -and ($misses.Count -or $creations.Count)) {
+        throw "Shader activity recorded with diagnostics disabled"
+    }
+    if ($diagnostics) {
+        $miss = $misses | Where-Object { $_.A -eq 5 -and $_.Bytes -eq $shaderHash } | Select-Object -First 1
+        if (!$miss -or !($miss.B -or $miss.C) -or !($creations | Where-Object {
+            $_.Bytes -eq $shaderHash -and $_.B -eq $miss.B -and $_.C -eq $miss.C
+        })) { throw "Uncached shader object could not be traced to creation" }
     }
 }
 "PASS opt-in shader miss hash and reason"

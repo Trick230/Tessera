@@ -61,9 +61,11 @@ enum TesseraRecordKind {
     TESSERA_REC_SLOW_D3D11 = 13, // qpc = end, bytes = start, format = TesseraD3D11Call,
                                 // a = elapsed us, b = thread id, c = map mode or Flush1 context type,
                                 // d = HRESULT (0 for void), flags = API flags and TESSERA_CALL_PRESENT_THREAD
-    TESSERA_REC_MIP_SHADER_MISS = 14, // a = TesseraMipShaderMiss, bytes = pixel shader hash (0 if unknown)
+    TESSERA_REC_MIP_SHADER_MISS = 14, // a = TesseraMipShaderMiss, b/c = shader object key low/high,
+                                     // bytes = pixel shader hash (0 if unknown)
     TESSERA_REC_STREAM_IO = 15, // format = TesseraStreamIoKind, a = byte count, b/c = file key low/high,
                                 // bytes = file offset, qpc = demand start or successful prefetch return
+    TESSERA_REC_MIP_SHADER_CREATE = 16, // b/c = shader object key low/high, bytes = hash, flags = FOREIGN if applicable
     TESSERA_REC_END = 0xFFFF,   // a = records dropped (ring overrun), bytes = records written
 };
 

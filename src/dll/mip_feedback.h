@@ -8,7 +8,7 @@ namespace tessera {
 using CreatePixelShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T,
                                                         ID3D11ClassLinkage*, ID3D11PixelShader**);
 void feedback_on_shader(ID3D11Device* dev, CreatePixelShaderFn create, ID3D11PixelShader* original,
-                        const void* bytes, SIZE_T size, uint64_t hash, bool linked);
+                        const void* bytes, SIZE_T size, uint64_t hash, bool linked, bool foreign);
 void feedback_on_context(ID3D11DeviceContext* context);
 void feedback_on_swapchain(IDXGISwapChain* swapchain);
 void feedback_present(IDXGISwapChain* swapchain);

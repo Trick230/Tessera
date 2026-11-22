@@ -205,6 +205,21 @@ struct ShaderMiss {
     TesseraMipShaderMiss reason;
 };
 
+void push_shader_event(ID3D11PixelShader* shader, TesseraRecord& record) {
+    if (shader) {
+        ComPtr<IUnknown> identity;
+        if (SUCCEEDED(shader->QueryInterface(IID_PPV_ARGS(&identity)))) {
+            const auto key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(identity.Get()));
+            record.b = static_cast<uint32_t>(key);
+            record.c = static_cast<uint32_t>(key >> 32);
+        }
+    }
+    LARGE_INTEGER time;
+    QueryPerformanceCounter(&time);
+    record.qpc = static_cast<uint64_t>(time.QuadPart);
+    session_push(record);
+}
+
 void record_shader_miss(ID3D11PixelShader* shader) {
     ShaderMiss miss = {0, shader ? TESSERA_MIP_UNTRACKED_SHADER : TESSERA_MIP_NO_SHADER};
     if (shader) {
@@ -213,14 +228,11 @@ void record_shader_miss(ID3D11PixelShader* shader) {
         if (SUCCEEDED(shader->GetPrivateData(kShaderMiss, &size, &tracked)) && size == sizeof tracked)
             miss = tracked;
     }
-    LARGE_INTEGER time;
-    QueryPerformanceCounter(&time);
     TesseraRecord record = {};
-    record.qpc = static_cast<uint64_t>(time.QuadPart);
     record.kind = TESSERA_REC_MIP_SHADER_MISS;
     record.a = miss.reason;
     record.bytes = miss.hash;
-    session_push(record);
+    push_shader_event(shader, record);
 }
 
 template <typename F, typename... A>
@@ -326,8 +338,16 @@ void STDMETHODCALLTYPE hk_draw_indirect(ID3D11DeviceContext* c, ID3D11Buffer* ar
 }  // namespace
 
 void feedback_on_shader(ID3D11Device* dev, CreatePixelShaderFn create, ID3D11PixelShader* original,
-                        const void* bytes, SIZE_T size, uint64_t hash, bool linked) {
+                        const void* bytes, SIZE_T size, uint64_t hash, bool linked, bool foreign) {
     if (!config().mip_feedback) return;
+    if (config().mip_feedback_diagnostics) {
+        TesseraRecord record = {};
+        record.kind = TESSERA_REC_MIP_SHADER_CREATE;
+        record.flags = foreign ? TESSERA_FLAG_FOREIGN : 0;
+        record.bytes = hash;
+        push_shader_event(original, record);
+    }
+    if (foreign) return;
     auto note_miss = [&](TesseraMipShaderMiss reason) {
         if (config().mip_feedback_diagnostics) {
             const ShaderMiss miss = {hash, reason};
