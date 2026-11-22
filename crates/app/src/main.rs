@@ -379,7 +379,11 @@ fn shader_state(
     };
     let mut rows = Vec::new();
 
-    if let Some(pak_key) = pak_key {
+    if c.auto_key_archives > 0 && c.scan_outdated == Some(false) {
+        rows.push(line("Unreal archive keys", "Detected".to_string(), vec![
+            format!("Keys found in the game executable and verified against {} encrypted archives.", c.auto_key_archives),
+        ], OK));
+    } else if let Some(pak_key) = pak_key {
         use tessera_core::scan::PakKeySource;
         let (value, detail, tone) = match pak_key {
             Some((source, true)) => {
@@ -391,7 +395,7 @@ fn shader_state(
                 ("Available", source, OK)
             }
             Some((_, false)) => ("Unavailable", "The configured key file is unreadable or invalid.", WARN),
-            None => ("Not found", "Encrypted Unreal PAKs need a game key for full shader discovery.", NEUTRAL),
+            None => ("Not found", "Prepare shaders checks the game executable when it finds encrypted archives.", NEUTRAL),
         };
         rows.push(line("Unreal PAK key", value.to_string(), vec![detail.to_string()], tone));
     }
@@ -420,18 +424,19 @@ fn shader_state(
         d.push(format!("The warm-up exercised all {} supported stored shaders on the installed driver.", c.compiled));
         (format!("All {}", c.compiled), OK)
     } else {
-        d.push(format!(
-            "{} of {} stored shaders were exercised on the installed driver. {} are still pending.",
-            c.compiled, warmable, c.pending
-        ));
-        let v = format!("{} of {}", c.compiled, warmable);
-        (v, WARN)
+        d.push(format!("{} exercised in a test draw or dispatch.", c.compiled));
+        let created = c.compiled + c.created_only;
+        let v = format!("{created} of {warmable} created");
+        (v, if c.pending > 0 || c.failed > 0 || c.created_only > 0 { WARN } else { OK })
     };
     if c.skipped > 0 {
         d.push(format!("{} are D3D12 shaders (DXIL) the D3D11 warm-up cannot take.", c.skipped));
     }
     if c.created_only > 0 {
-        d.push(format!("{} created successfully without a compatible draw or dispatch.", c.created_only));
+        d.push(format!("{} created without a compatible draw or dispatch.", c.created_only));
+    }
+    if c.stored > 0 {
+        d.push(format!("{} pending, {} failed.", c.pending, c.failed));
     }
     if let Some(n) = c.unsupported_in_install.filter(|&n| n > 0) {
         d.push(format!("The file scan also found {n} containers outside D3D11 warm-up support."));
@@ -440,18 +445,12 @@ fn shader_state(
         d.push(format!("Searched {} Unreal packages.", c.unreal_packages));
     }
     if c.locked_unreal_paks > 0 {
-        d.push(format!("{} encrypted Unreal PAKs could not be opened with the supplied key file.", c.locked_unreal_paks));
+        d.push(format!("{} encrypted Unreal PAKs could not be opened.", c.locked_unreal_paks));
     }
     if c.unreadable_unreal_packages > 0 {
         d.push(format!("{} Unreal packages could not be decoded.", c.unreadable_unreal_packages));
     }
-    rows.push(line("Warm-up recorded", value, d, tone));
-    rows.push(line(
-        "Pending",
-        c.pending.to_string(),
-        vec!["Prepare shaders warms pending bytecode and retries previously failed shaders.".to_string()],
-        if c.pending > 0 { WARN } else { NEUTRAL },
-    ));
+    rows.push(line("Shader preparation", value, d, tone));
 
     // Coverage: how many of the shaders the last run created were already stored.
     let (value, tone, d) = match run {
@@ -460,7 +459,7 @@ fn shader_state(
             if new > 0 {
                 d.push(format!("The other {new} are stored now and compile in the next preparation."));
             }
-            (format!("{}%", (n - new) * 100 / n), if new == 0 { OK } else { WARN }, d)
+            (format!("{} of {n} already stored", n - new), if new == 0 { OK } else { WARN }, d)
         }
         None => (
             "Unknown".to_string(),
@@ -468,7 +467,7 @@ fn shader_state(
             vec!["Play once with the D3D11 layer on to capture shaders created during play.".to_string()],
         ),
     };
-    rows.push(line("Coverage", value, d, tone));
+    rows.push(line("Last game session", value, d, tone));
 
     // Damaged: bad store entries, driver refusals, bad containers in the install.
     let mut d = Vec::new();
