@@ -1040,7 +1040,7 @@ int tiled() {
     const uint64_t before = local_usage(g.adapter);
     // Nothing is bound now: all evicted, and the freed memory trimmed a few
     // frames later.
-    present_frames(g, 6);
+    present_frames(g, predict ? 12 : 6);  // let queued predictions expire and their evictions reach Trim
     settle(g);
     const uint64_t evicted = local_usage(g.adapter);
     std::printf("tiled: local usage %llu MB -> %llu MB after eviction\n", before >> 20, evicted >> 20);

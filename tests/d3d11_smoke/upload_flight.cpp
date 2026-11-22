@@ -12,7 +12,7 @@ int upload_flight_probe() {
     constexpr uint64_t mib = 1ull << 20;
     UploadFlight flight;
     flight.submitted = 15 * mib / 2;
-    if (flight.budget(2 * mib) != mib / 2 || flight.can_restore(mib)) return 1;
+    if (flight.budget(2 * mib) != mib / 2 || flight.can_restore()) return 1;
     flight.submitted += 6 * mib;  // on demand can exceed the speculative window
     if (flight.budget(2 * mib) != 0) return 2;
     flight.observe(5 * mib);
@@ -22,7 +22,7 @@ int upload_flight_probe() {
     flight.observe(UINT64_MAX);
     if (flight.budget(2 * mib) != mib / 2) return 4;
     flight.observe(flight.submitted);
-    if (flight.budget(2 * mib) != 2 * mib || !flight.can_restore(16 * mib)) return 5;
+    if (flight.budget(2 * mib) != 2 * mib || !flight.can_restore()) return 5;
     std::puts("PASS upload accounting, backpressure, stale fence values and recovery");
 
     // Exercise an actual GPU completion even on hardware with tiled resources

@@ -21,7 +21,8 @@ struct UploadFlight {
         const uint64_t room = limit - pending;
         return frame_room < room ? frame_room : room;
     }
-    // A single predicted restore can be larger than the window when idle.
-    bool can_restore(uint64_t size) const { return !bytes() || size <= budget(size); }
+    // A predicted restore may involve allocation and mapping as well as a copy.
+    // Let previous uploads finish before starting one.
+    bool can_restore() const { return bytes() == 0; }
 };
 }  // namespace tessera

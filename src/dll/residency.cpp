@@ -144,7 +144,11 @@ int g_cand_n = 0, g_cand_pos = 0;
 uint32_t g_cand_cutoff = 0;
 uint64_t g_want = 0;
 SRWLOCK g_predict_lock = SRWLOCK_INIT;
-TextureHint g_predicted[8];
+struct RestoreHint {
+    TextureHint texture;
+    uint32_t frame;
+};
+RestoreHint g_predicted[8];
 unsigned g_predicted_count = 0;
 std::atomic<uint32_t> g_on_demand{0};
 std::atomic<uint32_t> g_predicted_restores{0};
@@ -649,9 +653,23 @@ void make_whole(uint32_t i, bool on_demand = false) {
     if (st == kPending || st == kEvicted) residency_check_hooks(g_imm);
 }
 
-void restore_predictions(bool tracked_uploads) {
-    if (g_evict_off.load(std::memory_order_relaxed)) return;
-    TextureHint next[_countof(g_predicted)];
+void queue_restore_hint(RestoreHint hint) {
+    if (!TryAcquireSRWLockExclusive(&g_predict_lock)) return;
+    auto* end = g_predicted + g_predicted_count;
+    const auto found = std::find_if(g_predicted, end, [&](const RestoreHint& pending) {
+        return pending.texture.resident_index == hint.texture.resident_index &&
+               pending.texture.key == hint.texture.key;
+    });
+    if (found == end && g_predicted_count < _countof(g_predicted))
+        g_predicted[g_predicted_count++] = hint;
+    ReleaseSRWLockExclusive(&g_predict_lock);
+}
+
+// Return true once a speculative driver operation was attempted. The caller
+// leaves the rest of the speculative work for a later Present.
+bool restore_predictions(bool tracked_uploads) {
+    if (g_evict_off.load(std::memory_order_relaxed)) return false;
+    RestoreHint next[_countof(g_predicted)];
     unsigned count = 0;
     if (TryAcquireSRWLockExclusive(&g_predict_lock)) {
         count = g_predicted_count;
@@ -659,11 +677,11 @@ void restore_predictions(bool tracked_uploads) {
         g_predicted_count = 0;
         ReleaseSRWLockExclusive(&g_predict_lock);
     }
-    if (!count) return;
+    if (!count) return false;
     uint64_t usage = 0, budget = 0;
-    if (!memory_local(&usage, &budget)) return;
+    if (!memory_local(&usage, &budget)) return false;
     const uint64_t ceiling = budget / 100 * 92;
-    if (usage >= ceiling) return;
+    if (usage >= ceiling) return false;
     static uint32_t last_misses = 0;
     static unsigned margin = 16;
     const uint32_t misses = g_on_demand.load(std::memory_order_relaxed);
@@ -672,34 +690,39 @@ void restore_predictions(bool tracked_uploads) {
     else
         margin = std::max(margin - 1, 16u);
     last_misses = misses;
-    uint64_t room = std::min<uint64_t>(ceiling - usage, uint64_t(margin) << 20);
-    if (!TryAcquireSRWLockExclusive(&g_op)) return;
+    const uint64_t room = std::min<uint64_t>(ceiling - usage, uint64_t(margin) << 20);
+    if (!TryAcquireSRWLockExclusive(&g_op)) {
+        for (unsigned k = 0; k < count; ++k) queue_restore_hint(next[k]);
+        return false;
+    }
     t_in_op = true;
-    unsigned restored = 0, deferred = 0;
-    for (unsigned k = 0; k < count && restored < 2; ++k) {
-        Res& r = g_res[next[k].resident_index - 1];
+    constexpr uint32_t max_hint_age = 8;
+    const uint32_t frame = g_frame.load(std::memory_order_relaxed);
+    const bool backlog = tracked_uploads && !g_upload_flight.can_restore();
+    bool attempted = false, restored = false;
+    unsigned deferred = 0;
+    for (unsigned k = 0; k < count; ++k) {
+        const auto& hint = next[k];
+        if (frame - hint.frame >= max_hint_age) continue;
+        Res& r = g_res[hint.texture.resident_index - 1];
         if (r.state.load(std::memory_order_acquire) != kEvicted ||
-            r.asset.load(std::memory_order_relaxed) != next[k].key || r.top_bytes > room)
+            r.asset.load(std::memory_order_relaxed) != hint.texture.key || r.top_bytes > room)
             continue;
-        if (tracked_uploads && !g_upload_flight.can_restore(r.top_bytes)) {
-            g_upload_defers.fetch_add(1, std::memory_order_relaxed);
-            next[deferred++] = next[k];
+        if (attempted || backlog) {
+            if (backlog) g_upload_defers.fetch_add(1, std::memory_order_relaxed);
+            next[deferred++] = hint;
             continue;
         }
-        if (restore(r)) {
-            r.last.store(g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            room -= r.top_bytes;
-            ++restored;
-        }
+        attempted = true;
+        restored = restore(r);
+        if (restored) r.last.store(frame, std::memory_order_relaxed);
     }
     t_in_op = false;
     ReleaseSRWLockExclusive(&g_op);
-    for (unsigned k = 0; k < deferred; ++k)
-        residency_predict(next[k].resident_index - 1, next[k].key);
-    if (restored) {
-        g_predicted_restores.fetch_add(restored, std::memory_order_relaxed);
-        residency_check_hooks(g_imm);
-    }
+    for (unsigned k = 0; k < deferred; ++k) queue_restore_hint(next[k]);
+    if (restored) g_predicted_restores.fetch_add(1, std::memory_order_relaxed);
+    if (attempted) residency_check_hooks(g_imm);
+    return attempted;
 }
 
 // Under g_op, Present thread. Resident -> Evicted, unless used since cutoff.
@@ -1361,17 +1384,9 @@ void residency_on_use(uint32_t i, ID3D11DeviceContext* ctx) {
 void residency_predict(uint32_t i, uint64_t key) {
     if (!g_on.load(std::memory_order_acquire) || i >= g_hi.load(std::memory_order_acquire)) return;
     const Res& r = g_res[i];
-    if (r.state.load(std::memory_order_acquire) != kEvicted || r.asset.load(std::memory_order_relaxed) != key ||
-        !TryAcquireSRWLockExclusive(&g_predict_lock))
+    if (r.state.load(std::memory_order_acquire) != kEvicted || r.asset.load(std::memory_order_relaxed) != key)
         return;
-    if (g_predicted_count < _countof(g_predicted)) {
-        const auto* end = g_predicted + g_predicted_count;
-        if (std::find_if(static_cast<const TextureHint*>(g_predicted), end, [i](const TextureHint& hint) {
-                return hint.resident_index == i + 1;
-            }) == end)
-            g_predicted[g_predicted_count++] = {key, i + 1};
-    }
-    ReleaseSRWLockExclusive(&g_predict_lock);
+    queue_restore_hint({{key, i + 1}, g_frame.load(std::memory_order_relaxed)});
 }
 
 void residency_after_present() {
@@ -1449,11 +1464,12 @@ bool residency_present(IDXGISwapChain* sc) {
     // The last texture can be dropped while its last upload is still in flight.
     if (!g_live.load(std::memory_order_relaxed)) return false;
     drain_need();
-    if (config().mip_prediction) restore_predictions(uploads.tracked());
+    const bool attempted_prediction = config().mip_prediction && restore_predictions(uploads.tracked());
     uint64_t up = 0;
     const bool split = config().mip_streaming;
     const uint64_t upload_limit = split ? kStreamPerFrame : kUploadPerFrame;
-    for (unsigned jobs = 0; up < upload_limit && (!split || jobs < 4) && pop(g_up, &i); ++jobs) {
+    for (unsigned checked = 0;
+         !attempted_prediction && up < upload_limit && (!split || checked < 4) && pop(g_up, &i); ++checked) {
         if (g_res[i].state.load(std::memory_order_acquire) != kPending) continue;
         Res& r = g_res[i];
         if (!split) {
@@ -1486,7 +1502,7 @@ bool residency_present(IDXGISwapChain* sc) {
             if (copied) g_split_batches.fetch_add(1, std::memory_order_relaxed);
             break;  // continue this upload next frame, or finish before its first use
         }
-        up += copied;
+        break;  // one speculative split upload or predicted restore per Present
     }
     if (g_evict_off.load(std::memory_order_relaxed)) {
         if (g_restore_due.exchange(false)) restore_all(0);
