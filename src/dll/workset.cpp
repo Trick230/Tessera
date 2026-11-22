@@ -90,11 +90,12 @@ constexpr int kTexBits = 15, kSrvBits = 16;  // 32K textures, 64K views (~6 MB r
 Table g_tex = {nullptr, nullptr, kTexBits};
 Table g_srv = {nullptr, nullptr, kSrvBits};
 SRWLOCK g_lock = SRWLOCK_INIT;
+INIT_ONCE g_init = INIT_ONCE_STATIC_INIT;
 std::atomic<uint32_t> g_frame{1};
 std::atomic<uint32_t> g_view_revision{0};
 std::atomic<uint32_t> g_untracked{0};
 std::atomic<bool> g_on{false};
-ID3D11DeviceContext* g_imm = nullptr;  // weak, like the device
+constexpr GUID kSwapContext = {0x35e23f2c, 0x6e32, 0x455b, {0x93, 0x8a, 0x50, 0xcb, 0xb2, 0x03, 0x2c, 0xf1}};
 
 uint32_t hash(const void* p, int bits) {
     return static_cast<uint32_t>(((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull) >> (64 - bits));
@@ -244,55 +245,62 @@ void STDMETHODCALLTYPE hk_set(ID3D11DeviceContext* self, UINT start, UINT n, ID3
     using F = decltype(&hk_set<I>);
     reinterpret_cast<F>(vt_orig(g_set[I], self))(self, start, n, v);
 }
+BOOL CALLBACK initialize(PINIT_ONCE, PVOID, PVOID*) {
+    // Committed at once, but zero pages cost nothing until touched.
+    const size_t nt = size_t{1} << kTexBits, ns = size_t{1} << kSrvBits;
+    const size_t bytes = (nt + ns) * (sizeof(Hot) + sizeof(Slot));
+    auto* p = static_cast<uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!p) {
+        logf("workset: no memory for the tables, meter off");
+        return FALSE;
+    }
+    g_tex.hot = reinterpret_cast<Hot*>(p);
+    g_srv.hot = g_tex.hot + nt;
+    g_tex.slot = reinterpret_cast<Slot*>(g_srv.hot + ns);
+    g_srv.slot = g_tex.slot + nt;
+    g_on.store(true, std::memory_order_release);
+    return TRUE;
+}
 }  // namespace
 
 void workset_on_device(ID3D11Device* dev) {
-    if (!config().workset || g_on.load(std::memory_order_acquire)) return;
-    if (!g_tex.hot) {
-        // Committed at once, but zero pages cost nothing until touched.
-        const size_t nt = size_t{1} << kTexBits, ns = size_t{1} << kSrvBits;
-        const size_t bytes = (nt + ns) * (sizeof(Hot) + sizeof(Slot));
-        auto* p = static_cast<uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (!p) {
-            logf("workset: no memory for the tables, meter off");
-            return;
-        }
-        g_tex.hot = reinterpret_cast<Hot*>(p);
-        g_srv.hot = g_tex.hot + nt;
-        g_tex.slot = reinterpret_cast<Slot*>(g_srv.hot + ns);
-        g_srv.slot = g_tex.slot + nt;
-    }
+    if (!config().workset || !InitOnceExecuteOnce(&g_init, initialize, nullptr, nullptr)) return;
     ID3D11DeviceContext* ctx = nullptr;
     dev->GetImmediateContext(&ctx);
     if (!ctx) return;
-    bool ok = true;
-    for (VtHook& h : g_set) ok = vt_hook(h, ctx) && ok;
-    g_imm = ctx;
+    const bool ok = workset_adopt(ctx);
     ctx->Release();
     logf("workset: bind hooks %s", ok ? "ok" : "FAILED");
-    // A partial set would undercount; the meter is only on with all six.
-    if (ok) g_on.store(true, std::memory_order_release);
 }
 
 bool workset_adopt(ID3D11DeviceContext* imm) {
-    if (!g_on.load(std::memory_order_acquire)) return false;
-    if (imm == g_imm) return true;
-    // A device that replaced the first one: its binds are the ones that count now.
+    if (!imm || !g_on.load(std::memory_order_acquire)) return false;
     bool ok = true;
-    for (VtHook& h : g_set) ok = vt_hook(h, imm) && ok;
-    logf("workset: bind hooks on the new device %s", ok ? "ok" : "FAILED");
-    if (ok) g_imm = imm;
+    for (VtHook& h : g_set) ok = vt_hook(h, imm, true) && ok;
     return ok;
 }
 
 bool workset_check_hooks(ID3D11DeviceContext* imm) {
-    // g_imm is weak: compared, never followed unless it is imm (alive).
-    if (!g_on.load(std::memory_order_acquire) || imm != g_imm) return true;
+    if (!imm || !g_on.load(std::memory_order_acquire)) return true;
     bool ok = true;
-    for (VtHook& h : g_set) ok = vt_rehook(h, g_imm) && ok;
+    for (VtHook& h : g_set) ok = vt_rehook(h, imm) && ok;
     static std::atomic<bool> s_logged{false};
     if (!ok && !s_logged.exchange(true)) logf("workset: bind hooks overwritten, binds go uncounted");
     return ok;
+}
+
+void workset_on_swapchain(IDXGISwapChain* sc, ID3D11DeviceContext* imm) {
+    if (workset_adopt(imm) && (config().mip_prediction || config().mip_feedback)) {
+        // The swapchain keeps the device and its immediate context alive.
+        sc->SetPrivateData(kSwapContext, sizeof imm, &imm);
+    }
+}
+
+void workset_after_present(IDXGISwapChain* sc) {
+    if (!config().workset || !(config().mip_prediction || config().mip_feedback)) return;
+    ID3D11DeviceContext* imm = nullptr;
+    UINT size = sizeof imm;
+    if (SUCCEEDED(sc->GetPrivateData(kSwapContext, &size, &imm))) workset_check_hooks(imm);
 }
 
 void workset_on_context(ID3D11DeviceContext* ctx) {

@@ -630,11 +630,27 @@ int d3d11_calls_mode(bool bench) {
 }  // namespace
 
 int stream() {
+    ID3D11Device* probe = nullptr;
+    constexpr UINT probe_flags = D3D11_CREATE_DEVICE_SINGLETHREADED;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, probe_flags, nullptr, 0,
+                                 D3D11_SDK_VERSION, &probe, nullptr, nullptr)))
+        return fail("stream probe device");
+    const HWND wnd = make_window();
+    if (!wnd) return fail("stream window");
+    DXGI_SWAP_CHAIN_DESC swap = {};
+    swap.BufferDesc = {64, 64, {0, 1}, DXGI_FORMAT_R8G8B8A8_UNORM};
+    swap.SampleDesc.Count = 1;
+    swap.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swap.BufferCount = 2;
+    swap.OutputWindow = wnd;
+    swap.Windowed = TRUE;
+    swap.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    IDXGISwapChain* sc = nullptr;
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
-                                 &dev, nullptr, &ctx)))
-        return fail("stream device");
+    if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                             D3D11_SDK_VERSION, &swap, &sc, &dev, nullptr, &ctx)))
+        return fail("stream device and swap chain");
     wchar_t mode[2] = {};
     GetEnvironmentVariableW(L"TESSERA_SMOKE_PREDICT", mode, _countof(mode));
     wchar_t path[MAX_PATH] = {};
@@ -656,6 +672,7 @@ int stream() {
             if (!read_asset(1 + i % 32, i < 32 ? 65536 : 4096)) return fail("stream startup reads");
     }
     if (mode[0]) {
+        if (FAILED(sc->Present(0, 0))) return fail("stream present");
         D3D11_TEXTURE2D_DESC d = {};
         d.Width = d.Height = 64;
         d.MipLevels = d.ArraySize = d.SampleDesc.Count = 1;
@@ -680,7 +697,10 @@ int stream() {
     CloseHandle(file);
     Sleep(650);  // the learning and prefetch workers run asynchronously
     ctx->Release();
+    sc->Release();
     dev->Release();
+    probe->Release();
+    DestroyWindow(wnd);
     return 0;
 }
 

@@ -1145,7 +1145,7 @@ void on_device_locked(ID3D11Device* dev) {
         g_need.items = q + 2 * kMaxRes;
         g_drop.items = q + 3 * kMaxRes;
     }
-    // A device that replaced the first: the meter's bind hooks go on its context too.
+    // The meter must see binds on the context whose textures we manage.
     if (!workset_adopt(ctx2)) {
         logf("residency: off, needs the working-set meter's bind hooks");
         ctx2->Release();
@@ -1369,15 +1369,13 @@ void residency_after_present() {
 }
 
 void residency_check_hooks(ID3D11DeviceContext* imm) {
-    // The managed device is gone: its context (g_imm here and in the meter)
-    // is freed memory until another device takes over.
+    // The managed device is gone: its context is freed until another device takes over.
     if (g_dev_gone.load(std::memory_order_acquire)) return;
-    // Residency relies on the meter's bind hooks too.
-    const bool binds = workset_check_hooks(imm);
     // Also once evictions are off: what is still evicted needs its copies seen.
     ID3D11DeviceContext* const ours = g_imm;
     if (!g_on.load(std::memory_order_acquire) || !ours || imm != ours) return;
-    bool ok = binds;
+    // Residency relies on the meter's bind hooks too.
+    bool ok = workset_check_hooks(ours);
     for (VtHook* h : {&g_copy_sub, &g_copy_res, &g_set_lod, &g_get_lod, &g_exec, &g_map, &g_copy_map, &g_resize_pool,
                      &g_copy_sub1, &g_swap_state})
         if (h->n) ok = vt_rehook(*h, ours) && ok;

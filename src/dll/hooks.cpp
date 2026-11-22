@@ -543,6 +543,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     const HRESULT hr = orig<F>(g_present, self)(self, sync, flags);
     flip_after_present(ff);
     if (managed) residency_after_present();
+    else if (frame) workset_after_present(self);
     if (config().mip_feedback) feedback_after_present(self);
     if (config().texture_quality == 2) quality_after_present(self);
     return hr;
@@ -570,6 +571,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
     const HRESULT hr = orig<F>(g_present1, self)(self, sync, flags, params);
     flip_after_present(ff);
     if (managed) residency_after_present();
+    else if (frame) workset_after_present(self);
     if (config().mip_feedback) feedback_after_present(self);
     if (config().texture_quality == 2) quality_after_present(self);
     return hr;
@@ -674,6 +676,7 @@ void on_swapchain(IDXGISwapChain* sc) {
             residency_on_swapchain(sc, dev);
             ID3D11DeviceContext* imm = nullptr;
             dev->GetImmediateContext(&imm);
+            workset_on_swapchain(sc, imm);
             residency_check_hooks(imm);
             if (imm) imm->Release();
             dev->Release();

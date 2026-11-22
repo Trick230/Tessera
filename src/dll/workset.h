@@ -6,6 +6,7 @@
 // CreateShaderResourceView1 (not hooked).
 #pragma once
 #include <d3d11.h>
+#include <dxgi.h>
 #include <stdint.h>
 
 #include <atomic>
@@ -15,14 +16,13 @@ namespace tessera {
 void workset_on_device(ID3D11Device* dev);
 // Every new deferred context: each has a vtable of its own.
 void workset_on_context(ID3D11DeviceContext* ctx);
-// The runtime rewrites some immediate-context methods (when a swapchain is
-// made): patches them again for imm if it is the hooked one. False if a hook
-// is gone.
+// Recheck bind hooks on a live immediate context previously adopted.
 bool workset_check_hooks(ID3D11DeviceContext* imm);
-// Residency moves to a device that replaced the first: hooks its immediate
-// context too and makes it the checked one. False if the meter is off or a
-// hook failed.
+// Attach bind hooks to a device's immediate context. False if the meter is
+// off or a hook failed.
 bool workset_adopt(ID3D11DeviceContext* imm);
+void workset_on_swapchain(IDXGISwapChain* sc, ID3D11DeviceContext* imm);
+void workset_after_present(IDXGISwapChain* sc);
 // A game texture that is only sampled (no target binds, not shared). res is
 // its M3 residency index + 1 (0 = not managed): binds of its views then
 // call residency_on_use. Returns the texture's live-view counter, nullptr
