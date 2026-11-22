@@ -21,6 +21,7 @@ using Microsoft::WRL::ComPtr;
 constexpr GUID kVariant = {0xbecdb178, 0x6c47, 0x4e77, {0xa8, 0x99, 0x67, 0xc0, 0xfb, 0xe1, 0x5d, 0x01}};
 constexpr GUID kSlots = {0x58a4d0c0, 0xe00b, 0x49ca, {0x83, 0x3c, 0xec, 0xcb, 0xb1, 0x21, 0x3d, 0x04}};
 constexpr GUID kCapture = {0x005a6bc5, 0xd1f9, 0x4e51, {0xb1, 0x51, 0x35, 0x1a, 0x60, 0x59, 0x09, 0xab}};
+constexpr GUID kShaderMiss = {0x015276bc, 0x948f, 0x4726, {0xac, 0x21, 0x1e, 0xc8, 0x36, 0xeb, 0x53, 0xbe}};
 constexpr UINT kUav = TESSERA_FEEDBACK_UAV, kTextures = TESSERA_FEEDBACK_TEXTURES;
 constexpr unsigned kInterval = 60;
 constexpr unsigned kWindowFrames = 8, kWindowAttempts = 32, kFrameAttempts = 8;
@@ -199,6 +200,29 @@ bool free_output_slot(ID3D11DeviceContext* ctx) {
     return !uav;
 }
 
+struct ShaderMiss {
+    uint64_t hash;
+    TesseraMipShaderMiss reason;
+};
+
+void record_shader_miss(ID3D11PixelShader* shader) {
+    ShaderMiss miss = {0, shader ? TESSERA_MIP_UNTRACKED_SHADER : TESSERA_MIP_NO_SHADER};
+    if (shader) {
+        ShaderMiss tracked;
+        UINT size = sizeof tracked;
+        if (SUCCEEDED(shader->GetPrivateData(kShaderMiss, &size, &tracked)) && size == sizeof tracked)
+            miss = tracked;
+    }
+    LARGE_INTEGER time;
+    QueryPerformanceCounter(&time);
+    TesseraRecord record = {};
+    record.qpc = static_cast<uint64_t>(time.QuadPart);
+    record.kind = TESSERA_REC_MIP_SHADER_MISS;
+    record.a = miss.reason;
+    record.bytes = miss.hash;
+    session_push(record);
+}
+
 template <typename F, typename... A>
 void draw(ID3D11DeviceContext* ctx, F original_draw, A... args) {
     if (!g_armed.load(std::memory_order_relaxed)) {
@@ -222,7 +246,10 @@ void draw(ID3D11DeviceContext* ctx, F original_draw, A... args) {
     UINT size = sizeof(ID3D11PixelShader*);
     if (original) original->GetPrivateData(kVariant, &size, variant.GetAddressOf());
     std::atomic<unsigned>* skipped = nullptr;
-    if (!variant) skipped = &g_stats.no_variant;
+    if (!variant) {
+        skipped = &g_stats.no_variant;
+        if (config().mip_feedback_diagnostics) record_shader_miss(original.Get());
+    }
     else if (!capture_bindings(*cap, *original.Get())) skipped = &g_stats.no_texture;
     else if (!free_output_slot(ctx)) skipped = &g_stats.output_busy;
     if (skipped) {
@@ -299,20 +326,31 @@ void STDMETHODCALLTYPE hk_draw_indirect(ID3D11DeviceContext* c, ID3D11Buffer* ar
 }  // namespace
 
 void feedback_on_shader(ID3D11Device* dev, CreatePixelShaderFn create, ID3D11PixelShader* original,
-                        const void* bytes, SIZE_T size) {
-    if (!config().mip_feedback || size < 32 || std::memcmp(bytes, "DXBC", 4) != 0 || !have_cache()) return;
+                        const void* bytes, SIZE_T size, uint64_t hash, bool linked) {
+    if (!config().mip_feedback) return;
+    auto note_miss = [&](TesseraMipShaderMiss reason) {
+        if (config().mip_feedback_diagnostics) {
+            const ShaderMiss miss = {hash, reason};
+            original->SetPrivateData(kShaderMiss, sizeof miss, &miss);
+        }
+    };
+    if (linked) return note_miss(TESSERA_MIP_CLASS_LINKAGE);
+    if (size < 32 || std::memcmp(bytes, "DXBC", 4) != 0) return note_miss(TESSERA_MIP_UNSUPPORTED_BYTECODE);
+    if (!have_cache()) return note_miss(TESSERA_MIP_CACHE_MISS);
     const auto* checksum = static_cast<const uint8_t*>(bytes) + 4;
     auto end = g_entries + g_count;
     auto match = std::lower_bound(g_entries, end, checksum, [](const auto* entry, const uint8_t* key) {
         return std::memcmp(entry->checksum, key, 16) < 0;
     });
-    if (match == end || std::memcmp((*match)->checksum, checksum, 16) != 0) return;
+    if (match == end || std::memcmp((*match)->checksum, checksum, 16) != 0) return note_miss(TESSERA_MIP_CACHE_MISS);
     const auto& entry = **match;
     ComPtr<ID3D11PixelShader> variant;
     if (SUCCEEDED(create(dev, &entry + 1, entry.bytes, nullptr, &variant)) &&
         SUCCEEDED(original->SetPrivateData(kSlots, entry.count, entry.slots)) &&
         SUCCEEDED(original->SetPrivateDataInterface(kVariant, variant.Get())))
         g_stats.variants.fetch_add(1, std::memory_order_relaxed);
+    else
+        note_miss(TESSERA_MIP_VARIANT_INSTALL_FAILED);
 }
 
 void feedback_on_context(ID3D11DeviceContext* ctx) {

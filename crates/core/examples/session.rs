@@ -5,17 +5,23 @@
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: session <file.tsess> [--mips]");
+        eprintln!("usage: session <file.tsess> [--mips | --mip-misses]");
         std::process::exit(2)
     };
-    if args.next().as_deref() == Some("--mips") {
-        if let Err(error) = print_quality(std::path::Path::new(&path)) {
+    let path = std::path::Path::new(&path);
+    let detail = match args.next().as_deref() {
+        Some("--mips") => Some(print_quality(path)),
+        Some("--mip-misses") => Some(print_mip_misses(path)),
+        _ => None,
+    };
+    if let Some(result) = detail {
+        if let Err(error) = result {
             eprintln!("{error}");
             std::process::exit(1);
         }
         return;
     }
-    match tessera_core::session::summarize_file(std::path::Path::new(&path)) {
+    match tessera_core::session::summarize_file(path) {
         Ok(s) => {
             println!("exe        {}", s.header.exe_path);
             println!("clean      {} (dropped {})", s.clean, s.dropped);
@@ -67,6 +73,26 @@ fn main() {
             std::process::exit(1)
         }
     }
+}
+
+fn print_mip_misses(path: &std::path::Path) -> Result<(), tessera_core::session::Error> {
+    use tessera_core::session::{self, REC_MIP_SHADER_MISS};
+    let data = std::fs::read(path)?;
+    let (_, header, record) = session::parse_header(&data)?;
+    println!("qpc,shader_hash,reason");
+    for r in session::records(&data, header, record).filter(|r| r.kind == REC_MIP_SHADER_MISS) {
+        let reason = match r.a {
+            1 => "no_pixel_shader",
+            2 => "untracked_shader",
+            3 => "class_linkage",
+            4 => "unsupported_bytecode",
+            5 => "cache_miss",
+            6 => "variant_install_failed",
+            _ => "unknown",
+        };
+        println!("{},{:016x},{reason}", r.qpc, r.bytes);
+    }
+    Ok(())
 }
 
 fn print_quality(path: &std::path::Path) -> Result<(), tessera_core::session::Error> {

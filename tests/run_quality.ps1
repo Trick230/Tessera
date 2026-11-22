@@ -148,3 +148,17 @@ if ($LASTEXITCODE -or $feedback.Count -ne 1 -or $feedback[0].A -ne 3 -or $feedba
     throw "Feedback missed an indirect draw in the next frame of the sample window"
 }
 "PASS early-cached indirect draw and sampling across frames"
+
+$uncached = Join-Path $case "EXPLICIT_LOD.dxbc"
+$shaderHash = [BitConverter]::ToUInt64([IO.File]::ReadAllBytes($uncached), 4)
+foreach ($diagnostics in 0, 1) {
+    Set-Content -LiteralPath "$case\tessera.ini" -Value @("[tessera]", "mip_feedback=1", "mip_feedback_diagnostics=$diagnostics") -Encoding ascii
+    & $test --layer $uncached
+    if ($LASTEXITCODE) { throw "Uncached shader draw failed" }
+    $misses = @(Read-Records 14)
+    if (!$diagnostics -and $misses.Count) { throw "Shader misses recorded with diagnostics disabled" }
+    if ($diagnostics -and !($misses | Where-Object { $_.A -eq 5 -and $_.Bytes -eq $shaderHash })) {
+        throw "Uncached shader hash or reason was not recorded"
+    }
+}
+"PASS opt-in shader miss hash and reason"

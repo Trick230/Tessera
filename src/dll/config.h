@@ -25,6 +25,7 @@ struct Config {
     int stream_io = 0;           // I1-I3: 1 learn reads, 2 prefetch a saved trace
     bool mip_prediction = false;  // M7: predict texture use
     bool mip_feedback = false;    // M6: sample prepared pixel shaders at runtime
+    bool mip_feedback_diagnostics = false;  // Record the pixel shaders skipped by feedback sampling.
     int texture_quality = 0;      // M9: 1 = capture textures, 2 = use prepared replacements
     bool mip_streaming = false;   // I4-I5: spare tile pool and split background uploads
     bool rt_recycle = false;    // R1: released big render targets handed back on the next matching create
