@@ -359,7 +359,13 @@ fn session_info(exe: &Path) -> (SessionInfo, (u32, Option<u32>), Option<(u64, u6
 
 /// The Shaders tab: what the driver already compiled, how much of what the
 /// game uses is covered, what is damaged and what is out of date.
-fn shader_state(c: &ShaderCheck, run: Option<(u64, u64)>, can_prepare: bool) -> ShaderState {
+fn shader_state(
+    c: &ShaderCheck,
+    run: Option<(u64, u64)>,
+    can_prepare: bool,
+    pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
+    disk_cache: Option<tessera_core::driver::NvidiaGameCache>,
+) -> ShaderState {
     const NEUTRAL: i32 = 0;
     const OK: i32 = 1;
     const WARN: i32 = 2;
@@ -373,7 +379,34 @@ fn shader_state(c: &ShaderCheck, run: Option<(u64, u64)>, can_prepare: bool) -> 
     };
     let mut rows = Vec::new();
 
-    // Compiled: the warm-up logs written with the installed driver.
+    if let Some(pak_key) = pak_key {
+        use tessera_core::scan::PakKeySource;
+        let (value, detail, tone) = match pak_key {
+            Some((source, true)) => {
+                let source = match source {
+                    PakKeySource::Environment => "Environment variable",
+                    PakKeySource::LinkedFile => "Linked file",
+                    PakKeySource::ScsKiller => "Detected automatically in SCSKiller",
+                };
+                ("Available", source, OK)
+            }
+            Some((_, false)) => ("Unavailable", "The configured key file is unreadable or invalid.", WARN),
+            None => ("No key file", "Link a key file if the game's Unreal PAKs are encrypted.", NEUTRAL),
+        };
+        rows.push(line("Unreal PAK key", value.to_string(), vec![detail.to_string()], tone));
+    }
+
+    let (value, detail) = match disk_cache {
+        Some(cache) if cache.files > 0 => (
+            size(cache.bytes),
+            format!("{} NVIDIA cache file(s) name this executable. Individual shader matches are unavailable.", cache.files),
+        ),
+        Some(_) => ("No matching files".to_string(), "No readable NVIDIA cache file names this executable.".to_string()),
+        None => ("Unavailable".to_string(), "Tessera could not verify this game's driver cache on disk.".to_string()),
+    };
+    rows.push(line("Driver cache on disk", value, vec![detail], NEUTRAL));
+
+    // Warm-up results written with the installed driver.
     let mut d = Vec::new();
     let warmable = c.stored - c.skipped;
     let (value, tone) = if c.stored == 0 {
@@ -384,7 +417,7 @@ fn shader_state(c: &ShaderCheck, run: Option<(u64, u64)>, can_prepare: bool) -> 
         }.to_string());
         ("Nothing stored".to_string(), NEUTRAL)
     } else if c.all_compiled() {
-        d.push(format!("The installed driver already compiled all {} stored shaders the warm-up can take.", c.compiled));
+        d.push(format!("The warm-up exercised all {} supported stored shaders on the installed driver.", c.compiled));
         (format!("All {}", c.compiled), OK)
     } else {
         d.push(format!(
@@ -412,7 +445,7 @@ fn shader_state(c: &ShaderCheck, run: Option<(u64, u64)>, can_prepare: bool) -> 
     if c.unreadable_unreal_packages > 0 {
         d.push(format!("{} Unreal packages could not be decoded.", c.unreadable_unreal_packages));
     }
-    rows.push(line("Compiled", value, d, tone));
+    rows.push(line("Warm-up recorded", value, d, tone));
     rows.push(line(
         "Pending",
         c.pending.to_string(),
@@ -590,7 +623,8 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
     let Some(exe) = exe else { return };
     let root = game.map(|g| g.entry.root.clone());
     let prepare = game.is_some_and(can_prepare);
-    let ue_exe = game.filter(|g| matches!(g.engine, tessera_core::engine::Engine::Unreal { .. })).map(|_| exe.clone());
+    let is_unreal = game.is_some_and(|g| matches!(g.engine, tessera_core::engine::Engine::Unreal { .. }));
+    let ue_exe = is_unreal.then(|| exe.clone());
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         // P1: before the settings card reads tessera.ini (NVAPI DRS takes tens of ms).
@@ -621,9 +655,11 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
             .filter_map(|g| tessera_core::driver::umd_version(&g.driver_version))
             .collect();
         let check = tessera_core::shader_check::check(&exe, root.as_deref(), &drivers);
+        let pak_key = is_unreal.then(|| tessera_core::scan::unreal_key_status(&exe));
+        let disk_cache = tessera_core::driver::nvidia_game_cache(&exe);
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if SESSION_GEN.load(Ordering::Relaxed) == gen {
-                ui.set_shader_state(shader_state(&check, run, prepare));
+                ui.set_shader_state(shader_state(&check, run, prepare, pak_key, disk_cache));
             }
         });
     });
@@ -939,7 +975,10 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(exe) = exe else { return };
             let Some(path) = rfd::FileDialog::new().set_title("Select an Unreal PAK key file").pick_file() else { return };
             let msg = match tessera_core::scan::set_unreal_key_file(&exe, &path) {
-                Ok(()) => "PAK key file linked. Prepare shaders will use it on the next scan.".into(),
+                Ok(()) => {
+                    load_session(&ui, &mut s.lock().unwrap(), i, true);
+                    "PAK key file linked. Prepare shaders will use it on the next scan.".into()
+                }
                 Err(e) => format!("Could not link the PAK key file: {e}"),
             };
             ui.set_status_text(msg.into());

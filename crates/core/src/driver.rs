@@ -169,6 +169,68 @@ pub fn cache_dirs() -> Vec<PathBuf> {
     out.into_iter().filter(|p| p.is_dir()).collect()
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NvidiaGameCache {
+    pub files: u64,
+    /// Used bytes in the matched files, read from their headers.
+    pub bytes: u64,
+}
+
+/// Reads only the headers of NVIDIA's current DXCache files. A matching
+/// header identifies an executable name, not individual shader bytecode.
+pub fn nvidia_game_cache(exe: &Path) -> Option<NvidiaGameCache> {
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    nvidia_game_cache_at(&local.join("NVIDIA/DXCache"), exe.file_name()?.to_str()?)
+}
+
+fn nvidia_game_cache_at(dir: &Path, exe_name: &str) -> Option<NvidiaGameCache> {
+    use std::io::Read;
+
+    let mut cache = NvidiaGameCache::default();
+    let mut incomplete = false;
+    let mut understood = false;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nvph")) {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            incomplete = true;
+            continue;
+        };
+        let mut header = Vec::with_capacity(0x111);
+        let Ok(metadata) = file.metadata() else {
+            incomplete = true;
+            continue;
+        };
+        if (&file).take(0x111).read_to_end(&mut header).is_err() {
+            incomplete = true;
+            continue;
+        }
+        let Some((name, bytes)) = nvidia_cache_header(&header, metadata.len()) else {
+            incomplete = true;
+            continue;
+        };
+        understood = true;
+        if name.eq_ignore_ascii_case(exe_name.as_bytes()) {
+            cache.files += 1;
+            cache.bytes += bytes;
+        }
+    }
+    (cache.files > 0 || (understood && !incomplete)).then_some(cache)
+}
+
+fn nvidia_cache_header(header: &[u8], file_len: u64) -> Option<(&[u8], u64)> {
+    if header.get(..4)? != b"nvph" {
+        return None;
+    }
+    let used = u64::from_le_bytes(header.get(8..16)?.try_into().ok()?);
+    let name_field = header.get(0x11..)?;
+    let name = &name_field[..name_field.iter().position(|&b| b == 0)?];
+    (used >= 0x12 && used <= file_len && !name.is_empty()).then_some((name, used))
+}
+
 #[cfg(windows)]
 mod nvapi {
     //! The NVIDIA cache limit lives in the driver profile database, reachable
@@ -432,5 +494,26 @@ mod tests {
         assert_eq!(r.advice().len(), 1);
         let ok = Report { nv_limit: Some(NvCacheLimit::Unlimited), ..r };
         assert!(ok.advice().is_empty());
+    }
+
+    #[test]
+    fn nvidia_cache_matches_executable_names_and_reports_used_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_cache = |file, name: &[u8], used: u64| {
+            let mut data = [0; 128];
+            data[..4].copy_from_slice(b"nvph");
+            data[8..16].copy_from_slice(&used.to_le_bytes());
+            data[0x11..0x11 + name.len()].copy_from_slice(name);
+            std::fs::write(dir.path().join(file), data).unwrap();
+        };
+        write_cache("a.nvph", b"FF7REMAKE_.EXE", 80);
+        write_cache("b.nvph", b"ff7remake_.exe.bak", 100);
+        assert_eq!(
+            nvidia_game_cache_at(dir.path(), "ff7remake_.exe"),
+            Some(NvidiaGameCache { files: 1, bytes: 80 }),
+        );
+        assert_eq!(nvidia_game_cache_at(dir.path(), "other.exe"), Some(NvidiaGameCache::default()));
+        write_cache("c.nvph", b"other.exe", 129);
+        assert_eq!(nvidia_game_cache_at(dir.path(), "other.exe"), None);
     }
 }

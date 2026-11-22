@@ -516,7 +516,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
     let mut paths = files(root);
     paths.sort_unstable();
     let mut key = std::collections::hash_map::DefaultHasher::new();
-    if let Some(path) = unreal_key_path(exe) {
+    if let Some((path, _)) = unreal_key_file(exe) {
         path.hash(&mut key);
         fs::metadata(path).ok().and_then(|meta| meta.modified().ok()).hash(&mut key);
     }
@@ -536,9 +536,33 @@ fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
     Some(crate::warm::with_suffix(&scan_base(exe)?, ".pak-key-path"))
 }
 
-fn unreal_key_path(exe: &Path) -> Option<PathBuf> {
-    std::env::var_os("TESSERA_UNREAL_PAK_KEY_FILE").filter(|p| !p.is_empty()).map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(fs::read_to_string(unreal_key_reference(exe)?).ok()?)))
+#[derive(Clone, Copy)]
+pub enum PakKeySource {
+    Environment,
+    LinkedFile,
+    ScsKiller,
+}
+
+fn unreal_key_file(exe: &Path) -> Option<(PathBuf, PakKeySource)> {
+    if let Some(path) = std::env::var_os("TESSERA_UNREAL_PAK_KEY_FILE").filter(|p| !p.is_empty()) {
+        return Some((path.into(), PakKeySource::Environment));
+    }
+    if let Some(reference) = unreal_key_reference(exe) {
+        if let Ok(path) = fs::read_to_string(reference) {
+            return Some((path.into(), PakKeySource::LinkedFile));
+        }
+    }
+    if !exe.file_name()?.eq_ignore_ascii_case("ff7remake_.exe") {
+        return None;
+    }
+    let path = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+        .join("SCSKiller/games/steam_1462040/aes.key");
+    path.is_file().then_some((path, PakKeySource::ScsKiller))
+}
+
+pub fn unreal_key_status(exe: &Path) -> Option<(PakKeySource, bool)> {
+    let (path, source) = unreal_key_file(exe)?;
+    Some((source, PakKey::from_file(&path).is_some()))
 }
 
 /// Store a reference to the user-selected key file, leaving its contents in place.
@@ -597,7 +621,7 @@ pub fn current_key(exe: &Path, root: &Path) -> String {
 pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     let base = scan_base(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
     let key = install_key(exe, root);
-    let pak_key = unreal_key_path(exe).and_then(|p| PakKey::from_file(&p));
+    let pak_key = unreal_key_file(exe).and_then(|(p, _)| PakKey::from_file(&p));
     let (mut shaders, stats) = scan_dir_with_key(root, pak_key.as_ref());
     let stored: std::collections::HashSet<u64> = crate::shaders::read(exe).iter().map(|s| s.hash).collect();
     shaders.retain(|s| !stored.contains(&s.hash));
