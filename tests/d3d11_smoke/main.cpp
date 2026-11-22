@@ -721,8 +721,8 @@ int dedup() {
     return 0;
 }
 
-// Cost of the bind hooks (M11): random 16-view binds across a large table.
-int bench() {
+// Cost of 16-view binds across a large table and for repeated material batches.
+int bench(bool repeated) {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev,
@@ -762,10 +762,23 @@ int bench() {
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&a);
     constexpr int kCalls = 2000000;
-    for (int i = 0; i < kCalls; ++i)
-        ctx->PSSetShaderResources(0, 16, &order[static_cast<size_t>(i) * 16 * 61 % (kViews - 16)]);
+    for (int i = 0; i < kCalls; ++i) {
+        const size_t batch = repeated ? static_cast<size_t>(i / 8) : static_cast<size_t>(i);
+        ctx->PSSetShaderResources(0, 16, &order[batch * 16 * 61 % (kViews - 16)]);
+    }
     QueryPerformanceCounter(&b);
-    std::printf("bench: %.1f ns per 16-view bind\n", (b.QuadPart - a.QuadPart) * 1e9 / f.QuadPart / kCalls);
+    std::printf("bench %s: %.1f ns per 16-view bind\n", repeated ? "repeated" : "random",
+                (b.QuadPart - a.QuadPart) * 1e9 / f.QuadPart / kCalls);
+    // ClearState also changes all slots without calling our hook. An identical
+    // batch must still reach D3D11 after the clear.
+    ctx->PSSetShaderResources(0, 16, order.data());
+    ctx->PSSetShaderResources(0, 16, order.data());
+    ctx->ClearState();
+    ctx->PSSetShaderResources(0, 16, order.data());
+    ID3D11ShaderResourceView* bound = nullptr;
+    ctx->PSGetShaderResources(0, 1, &bound);
+    if (bound != order[0]) return fail("repeated bind missing after ClearState");
+    bound->Release();
     for (int i = 0; i < kViews; ++i) {
         v[i]->Release();
         t[i]->Release();
@@ -1388,7 +1401,8 @@ int uecvars_mode(bool stale) {
 
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--uecvars") == 0) return uecvars_mode(argc >= 3 && wcscmp(argv[2], L"stale") == 0);
-    if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0) return bench();
+    if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0)
+        return bench(argc >= 3 && wcscmp(argv[2], L"repeated") == 0);
     if (argc >= 2 && wcscmp(argv[1], L"--dedup") == 0) return dedup();
     if (argc >= 2 && wcscmp(argv[1], L"--stream") == 0) return stream();
     if (argc >= 2 && wcscmp(argv[1], L"--imports") == 0) return imports_mode();

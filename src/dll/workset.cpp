@@ -6,6 +6,7 @@
 #include <intrin.h>
 
 #include <atomic>
+#include <cstring>
 
 #include "config.h"
 #include "log.h"
@@ -90,6 +91,7 @@ Table g_tex = {nullptr, nullptr, kTexBits};
 Table g_srv = {nullptr, nullptr, kSrvBits};
 SRWLOCK g_lock = SRWLOCK_INIT;
 std::atomic<uint32_t> g_frame{1};
+std::atomic<uint32_t> g_view_revision{0};
 std::atomic<uint32_t> g_untracked{0};
 std::atomic<bool> g_on{false};
 ID3D11DeviceContext* g_imm = nullptr;  // weak, like the device
@@ -136,12 +138,42 @@ bool attach(const Table& t, int j, ID3D11DeviceChild* obj) {
 }
 
 // One lookup per view; the texture is resolved in the tick, off the frame path.
-template <bool Predict>
+template <bool Predict, bool MeterOnly = false>
 void mark(ID3D11DeviceContext* ctx, UINT start, UINT n, ID3D11ShaderResourceView* const* v) {
     // The runtime drops an out-of-range call without reading v: so must we.
     if (!v || start >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) return;
     if (n > D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - start) return;
     const uint32_t f = g_frame.load(std::memory_order_relaxed);
+    if constexpr (MeterOnly) {
+        // A repeated batch still reaches D3D11. Only our usage marks can be
+        // reused, within the same frame and before any new view was published.
+        thread_local struct {
+            ID3D11ShaderResourceView* const* previous;
+            ID3D11ShaderResourceView* const* cached;
+            ID3D11ShaderResourceView* views[16];
+            UINT count;
+            uint32_t frame, revision;
+        } recent{};
+        if (n == 0) return;
+        if (n <= _countof(recent.views)) {
+            // Different argument arrays pay only the pointer comparison and
+            // store. A repeat still checks the contents and tracked views.
+            if (recent.previous == v) {
+                const uint32_t revision = g_view_revision.load(std::memory_order_acquire);
+                const size_t bytes = n * sizeof *v;
+                if (recent.cached == v && recent.count == n && recent.frame == f && recent.revision == revision &&
+                    std::memcmp(recent.views, v, bytes) == 0)
+                    return;
+                std::memcpy(recent.views, v, bytes);
+                recent.cached = v;
+                recent.count = n;
+                recent.frame = f;
+                recent.revision = revision;
+            } else {
+                recent.previous = v;
+            }
+        }
+    }
     thread_local uint32_t t_frame = 0;
     thread_local unsigned t_samples = 0;
     if constexpr (Predict) {
@@ -161,10 +193,21 @@ void mark(ID3D11DeviceContext* ctx, UINT start, UINT n, ID3D11ShaderResourceView
         if (j < 0) continue;
         // Write only on the first bind in a frame: no cache line ping-pong.
         std::atomic<uint32_t>& last = g_srv.hot[j].last;
-        if (last.load(std::memory_order_relaxed) != f) last.store(f, std::memory_order_relaxed);
+        if constexpr (MeterOnly) {
+            // A bind on another thread may have captured the previous frame.
+            // Keep it from rolling back a mark we can now skip on a cache hit.
+            uint32_t seen = last.load(std::memory_order_relaxed);
+            while (seen != f && (!seen || static_cast<int32_t>(f - seen) > 0) &&
+                   !last.compare_exchange_weak(seen, f, std::memory_order_relaxed)) {}
+        } else if (last.load(std::memory_order_relaxed) != f) {
+            last.store(f, std::memory_order_relaxed);
+        }
         // M5: a managed texture is made whole before the draw that samples it.
-        const uint32_t r = g_srv.hot[j].res.load(std::memory_order_relaxed);
-        if (r) residency_on_use(r - 1, ctx);
+        uint32_t r = 0;
+        if constexpr (!MeterOnly) {
+            r = g_srv.hot[j].res.load(std::memory_order_relaxed);
+            if (r) residency_on_use(r - 1, ctx);
+        }
         if constexpr (Predict) {
             if (count < kMaterialTextures && t_samples < 12) {
                 if (const auto* t = g_srv.slot[j].tex.load(std::memory_order_relaxed)) {
@@ -194,6 +237,8 @@ template <int I>
 void STDMETHODCALLTYPE hk_set(ID3D11DeviceContext* self, UINT start, UINT n, ID3D11ShaderResourceView* const* v) {
     if (config().mip_prediction)
         mark<true>(self, start, n, v);
+    else if (!config().mip_residency)
+        mark<false, true>(self, start, n, v);
     else
         mark<false>(self, start, n, v);
     using F = decltype(&hk_set<I>);
@@ -296,6 +341,8 @@ void workset_on_srv(ID3D11Resource* res, ID3D11ShaderResourceView* view) {
         }
         if (j >= 0 && attach(g_srv, j, view)) {
             ts->views.fetch_add(1, std::memory_order_relaxed);
+            if (!config().mip_prediction && !config().mip_residency)
+                g_view_revision.fetch_add(1, std::memory_order_release);
         } else {
             g_untracked.fetch_add(1, std::memory_order_relaxed);
             pin = managed;
