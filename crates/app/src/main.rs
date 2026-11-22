@@ -391,7 +391,7 @@ fn shader_state(
                 ("Available", source, OK)
             }
             Some((_, false)) => ("Unavailable", "The configured key file is unreadable or invalid.", WARN),
-            None => ("No key file", "Link a key file if the game's Unreal PAKs are encrypted.", NEUTRAL),
+            None => ("Not found", "Encrypted Unreal PAKs need a game key for full shader discovery.", NEUTRAL),
         };
         rows.push(line("Unreal PAK key", value.to_string(), vec![detail.to_string()], tone));
     }
@@ -963,26 +963,6 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_warm_shaders(move |i| warm_action(&w.unwrap(), &s, i));
-    }
-    {
-        let (w, s) = (ui.as_weak(), state.clone());
-        ui.on_choose_pak_key(move |i| {
-            let Some(ui) = w.upgrade() else { return };
-            let exe = {
-                let st = s.lock().unwrap();
-                st.view.get(i as usize).and_then(|&gi| st.games[gi].exe.clone())
-            };
-            let Some(exe) = exe else { return };
-            let Some(path) = rfd::FileDialog::new().set_title("Select an Unreal PAK key file").pick_file() else { return };
-            let msg = match tessera_core::scan::set_unreal_key_file(&exe, &path) {
-                Ok(()) => {
-                    load_session(&ui, &mut s.lock().unwrap(), i, true);
-                    "PAK key file linked. Prepare shaders will use it on the next scan.".into()
-                }
-                Err(e) => format!("Could not link the PAK key file: {e}"),
-            };
-            ui.set_status_text(msg.into());
-        });
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());

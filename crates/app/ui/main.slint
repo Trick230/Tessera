@@ -628,7 +628,6 @@ component Detail inherits Rectangle {
     callback settings-changed(bool, bool, bool, bool, bool, int, int);
     callback advanced-changed(string, int);
     callback prepare-quality();
-    callback choose-pak-key();
 
     VerticalLayout {
         // The game and what Tessera knows about it at a glance, over its
@@ -779,14 +778,6 @@ component Detail inherits Rectangle {
                 // Shaders: compiled, covered, damaged, out of date.
                 if root.tab == 3: VerticalLayout {
                     spacing: 20px;
-                    if root.game.engine == "Unreal": HorizontalLayout {
-                        alignment: start;
-                        Btn {
-                            text: "Choose PAK key file";
-                            enabled: !root.busy;
-                            clicked => { root.choose-pak-key(); }
-                        }
-                    }
                     if !root.shaders.present: Text { text: "Checking the stored shaders…"; color: Theme.dim; font-size: 14px; }
                     for r in root.shaders.rows: ShaderLine { check: r; }
                 }
@@ -1019,7 +1010,6 @@ export component MainWindow inherits Window {
     callback select(int);
     callback reset-safe-mode(int);
     callback warm-shaders(int);
-    callback choose-pak-key(int);
     callback add-folder();
     callback filter-changed(string);
     callback install(int);
@@ -1131,7 +1121,6 @@ export component MainWindow inherits Window {
                 settings-changed(p, r, fl, rc, u, f, v) => { root.settings-changed(root.selected, p, r, fl, rc, u, f, v); }
                 advanced-changed(key, value) => { root.advanced-changed(root.selected, key, value); }
                 prepare-quality => { root.prepare-quality(root.selected); }
-                choose-pak-key => { root.choose-pak-key(root.selected); }
             }
             if !root.has-sel: VerticalLayout {
                 horizontal-stretch: 1;

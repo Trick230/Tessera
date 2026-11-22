@@ -565,17 +565,6 @@ pub fn unreal_key_status(exe: &Path) -> Option<(PakKeySource, bool)> {
     Some((source, PakKey::from_file(&path).is_some()))
 }
 
-/// Store a reference to the user-selected key file, leaving its contents in place.
-pub fn set_unreal_key_file(exe: &Path, path: &Path) -> io::Result<()> {
-    let path = std::path::absolute(path)?;
-    if PakKey::from_file(&path).is_none() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected a 256-bit hexadecimal PAK key"));
-    }
-    let reference = unreal_key_reference(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
-    fs::create_dir_all(reference.parent().ok_or_else(|| io::Error::other("missing data directory"))?)?;
-    fs::write(reference, path.to_str().ok_or_else(|| io::Error::other("unsupported key file path"))?)
-}
-
 fn key_path(base: &Path) -> PathBuf {
     let mut s = base.as_os_str().to_owned();
     s.push(".key");
