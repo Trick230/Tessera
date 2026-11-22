@@ -80,6 +80,17 @@ if (!$material -or $material.Offset -ne 33 * 65536 -or $material.Size -ne 65536 
     throw "Missing material prefetch and later demand for the same file range"
 }
 "PASS opt-in stream range and timing diagnostics"
+$history = @(Get-ChildItem -LiteralPath "$env:TESSERA_DATA_DIR\streams" -Filter "*.tiop")
+if ($history.Count -ne 1) { throw "Later demand did not save a prefetch priority" }
+$env:TESSERA_SMOKE_PREDICT = "3"
+& $exe --stream | Write-Host
+if ($LASTEXITCODE -or -not (Test-Log "1 material ranges prioritized from previous reads") -or
+    -not (Test-Log "skipped 1 recently demanded material ranges") -or (Test-Log "from a material match")) {
+    throw "Replay ignored its learned priority or warmed a recently demanded range"
+}
+"PASS replay priorities and recently read ranges"
+
+$env:TESSERA_SMOKE_PREDICT = "2"
 (Get-Item -LiteralPath $env:TESSERA_SMOKE_ASSET).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-1)
 & $exe --stream | Write-Host
 if ($LASTEXITCODE -or -not (Test-Log "0 KB from the startup list") -or (Test-Log "from a material match")) {

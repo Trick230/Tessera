@@ -666,6 +666,7 @@ int stream() {
                ReadFile(file, pixels.data(), bytes, &count, nullptr) && count == bytes && pixels[0] == 0x53;
     };
     const bool learning = mode[0] == L'1';
+    if (mode[0] == L'3' && !read_asset(33, 65536)) return fail("stream demand before material prefetch");
     if (learning) {
         // Fill the old trace before the first material bind without a large fixture.
         for (unsigned i = 0; i < 4096; ++i)
@@ -700,7 +701,10 @@ int stream() {
     }
     if (!read_asset(learning ? 33 : 1, 65536)) return fail("stream asset read");
     Sleep(650);  // the learning and prefetch workers run asynchronously
-    if (mode[0] == L'2' && !read_asset(33, 65536)) return fail("stream demand after material prefetch");
+    if (mode[0] == L'2') {
+        if (!read_asset(33, 65536)) return fail("stream demand after material prefetch");
+        Sleep(400);  // let replay record the later demand before closing the process
+    }
     CloseHandle(file);
     ctx->Release();
     sc->Release();

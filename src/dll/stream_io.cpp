@@ -21,6 +21,9 @@ constexpr unsigned kUntaggedWithPrediction = kReads / 2;
 constexpr unsigned kRecentStart = kReads / 2;
 constexpr DWORD kMinRead = 4096, kMaxRead = 2u << 20;
 constexpr DWORD kPrefixBytes = 8u << 20, kSessionBytes = 64u << 20;
+constexpr DWORD kInitialMaterialBudget = 16u << 20;
+constexpr DWORD kMaterialBytesPerSecond = 256u << 10;
+constexpr ULONGLONG kDemandWindowMs = 5000;
 constexpr uint32_t kMagic = 0x314f4954;  // TIO1
 
 struct File {
@@ -51,11 +54,20 @@ struct OpenFile {
 };
 OpenFile g_handles[kHandles];
 uint64_t g_file_keys[kFiles];
+struct Demand {
+    uint64_t begin, end;
+    ULONGLONG tick;
+};
+struct RecentDemands {
+    Demand items[128];
+    unsigned next;
+};
+RecentDemands g_recent_demands[kFiles];
 SRWLOCK g_lock = SRWLOCK_INIT;
 std::atomic<bool> g_learning{false};
 std::atomic<bool> g_track_reads{false};
 std::atomic<uint64_t> g_material{0};
-wchar_t g_root[MAX_PATH], g_path[MAX_PATH];
+wchar_t g_root[MAX_PATH], g_path[MAX_PATH], g_history_path[MAX_PATH];
 size_t g_root_length = 0;
 uint64_t g_exe_size = 0, g_exe_modified = 0;
 
@@ -122,6 +134,33 @@ unsigned tracked(HANDLE h) {
     return s.handle.load(std::memory_order_acquire) == h ? file : kFiles;
 }
 
+void remember_demand(unsigned file, uint64_t start, DWORD bytes, ULONGLONG tick) {
+    if (!TryAcquireSRWLockExclusive(&g_lock)) return;
+    auto& recent = g_recent_demands[file];
+    recent.items[recent.next] = {start, start + bytes, tick};
+    recent.next = (recent.next + 1) % _countof(recent.items);
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
+// Runs on the low-priority worker. Tracked reads publish their ranges without blocking.
+bool observed_demand(uint64_t file_key, uint64_t start, DWORD bytes, ULONGLONG since, bool full_range) {
+    bool found = false;
+    AcquireSRWLockShared(&g_lock);
+    for (unsigned file = 0; file < g_trace.files && !found; ++file) {
+        if (g_file_keys[file] != file_key) continue;
+        for (const Demand& d : g_recent_demands[file].items) {
+            if (d.tick <= since) continue;
+            const uint64_t end = std::min(d.end, start + bytes);
+            const uint64_t begin = std::max(d.begin, start);
+            const DWORD minimum = full_range ? bytes : (bytes + 1) / 2;
+            found = end > begin && end - begin >= minimum;
+            if (found) break;
+        }
+    }
+    ReleaseSRWLockShared(&g_lock);
+    return found;
+}
+
 void record_io(TesseraStreamIoKind kind, uint64_t key, uint64_t offset, DWORD count, LARGE_INTEGER time) {
     TesseraRecord r = {};
     r.qpc = static_cast<uint64_t>(time.QuadPart);
@@ -186,6 +225,8 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVER
     else if (valid)
         valid = SetFilePointerEx(h, {}, &offset, FILE_CURRENT) != 0;
     const bool observe = valid && config().stream_io_diagnostics;
+    const bool replay = valid && config().stream_io == 2 && config().mip_prediction;
+    const auto tick = replay ? GetTickCount64() : 0;
     LARGE_INTEGER time = {};
     if (observe) QueryPerformanceCounter(&time);
     SetLastError(before);
@@ -196,6 +237,7 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVER
         if (count >= kMinRead) {
             const auto start = static_cast<uint64_t>(offset.QuadPart);
             if (g_learning.load(std::memory_order_acquire)) record(file, start, count);
+            if (replay) remember_demand(file, start, count, tick);
             if (observe) record_io(TESSERA_STREAM_DEMAND, g_file_keys[file], start, count, time);
         }
     }
@@ -212,41 +254,55 @@ BOOL WINAPI close_file(HANDLE h) {
     return CloseHandle(h);
 }
 
-DWORD warm_range(const Trace& trace, const Range& r, DWORD limit, TesseraStreamIoKind kind) {
-    if (r.file >= trace.files || r.bytes < kMinRead || r.bytes > kMaxRead) return 0;
+struct WarmedRange {
+    DWORD bytes;
+    uint64_t file_key;
+    bool recent;
+};
+
+WarmedRange warm_range(const Trace& trace, const Range& r, DWORD limit, TesseraStreamIoKind kind) {
+    if (r.file >= trace.files || r.bytes < kMinRead || r.bytes > kMaxRead) return {};
     const File& known = trace.file[r.file];
     const wchar_t* end = static_cast<const wchar_t*>(wmemchr(known.path, 0, MAX_PATH));
     if (!end || !in_root(known.path, end - known.path) || r.offset >= known.size ||
         r.bytes > known.size - r.offset)
-        return 0;
+        return {};
     // Reject lexical escapes before opening, then validate the resolved file
     // and its version before causing any data reads.
     if (wcsstr(known.path + g_root_length, L"\\..\\") || wcsncmp(known.path + g_root_length, L"..\\", 3) == 0 ||
         wcschr(known.path + g_root_length, L'/'))
-        return 0;
+        return {};
     HANDLE h = CreateFileW(known.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (h == INVALID_HANDLE_VALUE) return {};
     File actual = {};
-    DWORD warmed = 0;
+    WarmedRange result = {};
+    const DWORD count = std::min(r.bytes, limit);
     uint64_t key;
     if (describe(h, actual, key) && actual.size == known.size && actual.modified == known.modified &&
         CompareStringOrdinal(actual.path, -1, known.path, -1, TRUE) == CSTR_EQUAL) {
+        if (kind == TESSERA_STREAM_MATERIAL_PREFETCH) {
+            const auto now = GetTickCount64();
+            if (observed_demand(key, r.offset, count, now - std::min(now, kDemandWindowMs), true)) {
+                CloseHandle(h);
+                return {0, key, true};
+            }
+        }
         SYSTEM_INFO sys = {};
         GetSystemInfo(&sys);
         const uint64_t base = r.offset / sys.dwAllocationGranularity * sys.dwAllocationGranularity;
-        const SIZE_T length = static_cast<SIZE_T>(r.offset - base + std::min(r.bytes, limit));
+        const SIZE_T length = static_cast<SIZE_T>(r.offset - base + count);
         HANDLE map = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
         if (map) {
             if (void* view = MapViewOfFile(map, FILE_MAP_READ, static_cast<DWORD>(base >> 32),
                                           static_cast<DWORD>(base), length)) {
-                WIN32_MEMORY_RANGE_ENTRY range = {static_cast<BYTE*>(view) + (r.offset - base), std::min(r.bytes, limit)};
+                WIN32_MEMORY_RANGE_ENTRY range = {static_cast<BYTE*>(view) + (r.offset - base), count};
                 if (PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
-                    warmed = static_cast<DWORD>(range.NumberOfBytes);
+                    result = {count, key, false};
                     if (config().stream_io_diagnostics) {
                         LARGE_INTEGER time;
                         QueryPerformanceCounter(&time);
-                        record_io(kind, key, r.offset, warmed, time);
+                        record_io(kind, key, r.offset, count, time);
                     }
                 }
                 UnmapViewOfFile(view);
@@ -255,13 +311,54 @@ DWORD warm_range(const Trace& trace, const Range& r, DWORD limit, TesseraStreamI
         }
     }
     CloseHandle(h);
-    return warmed;
+    return result;
 }
 
 bool has_room() {
     MEMORYSTATUSEX ms = {sizeof ms};
     return GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys > std::max(1ull << 30, ms.ullTotalPhys / 8);
 }
+
+struct ReplayHistory {
+    uint64_t trace_hash;
+    uint8_t useful[kReads];
+};
+
+ReplayHistory load_replay_history(const Trace& trace) {
+    uint64_t hash = 14695981039346656037ull;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&trace);
+    for (size_t i = 0; i < sizeof trace; ++i) hash = (hash ^ bytes[i]) * 1099511628211ull;
+    ReplayHistory history = {};
+    HANDLE file = CreateFileW(g_history_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD read = 0;
+        const BOOL ok = ReadFile(file, &history, sizeof history, &read, nullptr);
+        CloseHandle(file);
+        if (ok && read == sizeof history && history.trace_hash == hash) return history;
+    }
+    history = {};
+    history.trace_hash = hash;
+    return history;
+}
+
+bool save_replay_history(const ReplayHistory& history) {
+    wchar_t temp[MAX_PATH];
+    if (_snwprintf_s(temp, _TRUNCATE, L"%ls.%lu.tmp", g_history_path, GetCurrentProcessId()) < 0) return false;
+    HANDLE file = CreateFileW(temp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const BOOL ok = WriteFile(file, &history, sizeof history, &written, nullptr);
+    CloseHandle(file);
+    return ok && written == sizeof history && MoveFileExW(temp, g_history_path, MOVEFILE_REPLACE_EXISTING);
+}
+
+struct PendingPrefetch {
+    uint64_t file_key;
+    ULONGLONG issued;
+    unsigned index;
+    DWORD bytes;
+};
 
 void prefetch(const Trace& trace) {
     if (trace.magic != kMagic || trace.files > kFiles || trace.ranges > kReads ||
@@ -274,7 +371,7 @@ void prefetch(const Trace& trace) {
         issued[i] = true;
         const DWORD cap = kPrefixBytes - used;
         used += std::min(r.bytes, cap);
-        prefix += warm_range(trace, r, cap, TESSERA_STREAM_STARTUP_PREFETCH);
+        prefix += warm_range(trace, r, cap, TESSERA_STREAM_STARTUP_PREFETCH).bytes;
     }
     logf("stream I/O: prefetched %lu KB from the startup list", prefix >> 10);
     if (!config().mip_prediction || used >= kSessionBytes) return;
@@ -282,30 +379,69 @@ void prefetch(const Trace& trace) {
     for (unsigned i = 0; i < trace.ranges; ++i)
         if (!issued[i] && trace.range[i].material) ++remaining;
     logf("stream I/O: %u material ranges available after startup", remaining);
+    auto history = load_replay_history(trace);
+    const auto known = std::count_if(history.useful, history.useful + trace.ranges, [](uint8_t useful) { return useful != 0; });
+    if (known) logf("stream I/O: %u material ranges prioritized from previous reads", static_cast<unsigned>(known));
+    PendingPrefetch pending[128];
+    unsigned pending_count = 0;
+    bool dirty = false;
+    ULONGLONG last_save = 0;
+    const auto start = GetTickCount64();
     uint64_t last = 0;
-    while (remaining && used < kSessionBytes) {
+    while ((remaining && used < kSessionBytes) || pending_count) {
         Sleep(250);
+        const auto now = GetTickCount64();
+        unsigned unsettled = 0;
+        for (unsigned i = 0; i < pending_count; ++i) {
+            const auto& p = pending[i];
+            if (now - p.issued >= kDemandWindowMs) continue;
+            if (observed_demand(p.file_key, trace.range[p.index].offset, p.bytes, p.issued, false)) {
+                history.useful[p.index] = 1;
+                dirty = true;
+            } else {
+                pending[unsettled++] = p;
+            }
+        }
+        pending_count = unsettled;
+        if (dirty && (!last_save || now - last_save >= kDemandWindowMs)) {
+            dirty = !save_replay_history(history);
+            last_save = now;
+        }
+
+        // Reserve most of the material budget while the first area loads.
+        // Refill gradually so spending load time in menus cannot consume it in one burst.
+        const auto allowed = static_cast<DWORD>(std::min<uint64_t>(
+            kSessionBytes, kPrefixBytes + kInitialMaterialBudget + (now - start) / 1000 * kMaterialBytesPerSecond));
+        if (used + kMinRead > allowed) continue;
         const uint64_t current = g_material.load(std::memory_order_relaxed);
         if (!current || current == last || !has_room()) continue;
         last = current;
         DWORD batch = 0;
         DWORD warmed = 0;
-        unsigned warmed_ranges = 0;
-        for (unsigned i = 0; i < trace.ranges && batch < kMaxRead && used < kSessionBytes; ++i) {
-            if (issued[i] || trace.range[i].material != current) continue;
-            const DWORD cap = std::min(kMaxRead - batch, kSessionBytes - used);
-            const DWORD wanted = std::min(trace.range[i].bytes, cap);
-            issued[i] = true;
-            --remaining;
-            batch += wanted;
-            used += wanted;
-            const DWORD loaded = warm_range(trace, trace.range[i], cap, TESSERA_STREAM_MATERIAL_PREFETCH);
-            warmed += loaded;
-            warmed_ranges += loaded != 0;
+        unsigned warmed_ranges = 0, recent_ranges = 0;
+        for (bool preferred : {true, false}) {
+            for (unsigned i = 0; i < trace.ranges && batch + kMinRead <= kMaxRead && used + kMinRead <= allowed; ++i) {
+                if (issued[i] || trace.range[i].material != current || (history.useful[i] != 0) != preferred) continue;
+                const DWORD cap = std::min(kMaxRead - batch, allowed - used);
+                const DWORD wanted = std::min(trace.range[i].bytes, cap);
+                issued[i] = true;
+                --remaining;
+                batch += wanted;
+                const auto loaded = warm_range(trace, trace.range[i], cap, TESSERA_STREAM_MATERIAL_PREFETCH);
+                used += loaded.bytes;
+                warmed += loaded.bytes;
+                warmed_ranges += loaded.bytes != 0;
+                recent_ranges += loaded.recent;
+                if (loaded.bytes && !preferred && pending_count < _countof(pending))
+                    pending[pending_count++] = {loaded.file_key, GetTickCount64(), i, loaded.bytes};
+            }
         }
         if (warmed)
             logf("stream I/O: prefetched %lu KB from a material match (%u ranges)", warmed >> 10, warmed_ranges);
+        if (recent_ranges)
+            logf("stream I/O: skipped %u recently demanded material ranges", recent_ranges);
     }
+    if (dirty) save_replay_history(history);
 }
 
 DWORD WINAPI prefetch_thread(void*) {
@@ -381,6 +517,8 @@ void stream_start(const wchar_t* exe) {
     if (!GetFileAttributesExW(exe, GetFileExInfoStandard, &attr) ||
         !session_data_path(L"streams", L"tiot", g_path))
         return;
+    const bool replay = mode == 2 && config().mip_prediction;
+    if (replay && !session_data_path(L"streams", L"tiop", g_history_path)) return;
     g_exe_size = wide(attr.nFileSizeHigh, attr.nFileSizeLow);
     g_exe_modified = wide(attr.ftLastWriteTime.dwHighDateTime, attr.ftLastWriteTime.dwLowDateTime);
     if (mode == 1) {
@@ -390,7 +528,7 @@ void stream_start(const wchar_t* exe) {
         g_trace.exe_modified = g_exe_modified;
         g_learning.store(true, std::memory_order_release);
     }
-    if (mode == 1 || config().stream_io_diagnostics) {
+    if (mode == 1 || replay || config().stream_io_diagnostics) {
         g_track_reads.store(true, std::memory_order_release);
         activate_stream_imports();
     }
