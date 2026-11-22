@@ -166,9 +166,9 @@ is "all shaders + the right root signature", not an explosion of combinations.
 
 ### Pacing and system (P) — all at process level only
 
-- **P1 Precise limiter** — high-resolution timer + final busy-wait. Rule: the lowest limiter
-  wins; Tessera sits slightly below the lowest limit found (RTSS, NVIDIA control panel), unless the
-  user deliberately set a lower limit in another tool.
+- **P1 Precise limiter** — high-resolution timer + final busy-wait next to `Present`. After a late
+  frame, the next interval starts from its actual release time. RTSS or NVIDIA takes precedence
+  when the cap detected during preparation is equal to or below Tessera's.
 - **P2 Flip model + tearing** for D3D11 in borderless windows: convert blit swapchains (`DISCARD` →
   `FLIP_DISCARD`, `SEQUENTIAL` → `FLIP_SEQUENTIAL`, at least 2 buffers) and, with VRR, `ALLOW_TEARING` at
   `SyncInterval 0`. Windowed only, game swapchains only (C3). Exclude: MSAA back buffers,
@@ -178,7 +178,8 @@ is "all shaders + the right root signature", not an explosion of combinations.
 - **P3 Frame latency** — `SetMaximumFrameLatency`, waitable object.
 - **P4 CPU sets** — the thread that calls `Present` on P-cores (hybrid CPUs).
 - **P5 Process** — timer resolution, EcoQoS off (`SetProcessInformation`), moderate priority.
-- **P6 Back-off** — with Reflex or frame generation, the limiter turns off (the rest keeps going).
+- **P6 Back-off** — the D3D11 limiter yields to confirmed Reflex or NVAPI pacing on the presenting
+  device and resumes when it is disabled. It also yields while the Smooth Motion runtime is loaded.
 
 ### Diagnostics (D)
 

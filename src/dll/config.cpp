@@ -71,6 +71,8 @@ void config_log() {
          c.process, c.priority, c.residency, c.fps_limit, c.ext_fps_limit, c.max_frame_latency, c.vram_budget_mb,
          c.flip_model, c.workset, c.mip_residency, c.mip_ram_mb, c.mip_force_evict, c.rt_recycle, c.ue_cvars,
          c.present_cpu_sets, c.texture_dedup, c.stream_io, c.mip_prediction, c.mip_streaming, c.mip_feedback, c.texture_quality);
+    if (c.fps_limit > 0 && c.ext_fps_limit > 0 && c.ext_fps_limit <= c.fps_limit)
+        logf("limiter: yielding to the configured external cap");
 }
 
 const Config& config() { return g_config; }

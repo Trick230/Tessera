@@ -410,12 +410,12 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     Depth depth;
     FlipFrame ff;
     bool managed = false;
+    const bool frame = depth.outer() && !(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE));
     if (depth.outer()) {
-        if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
+        if (frame) {
             g_present_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
             managed = residency_present(self);
             if (config().mip_feedback) feedback_present(self);
-            session_frame(pace_before_present(self));
             rtpool_frame(self);
             uecvars_frame();
         }
@@ -423,6 +423,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
         if (ff.skip) return S_OK;
     }
     using F = decltype(&hk_Present);
+    if (frame) session_frame(pace_before_present(self));
     const HRESULT hr = orig<F>(g_present, self)(self, sync, flags);
     flip_after_present(ff);
     if (managed) residency_after_present();
@@ -436,12 +437,12 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
     Depth depth;
     FlipFrame ff;
     bool managed = false;
+    const bool frame = depth.outer() && !(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE));
     if (depth.outer()) {
-        if (!(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE))) {
+        if (frame) {
             g_present_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
             managed = residency_present(self);
             if (config().mip_feedback) feedback_present(self);
-            session_frame(pace_before_present(self));
             rtpool_frame(self);
             uecvars_frame();
         }
@@ -449,6 +450,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
         if (ff.skip) return S_OK;
     }
     using F = decltype(&hk_Present1);
+    if (frame) session_frame(pace_before_present(self));
     const HRESULT hr = orig<F>(g_present1, self)(self, sync, flags, params);
     flip_after_present(ff);
     if (managed) residency_after_present();

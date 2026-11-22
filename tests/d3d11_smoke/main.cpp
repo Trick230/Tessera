@@ -3,6 +3,7 @@
 //   d3d11_smoke            render through both creation paths, then exit cleanly
 //   d3d11_smoke --crash    create a device and die without DLL detach
 //   d3d11_smoke --tiled    mip residency (M3-M5), with mip_residency=1 and mip_force_evict=1
+//   d3d11_smoke --pacing [driver]   measure recovery after a late frame or verify driver handoff
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
 #include <d3d11_2.h>
@@ -457,6 +458,114 @@ int verify(const wchar_t* dir, int fps) {
                 alive, untracked, tiled);
     if (workset < 1 || used_kb != 1365 || alive != 10 || untracked != 0) return fail("working set");
     std::printf("OK: session verified\n");
+    return 0;
+}
+int pacing_driver(ID3D11Device* dev, IDXGISwapChain* sc, int64_t freq) {
+    using QueryInterface = void*(__cdecl*)(unsigned);
+    using SleepMode = int(__cdecl*)(IUnknown*, const void*);
+    const HMODULE probe = LoadLibraryW(L"load_probe.dll");
+    const auto qi = probe ? reinterpret_cast<QueryInterface>(GetProcAddress(probe, "nvapi_QueryInterface")) : nullptr;
+    const auto set_mode = qi ? reinterpret_cast<SleepMode>(qi(0xAC1CA9E0)) : nullptr;
+    if (!set_mode) return fail("could not resolve the probe's sleep mode");
+    if (!LoadLibraryW(L"sl.reflex.dll")) return fail("load the idle Reflex SDK fixture");
+    struct {
+        uint32_t version = 0x1002C;
+        bool low_latency = false, boost = false;
+        uint32_t interval = 0;
+        bool reject = false;
+        uint8_t padding[31] = {};
+    } params;
+    static_assert(sizeof params == 44);
+    const auto measure = [&](bool expect_cap) {
+        sc->Present(0, 0);
+        LARGE_INTEGER start, stop;
+        QueryPerformanceCounter(&start);
+        for (int i = 0; i < 10; ++i) sc->Present(0, 0);
+        QueryPerformanceCounter(&stop);
+        const double average_ms = (stop.QuadPart - start.QuadPart) * 100.0 / freq;
+        std::printf("NVAPI probe: %s, %.2f ms/frame\n", expect_cap ? "Tessera cap" : "delegated", average_ms);
+        return expect_cap ? average_ms >= 15.0 : average_ms < 10.0;
+    };
+
+    Sleep(2100);  // Let the background poll see the loaded, inactive SDK.
+    if (!measure(true)) return fail("idle Reflex SDK must leave Tessera's cap active");
+    ID3D11Device* other = nullptr;
+    const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                         D3D11_SDK_VERSION, &other, nullptr, nullptr);
+    if (FAILED(hr)) return fail("create secondary pacing device", hr);
+    params.low_latency = true;
+    const int secondary_status = set_mode(other, &params);
+    other->Release();
+    if (secondary_status != 0 || !measure(true)) return fail("NVAPI mode on a secondary device must leave the cap active");
+    if (set_mode(dev, &params) != 0 || !measure(false)) return fail("handoff with Reflex enabled");
+    params.low_latency = false;
+    params.reject = true;
+    if (set_mode(dev, &params) == 0 || !measure(false)) return fail("failed NVAPI change must leave the cap delegated");
+    params.reject = false;
+    if (set_mode(dev, &params) != 0 || !measure(true)) return fail("cap resumes after Reflex is disabled");
+    params.interval = 20000;
+    if (set_mode(dev, &params) != 0 || !measure(false)) return fail("handoff to an explicit NVAPI cap");
+    params.interval = 0;
+    if (set_mode(dev, &params) != 0 || !measure(true)) return fail("cap resumes after NVAPI cap is disabled");
+    return 0;
+}
+
+int pacing_mode(bool driver) {
+    const HWND wnd = make_window();
+    if (!wnd) return fail("make pacing window");
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    desc.BufferDesc = {64, 64, {0, 1}, DXGI_FORMAT_R8G8B8A8_UNORM};
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 1;
+    desc.OutputWindow = wnd;
+    desc.Windowed = TRUE;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    IDXGISwapChain* sc = nullptr;
+    ID3D11Device* dev = nullptr;
+    const HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                                     D3D11_SDK_VERSION, &desc, &sc, &dev, nullptr, nullptr);
+    if (FAILED(hr)) return fail("create pacing swap chain", hr);
+
+    LARGE_INTEGER freq, last, now;
+    QueryPerformanceFrequency(&freq);
+    if (driver) {
+        const int result = pacing_driver(dev, sc, freq.QuadPart);
+        sc->Release();
+        dev->Release();
+        DestroyWindow(wnd);
+        return result;
+    }
+    // At a 60 FPS cap, inject an arrival about 3 ms overdue every tenth frame.
+    // Sample CPU-side Present returns; this does not measure display latency.
+    constexpr int frames = 160;
+    constexpr int delay_every = 10;
+    std::vector<double> gaps, recovery;
+    gaps.reserve(frames);
+    recovery.reserve(frames / delay_every);
+    if (FAILED(sc->Present(0, 0))) return fail("initial pacing present");
+    QueryPerformanceCounter(&last);
+    for (int i = 1; i <= frames; ++i) {
+        if (i % delay_every == 1) {
+            const int64_t end = last.QuadPart + freq.QuadPart / 60 + freq.QuadPart * 3 / 1000;
+            do { QueryPerformanceCounter(&now); } while (now.QuadPart < end);
+        }
+        const HRESULT presented = sc->Present(0, 0);
+        if (FAILED(presented)) return fail("pacing present", presented);
+        QueryPerformanceCounter(&now);
+        const double gap = 1000.0 * (now.QuadPart - last.QuadPart) / freq.QuadPart;
+        gaps.push_back(gap);
+        if (i % delay_every == 2) recovery.push_back(gap);
+        last = now;
+    }
+    std::sort(gaps.begin(), gaps.end());
+    std::sort(recovery.begin(), recovery.end());
+    const auto short_recovery = std::count_if(recovery.begin(), recovery.end(), [](double gap) { return gap < 15.5; });
+    std::printf("pacing: median=%.3f ms, recovery median=%.3f ms, recovery <15.5 ms=%td/%zu\n",
+                gaps[gaps.size() / 2], recovery[recovery.size() / 2], short_recovery, recovery.size());
+    sc->Release();
+    dev->Release();
+    DestroyWindow(wnd);
     return 0;
 }
 }  // namespace
@@ -1227,6 +1336,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--recycle") == 0) return recycle_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--tiled") == 0) return tiled();
     if (argc >= 2 && wcscmp(argv[1], L"--nvapi") == 0) return nvapi_mode();
+    if (argc >= 2 && wcscmp(argv[1], L"--pacing") == 0) return pacing_mode(argc >= 3 && wcscmp(argv[2], L"driver") == 0);
     if (argc >= 3 && wcscmp(argv[1], L"--verify") == 0) return verify(argv[2], argc >= 4 ? _wtoi(argv[3]) : 0);
     return run(argc >= 2 && wcscmp(argv[1], L"--crash") == 0);
 }

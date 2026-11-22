@@ -132,8 +132,8 @@ fn set_keys(dir: &Path, keys: &[(&str, Option<&str>)]) -> io::Result<()> {
 }
 
 /// P1: records the lowest frame limit another tool (RTSS, NVIDIA control
-/// panel) applies to this game as `ext_fps_limit`, so the layer runs just
-/// under it. Rewrites tessera.ini only when the value changed.
+/// panel) applies to this game as `ext_fps_limit`. It takes precedence over
+/// an equal or higher Tessera cap. Rewrites tessera.ini only on a change.
 pub fn note_external_limit(dir: &Path, exe_name: &str) -> io::Result<Option<crate::limits::ExternalLimit>> {
     let found = crate::limits::external_fps_limit(exe_name);
     let _g = INI_LOCK.lock().unwrap_or_else(|e| e.into_inner());

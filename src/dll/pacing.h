@@ -7,17 +7,16 @@
 namespace tessera {
 // P1: called by the outermost Present hook before the real Present. Waits
 // until the next frame deadline when fps_limit is set, the swap chain is the
-// primary one and no Reflex / frame generation is present (P6). Returns the
-// time waited in microseconds. No allocation; the timer is created once.
+// primary one and neither an external cap nor driver pacing takes precedence.
+// Returns the time waited in microseconds. The timer is created once per thread.
 uint32_t pace_before_present(IDXGISwapChain* sc);
 
 // P6: polled from the session writer thread (never the frame path): looks
-// for modules that own pacing themselves and makes the limiter back off.
+// for the NVIDIA Smooth Motion runtime.
 void pacing_background_tick();
 
-// P6: the game turned on pacing of its own (Reflex through NVAPI): the
-// limiter stops for the rest of the session. Any thread; logs once.
-void pacing_backoff(const char* why);
+// P6: track a successful NVAPI pacing change for the corresponding device.
+void pacing_set_driver_mode(IUnknown* device, bool active);
 // P3: applies max_frame_latency to a new swap chain's device, unless the
 // game manages latency itself with a waitable swap chain.
 void pacing_on_swapchain(IDXGISwapChain* sc);

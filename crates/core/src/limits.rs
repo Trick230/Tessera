@@ -1,6 +1,5 @@
-//! P1: frame limits set in other tools. Tessera's limiter runs just under the
-//! lowest one (src/dll/pacing.cpp), so two limiters never fight and a lower
-//! limit the user chose elsewhere stands. Read-only.
+//! P1: read the caps in other tools. An equal or lower external cap takes
+//! precedence over Tessera's own cap (src/dll/pacing.cpp).
 
 use std::path::{Path, PathBuf};
 
@@ -56,7 +55,8 @@ fn rtss_limit(dir: &Path, exe_name: &str) -> Option<u32> {
     rtss_profile_limit(&String::from_utf8_lossy(&bytes))
 }
 
-/// `[Framerate] Limit` (fps, 0 = off) over `LimitDenominator`, rounded down.
+/// Round the configured RTSS cap up for comparison against Tessera's integer
+/// cap: 59.94 is below 60 but above 59.
 pub fn rtss_profile_limit(text: &str) -> Option<u32> {
     let (mut limit, mut den, mut in_section) = (0u32, 1u32, false);
     for line in text.lines().map(str::trim) {
@@ -75,7 +75,7 @@ pub fn rtss_profile_limit(text: &str) -> Option<u32> {
             _ => {}
         }
     }
-    let fps = limit / den;
+    let fps = limit.div_ceil(den);
     (fps > 0).then_some(fps)
 }
 
@@ -87,8 +87,8 @@ mod tests {
     fn reads_the_rtss_framerate_limit() {
         let p = "[OSD]\nLimit=99\n[Framerate]\nLimit=60\nLimitDenominator=1\nLimitTime=0\n[Hooking]\n";
         assert_eq!(rtss_profile_limit(p), Some(60));
-        // 59.94 stored as 5994/100: rounded down, still at or below the real limit.
-        assert_eq!(rtss_profile_limit("[Framerate]\nLimit=5994\nLimitDenominator=100\n"), Some(59));
+        assert_eq!(rtss_profile_limit("[Framerate]\nLimit=5994\nLimitDenominator=100\n"), Some(60));
+        assert_eq!(rtss_profile_limit("[Framerate]\nLimit=6001\nLimitDenominator=100\n"), Some(61));
         assert_eq!(rtss_profile_limit("[Framerate]\nLimit=0\nLimitDenominator=1\n"), None);
         assert_eq!(rtss_profile_limit("[OSD]\nLimit=60\n"), None);
     }

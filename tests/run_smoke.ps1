@@ -1,18 +1,54 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Layer smoke test: clean run + session check, then safe mode after two crashes.
-#   powershell -File tests/run_smoke.ps1 [-Config Release]
-param([string]$Config = "Release")
+#   powershell -File tests/run_smoke.ps1 [-Config Release] [-PacingOnly]
+param([string]$Config = "Release", [switch]$PacingOnly)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "build\tests\d3d11_smoke\$Config\d3d11_smoke.exe"
 $layer = Join-Path $root "target\release\examples\layer.exe"
-$data = Join-Path $root "build\smoke-data"
-if (Test-Path $data) { Remove-Item -Recurse -Force $data }
-$env:TESSERA_DATA_DIR = $data
 $fails = 0
 function Check($name, $ok) {
     if ($ok) { "PASS $name" } else { "FAIL $name"; $script:fails++ }
 }
+
+function CheckPacing {
+    $bin = Split-Path $exe
+    $run = Join-Path $root "build\pacing-smoke\$([guid]::NewGuid())"
+    New-Item -ItemType Directory -Path $run -Force | Out-Null
+    Copy-Item -LiteralPath $exe, "$bin\d3d11.dll", "$bin\load_probe.dll" -Destination $run
+    Copy-Item -LiteralPath "$bin\load_probe.dll" -Destination "$run\sl.reflex.dll"
+    $previousDataDir = $env:TESSERA_DATA_DIR
+    $env:TESSERA_DATA_DIR = Join-Path $run "data"
+    try {
+        # A lower or equal external cap delegates; a higher one leaves our 60 FPS cap in charge.
+        foreach ($ext in @(50, 60, 61)) {
+            Set-Content "$run\tessera.ini" -Value "[tessera]`nfps_limit=60`next_fps_limit=$ext" -Encoding ascii
+            $out = & "$run\d3d11_smoke.exe" --pacing
+            $code = $LASTEXITCODE
+            $out | Write-Host
+            $ok = $false
+            if ($code -eq 0 -and "$out" -match 'median=([0-9.]+) ms, recovery median=([0-9.]+) ms') {
+                $median = [double]$Matches[1]
+                $recovery = [double]$Matches[2]
+                $ok = if ($ext -le 60) { $median -lt 10 } else { $median -ge 16 -and $recovery -ge 16 }
+            }
+            Check "60 FPS cap with an external cap of $ext" $ok
+        }
+        Set-Content "$run\tessera.ini" -Value "[tessera]`nfps_limit=60" -Encoding ascii
+        & "$run\d3d11_smoke.exe" --pacing driver | Write-Host
+        Check "idle SDK, secondary device, Reflex and NVAPI cap transitions" ($LASTEXITCODE -eq 0)
+    } finally { $env:TESSERA_DATA_DIR = $previousDataDir }
+}
+
+if ($PacingOnly) {
+    CheckPacing
+    if ($fails) { exit 1 }
+    exit 0
+}
+
+$data = Join-Path $root "build\smoke-data"
+if (Test-Path $data) { Remove-Item -Recurse -Force $data }
+$env:TESSERA_DATA_DIR = $data
 
 # M2 is off by default; the session check expects its priority flags.
 $ini = Join-Path (Split-Path $exe) "tessera.ini"
@@ -38,9 +74,8 @@ $nv = $LASTEXITCODE
 if ($nv -ne 4) { Check "NVAPI wrapped for the exe and a game DLL" ($nv -eq 0) }
 
 # Frame limiter (P1), budget cap (M1), flip model (P2) and frame latency (P3) from tessera.ini next to the layer.
-# ext_fps_limit: another tool limits to 50 below our 60, so ours runs just under 50.
 $ini = Join-Path (Split-Path $exe) "tessera.ini"
-Set-Content -Path $ini -Value "[tessera]`nresidency=1`nfps_limit=60`next_fps_limit=50`nvram_budget_mb=2048`nflip_model=1`nmax_frame_latency=1" -Encoding ascii
+Set-Content -Path $ini -Value "[tessera]`nresidency=1`nfps_limit=60`nvram_budget_mb=2048`nflip_model=1`nmax_frame_latency=1" -Encoding ascii
 $env:TESSERA_SMOKE_CAP_MB = "2048"
 try {
     & $exe | Write-Host
@@ -48,8 +83,8 @@ try {
     # M1 before any device: factories through every route are the layer's; a D3D12 device turns the cap off.
     & $exe --imports | Write-Host
     Check "DXGI factories wrapped, capped before the device, left alone for D3D12" ($LASTEXITCODE -eq 0)
-    & $exe --verify "$data\sessions" 50 | Write-Host
-    Check "limiter holds just under the other tool's 50 fps, budget capped, flip model" ($LASTEXITCODE -eq 0)
+    & $exe --verify "$data\sessions" 60 | Write-Host
+    Check "limiter holds 60 fps, budget capped, flip model" ($LASTEXITCODE -eq 0)
     Check "flip conversion logged" ((Select-String -Path $log -Pattern "converted to flip model" -Quiet))
     Check "frame latency through the waitable object (P3)" ((Select-String -Path $log -Pattern "latency 1 through the waitable object: ok" -Quiet))
     # S6: two shaders stored once each across both runs (header 24 + 2 index entries of 16).
@@ -67,6 +102,8 @@ try {
     Check "app warm-up reads the log" ($LASTEXITCODE -eq 0 -and "$w3" -match "warm log: ok 2 failed 0")
     Check "warm copy has the game's exe name" (@(Get-ChildItem "$data\warm\*\d3d11_smoke.exe").Count -eq 1)
 } finally { Remove-Item $ini; Remove-Item Env:TESSERA_SMOKE_CAP_MB }
+
+CheckPacing
 
 # R1: a released big render target comes back on the next matching create; held ones and initial data never.
 Set-Content -Path $ini -Value "[tessera]`nrt_recycle=1" -Encoding ascii

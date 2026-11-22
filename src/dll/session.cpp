@@ -178,7 +178,7 @@ DWORD WINAPI writer_main(void*) {
             if (config().present_cpu_sets) present_cpu_sets_tick();
             if (config().texture_dedup) dedup_background_tick();
         }
-        if ((tick & 7) == 0) pacing_background_tick();  // every 2 s
+        if ((tick & 7) == 1) pacing_background_tick();  // every 2 s, first after 250 ms
         shaders_background_tick();
         nvapi_background_tick();
         if (config().stream_io == 1) stream_background_tick();

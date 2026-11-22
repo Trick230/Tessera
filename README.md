@@ -18,7 +18,7 @@ Tessera tackles these problems in two steps. A preparation app does the heavy wo
 | **Pop-in** | A removed mip is put back before the draw that needs it, within a fixed per-frame budget. The frame never waits on Tessera. |
 | **Shader / PSO stutters** | Finds the game's shaders and pipeline caches on disk and compiles them ahead of time in a separate process, so the driver cache is warm before the first launch. |
 | **Traversal stutters** | Learns which files and textures load together and prefetches them at low I/O priority. |
-| **Frame pacing** | Precise frame limiter, flip model in borderless windows, frame latency control, and per-process scheduling tweaks. It backs off when Reflex or frame generation is active. |
+| **Frame pacing** | Precise frame limiter, flip model in borderless windows, frame latency control, and per-process scheduling tweaks. The D3D11 limiter yields to active Reflex and the Smooth Motion runtime. |
 | **Diagnosis** | Records frame times and resource creation in every session. The app shows the result: percentiles, stutters, a VRAM estimate and, later, the cause of each stutter. |
 
 Quality is never traded silently. Any lossy step, such as recompressing a texture, is applied only if the [FLIP](https://github.com/NVlabs/flip) image metric confirms the difference is imperceptible.
@@ -60,7 +60,7 @@ Quality is never traded silently. Any lossy step, such as recompressing a textur
 
 - **App:** game discovery from Steam, Epic and folders you add; graphics API, engine and anti-cheat detection; one-click install and uninstall of the layer, chaining to any DLL already there; per-game settings; a session panel with frame time percentiles, stutters per minute, VRAM peak against the budget, and the likely causes.
 - **Layer basics:** proxy DLL that forwards every export; session recording through a lock-free ring buffer (frame times, every texture, buffer and shader created, slow creates); safe mode after two crashes in a row.
-- **Pacing:** precise frame limiter that respects RTSS and NVIDIA limits and backs off for Reflex and frame generation; frame latency control; flip model for borderless windows (off by default); process tweaks (timer resolution, EcoQoS off).
+- **Pacing:** precise frame limiter that yields to lower or equal RTSS and NVIDIA limits, active Reflex or NVAPI pacing, and the Smooth Motion runtime; frame latency control; flip model for borderless windows (off by default); process tweaks (timer resolution, EcoQoS off).
 - **Memory:** VRAM budget reporting and an optional cap, also through NVAPI and before the game creates its device; working-set meter; mip residency with tiled textures and pop-in-free restore (needs tiled resources tier 2, off by default); render target reuse (off by default).
 - **Shaders:** scans the whole install for shader bytecode (including Oodle, zlib, zstd and LZ4 archives) and warms the driver cache in a separate process before you play; records new shaders during play for the next preparation; a coverage meter in the app.
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.

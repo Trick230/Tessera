@@ -8,7 +8,7 @@
 // except the few memory.cpp wants (memory_import_hook), patched the same way
 // in import tables and in GetProcAddress results.
 //   M1: NvAPI_GPU_GetMemoryInfo(Ex) reports at most the budget the game is given.
-//   P6: NvAPI_D3D_SetSleepMode with low latency on = Reflex: the limiter backs off.
+//   P6: observe when NVAPI low latency or a driver sleep interval takes over.
 #include "nvapi.h"
 
 #include <windows.h>
@@ -23,7 +23,6 @@
 #include "memory.h"
 #include "module.h"
 #include "pacing.h"
-#include "session.h"
 #include "stream_io.h"
 
 namespace tessera {
@@ -93,12 +92,18 @@ NvStatus __cdecl hk_get_memory_info_ex(void* gpu, uint64_t* info) {
     return st;
 }
 
-// NV_SET_SLEEP_MODE_PARAMS V1: version, bLowLatencyMode (byte at 4), ...
+// NV_SET_SLEEP_MODE_PARAMS V1: version, low latency and boost (NvBool),
+// padding, minimum interval in microseconds, markers and reserved bytes.
 NvStatus __cdecl hk_set_sleep_mode(IUnknown* dev, const uint8_t* p) {
     const NvStatus st = g_sleep.load(std::memory_order_relaxed)(dev, p);
-    // Reflex needs a device; ours existing means the session is already up.
-    if (st == 0 && p && p[4] && memory_device_seen() && session_init())
-        pacing_backoff("Reflex (NVAPI low latency mode)");
+    if (st != 0 || !p) return st;
+    uint32_t version;
+    std::memcpy(&version, p, sizeof version);
+    if ((version >> 16) == 1 && (version & 0xFFFFu) >= 12) {
+        uint32_t interval;
+        std::memcpy(&interval, p + 8, sizeof interval);
+        pacing_set_driver_mode(dev, p[4] != 0 || interval != 0);
+    }
     return st;
 }
 
