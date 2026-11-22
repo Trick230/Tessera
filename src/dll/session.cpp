@@ -11,6 +11,7 @@
 #include <cwchar>
 
 #include "config.h"
+#include "dedup.h"
 #include "log.h"
 #include "memory.h"
 #include "nvapi.h"
@@ -172,6 +173,7 @@ DWORD WINAPI writer_main(void*) {
             workset_background_tick();
             residency_background_tick();
             if (config().present_cpu_sets) present_cpu_sets_tick();
+            if (config().texture_dedup) dedup_background_tick();
         }
         if ((tick & 7) == 0) pacing_background_tick();  // every 2 s
         shaders_background_tick();

@@ -9,6 +9,7 @@ add_library(tessera_d3d11 SHARED
   session.cpp
   log.cpp
   config.cpp
+  dedup.cpp
   module.cpp
   process.cpp
   pacing.cpp

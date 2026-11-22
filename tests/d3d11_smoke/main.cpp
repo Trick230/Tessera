@@ -463,6 +463,48 @@ int verify(const wchar_t* dir, int fps) {
 
 // Cost of the bind hooks (M11): 2M PSSetShaderResources of 16 views, taken
 // in turn from 4096 so lookups miss the cache as in a game.
+int dedup() {
+    ID3D11Device* dev = nullptr;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                                 &dev, nullptr, nullptr)))
+        return fail("dedup device");
+    constexpr UINT size = 256, pitch = size * 4 + 16;
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = d.Height = size;
+    d.MipLevels = d.ArraySize = d.SampleDesc.Count = 1;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.Usage = D3D11_USAGE_IMMUTABLE;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    std::vector<BYTE> pixels(size * pitch, 0x41);
+    D3D11_SUBRESOURCE_DATA init = {pixels.data(), pitch, 0};
+    ID3D11Texture2D *first = nullptr, *second = nullptr;
+    if (FAILED(dev->CreateTexture2D(&d, &init, &first))) return fail("dedup first");
+    pixels[size * 4] ^= 0xff;  // different row padding, same pixels
+    if (FAILED(dev->CreateTexture2D(&d, &init, &second))) return fail("dedup second");
+    const bool shared = first == second;
+    if (shared != (GetEnvironmentVariableW(L"TESSERA_SMOKE_DEDUP", nullptr, 0) != 0))
+        return fail("dedup identical pixels");
+    second->Release();
+    pixels[0] ^= 0xff;  // same sampled signature, different pixels
+    if (FAILED(dev->CreateTexture2D(&d, &init, &second)) || first == second) return fail("dedup distinct pixels");
+    second->Release();
+    pixels[0] ^= 0xff;
+    LARGE_INTEGER freq, start, end;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    constexpr int count = 512;
+    for (int i = 0; i < count; ++i) {
+        if (FAILED(dev->CreateTexture2D(&d, &init, &second))) return fail("dedup loop");
+        second->Release();
+    }
+    QueryPerformanceCounter(&end);
+    std::printf("dedup %s: %.2f us per repeated immutable create\n", shared ? "on" : "off",
+                (end.QuadPart - start.QuadPart) * 1e6 / freq.QuadPart / count);
+    first->Release();
+    dev->Release();
+    return 0;
+}
+
 int bench() {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
@@ -1094,6 +1136,7 @@ int uecvars_mode(bool stale) {
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--uecvars") == 0) return uecvars_mode(argc >= 3 && wcscmp(argv[2], L"stale") == 0);
     if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0) return bench();
+    if (argc >= 2 && wcscmp(argv[1], L"--dedup") == 0) return dedup();
     if (argc >= 2 && wcscmp(argv[1], L"--imports") == 0) return imports_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--recycle") == 0) return recycle_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--tiled") == 0) return tiled();

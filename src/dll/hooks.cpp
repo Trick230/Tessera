@@ -7,6 +7,7 @@
 #include <intrin.h>
 
 #include "config.h"
+#include "dedup.h"
 #include "flip.h"
 #include "log.h"
 #include "module.h"
@@ -178,11 +179,26 @@ HRESULT STDMETHODCALLTYPE hk_CreateTexture2D(ID3D11Device* self, const D3D11_TEX
     // M3: large immutable textures become tiled, their top mip movable.
     // R1: a released render target with this description comes back.
     const bool reused = game && d && out && !init && rtpool_take(self, *d, bytes, out);
-    const bool tiled = !reused && game && d && out && residency_create(self, create, *d, init, out, bytes);
-    const HRESULT hr = reused || tiled ? S_OK : create(self, d, init, out);
+    const bool can_share = config().texture_dedup && game && d && init && out;
+    bool shared = false;
+    if (can_share) {
+        if (auto* match = dedup_texture(self, *d, init, bytes)) {
+            *out = match;
+            shared = true;
+        }
+    }
+    const bool tiled = !reused && !shared && game && d && out && residency_create(self, create, *d, init, out, bytes);
+    const HRESULT hr = reused || shared || tiled ? S_OK : create(self, d, init, out);
+    if (can_share && !shared && !tiled && SUCCEEDED(hr) && *out) {
+        if (auto* match = dedup_texture(self, *d, init, bytes, *out)) {
+            (*out)->Release();
+            *out = match;
+            shared = true;
+        }
+    }
     if (SUCCEEDED(hr) && !reused && game && !init && d && out && *out) rtpool_track(self, *out, *d, bytes);
     if (SUCCEEDED(hr) && !tiled && d && (d->MiscFlags & D3D11_RESOURCE_MISC_TILED)) residency_after_present();
-    if (SUCCEEDED(hr) && out && *out && d && outer) {
+    if (SUCCEEDED(hr) && out && *out && d && outer && !shared) {
         TesseraRecord r = {};
         r.qpc = now_qpc();
         r.kind = TESSERA_REC_TEXTURE2D;
