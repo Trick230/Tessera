@@ -137,13 +137,21 @@ bool verify_copies(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D*
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 3) return fail("usage: tessera_test_feedback <original.dxbc> <instrumented.dxbc> | --layer <original.dxbc>");
+    const bool foreign = argc == 4 && std::wcscmp(argv[1], L"--layer-foreign") == 0;
+    if (argc != 3 && !foreign) return fail("usage: tessera_test_feedback <original.dxbc> <instrumented.dxbc> | --layer <original.dxbc>");
     const bool changed = std::wcscmp(argv[1], L"--textures-changed") == 0;
     const bool hdr = std::wcscmp(argv[1], L"--textures-hdr") == 0;
     const bool occupied = std::wcscmp(argv[1], L"--layer-occupied") == 0;
     const bool indirect = std::wcscmp(argv[1], L"--layer-indirect") == 0;
     const bool textures = changed || hdr || std::wcscmp(argv[1], L"--textures") == 0;
-    const bool layer = textures || occupied || indirect || std::wcscmp(argv[1], L"--layer") == 0;
+    const bool layer = textures || occupied || indirect || foreign || std::wcscmp(argv[1], L"--layer") == 0;
+    using ForeignDraw = unsigned (WINAPI*)(ID3D11DeviceContext*);
+    ForeignDraw foreign_draw = nullptr;
+    if (foreign) {
+        const HMODULE module = LoadLibraryW(argv[3]);
+        if (module) foreign_draw = reinterpret_cast<ForeignDraw>(GetProcAddress(module, "draw_foreign"));
+        if (!foreign_draw) return fail("load foreign draw helper");
+    }
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
@@ -271,6 +279,11 @@ int wmain(int argc, wchar_t** argv) {
         auto* filter = sampler.Get();
         ctx->PSSetShaderResources(3, 1, &view);
         ctx->PSSetSamplers(1, 1, &filter);
+        if (foreign_draw) {
+            ctx->PSSetShader(nullptr, nullptr, 0);
+            if (foreign_draw(ctx.Get()) != 8) return false;
+            ctx->PSSetShader(ps, nullptr, 0);
+        }
         if (indirect) draw_indirect(ctx.Get(), args.Get(), 0);
         else ctx->Draw(3, 0);
         if (layer) {

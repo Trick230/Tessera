@@ -33,3 +33,5 @@ add_custom_command(TARGET tessera_texcomp POST_BUILD
 add_executable(tessera_test_feedback EXCLUDE_FROM_ALL ../../tests/quality/feedback.cpp)
 target_compile_options(tessera_test_feedback PRIVATE /EHsc)
 target_link_libraries(tessera_test_feedback PRIVATE d3d11 d3dcompiler)
+add_library(tessera_test_foreign_draw SHARED EXCLUDE_FROM_ALL ../../tests/quality/foreign_draw.cpp)
+add_dependencies(tessera_test_feedback tessera_test_foreign_draw)

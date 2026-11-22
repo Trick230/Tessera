@@ -150,6 +150,13 @@ if ($LASTEXITCODE -or $feedback.Count -ne 1 -or $feedback[0].A -ne 3 -or $feedba
 }
 "PASS early-cached indirect draw and sampling across frames"
 
+& $test --layer-foreign $in "$bin\tessera_test_foreign_draw.dll"
+$feedback = @(Read-Records 12)
+if ($LASTEXITCODE -or $feedback.Count -ne 1 -or $feedback[0].A -ne 3 -or $feedback[0].B -ne 2) {
+    throw "Foreign draws consumed the game's mip feedback sample window"
+}
+"PASS game draw sampled after eight foreign draws"
+
 $uncached = Join-Path $case "EXPLICIT_LOD.dxbc"
 $shaderHash = [BitConverter]::ToUInt64([IO.File]::ReadAllBytes($uncached), 4)
 foreach ($diagnostics in 0, 1) {

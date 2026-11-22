@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "mip_feedback.h"
 
+#include <intrin.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 
 #include "config.h"
 #include "log.h"
+#include "module.h"
 #include "session.h"
 #include "tessera/feedback_format.h"
 #include "vtable.h"
@@ -236,8 +238,8 @@ void record_shader_miss(ID3D11PixelShader* shader) {
 }
 
 template <typename F, typename... A>
-void draw(ID3D11DeviceContext* ctx, F original_draw, A... args) {
-    if (!g_armed.load(std::memory_order_relaxed)) {
+void draw(ID3D11DeviceContext* ctx, void* caller, F original_draw, A... args) {
+    if (!g_armed.load(std::memory_order_relaxed) || !is_game_code(caller)) {
         original_draw(ctx, args...);
         return;
     }
@@ -261,8 +263,7 @@ void draw(ID3D11DeviceContext* ctx, F original_draw, A... args) {
     if (!variant) {
         skipped = &g_stats.no_variant;
         if (config().mip_feedback_diagnostics) record_shader_miss(original.Get());
-    }
-    else if (!capture_bindings(*cap, *original.Get())) skipped = &g_stats.no_texture;
+    } else if (!capture_bindings(*cap, *original.Get())) skipped = &g_stats.no_texture;
     else if (!free_output_slot(ctx)) skipped = &g_stats.output_busy;
     if (skipped) {
         skipped->fetch_add(1, std::memory_order_relaxed);
@@ -313,27 +314,29 @@ bool hook_draws(ID3D11DeviceContext* ctx, bool refresh) {
 }
 
 void STDMETHODCALLTYPE hk_draw(ID3D11DeviceContext* c, UINT n, UINT first) {
-    draw(c, reinterpret_cast<decltype(&hk_draw)>(vt_orig(g_draw, c)), n, first);
+    draw(c, _ReturnAddress(), reinterpret_cast<decltype(&hk_draw)>(vt_orig(g_draw, c)), n, first);
 }
 void STDMETHODCALLTYPE hk_draw_indexed(ID3D11DeviceContext* c, UINT n, UINT first, INT base) {
-    draw(c, reinterpret_cast<decltype(&hk_draw_indexed)>(vt_orig(g_draw_indexed, c)), n, first, base);
+    draw(c, _ReturnAddress(), reinterpret_cast<decltype(&hk_draw_indexed)>(vt_orig(g_draw_indexed, c)), n, first, base);
 }
 void STDMETHODCALLTYPE hk_draw_instanced(ID3D11DeviceContext* c, UINT n, UINT count, UINT first, UINT start) {
-    draw(c, reinterpret_cast<decltype(&hk_draw_instanced)>(vt_orig(g_draw_instanced, c)), n, count, first, start);
+    draw(c, _ReturnAddress(), reinterpret_cast<decltype(&hk_draw_instanced)>(vt_orig(g_draw_instanced, c)), n, count, first,
+         start);
 }
 void STDMETHODCALLTYPE hk_draw_indexed_instanced(ID3D11DeviceContext* c, UINT n, UINT count, UINT first, INT base,
                                                   UINT start) {
-    draw(c, reinterpret_cast<decltype(&hk_draw_indexed_instanced)>(vt_orig(g_draw_indexed_instanced, c)),
+    draw(c, _ReturnAddress(), reinterpret_cast<decltype(&hk_draw_indexed_instanced)>(vt_orig(g_draw_indexed_instanced, c)),
          n, count, first, base, start);
 }
 void STDMETHODCALLTYPE hk_draw_auto(ID3D11DeviceContext* c) {
-    draw(c, reinterpret_cast<decltype(&hk_draw_auto)>(vt_orig(g_draw_auto, c)));
+    draw(c, _ReturnAddress(), reinterpret_cast<decltype(&hk_draw_auto)>(vt_orig(g_draw_auto, c)));
 }
 void STDMETHODCALLTYPE hk_draw_indexed_indirect(ID3D11DeviceContext* c, ID3D11Buffer* args, UINT offset) {
-    draw(c, reinterpret_cast<decltype(&hk_draw_indexed_indirect)>(vt_orig(g_draw_indexed_indirect, c)), args, offset);
+    draw(c, _ReturnAddress(), reinterpret_cast<decltype(&hk_draw_indexed_indirect)>(vt_orig(g_draw_indexed_indirect, c)),
+         args, offset);
 }
 void STDMETHODCALLTYPE hk_draw_indirect(ID3D11DeviceContext* c, ID3D11Buffer* args, UINT offset) {
-    draw(c, reinterpret_cast<decltype(&hk_draw_indirect)>(vt_orig(g_draw_indirect, c)), args, offset);
+    draw(c, _ReturnAddress(), reinterpret_cast<decltype(&hk_draw_indirect)>(vt_orig(g_draw_indirect, c)), args, offset);
 }
 }  // namespace
 
