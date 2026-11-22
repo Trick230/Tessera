@@ -57,6 +57,23 @@ if ($LASTEXITCODE -or -not (Test-Log "0 KB from the startup list") -or (Test-Log
 }
 "PASS I/O learning, startup and material prefetch, and cache invalidation"
 
+$env:TESSERA_SMOKE_STREAM_ROLL = "1"
+$env:TESSERA_SMOKE_PREDICT = "1"
+Set-Options @("stream_io=1", "mip_prediction=1")
+& $exe --stream | Write-Host
+if ($LASTEXITCODE -or -not (Test-Log "learning trace contains 4096 ranges, 2048 with materials, 1 rolling replacements")) {
+    throw "A full stream trace did not retain the later material read"
+}
+$env:TESSERA_SMOKE_STREAM_ROLL = $null
+$env:TESSERA_SMOKE_PREDICT = "2"
+Set-Options @("stream_io=2", "mip_prediction=1")
+& $exe --stream | Write-Host
+if ($LASTEXITCODE -or -not (Test-Log "2048 KB from the startup list") -or
+    -not (Test-Log "64 KB from a material match \(1 ranges\)")) {
+    throw "Replay lost either startup or the later material read"
+}
+"PASS rolling material trace after saturation"
+
 Set-Options @("mip_residency=1", "mip_force_evict=1", "mip_streaming=1", "mip_prediction=1")
 $env:TESSERA_SMOKE_MIP_STREAM = "1"
 $env:TESSERA_SMOKE_MIP_PREDICT = "1"

@@ -690,6 +690,11 @@ int stream() {
             tex->Release();
             texels.assign(texels.size(), 0x87654321);
         }
+        if (learning && GetEnvironmentVariableW(L"TESSERA_SMOKE_STREAM_ROLL", nullptr, 0)) {
+            ctx->PSSetShaderResources(0, 1, views);
+            for (unsigned i = 0; i < 2048; ++i)
+                if (!read_asset(1 + i % 32, 4096)) return fail("stream early material reads");
+        }
         ctx->PSSetShaderResources(0, _countof(views), views);
         for (auto* view : views) view->Release();
     }

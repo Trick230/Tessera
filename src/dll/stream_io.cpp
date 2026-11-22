@@ -18,6 +18,7 @@ namespace tessera {
 namespace {
 constexpr unsigned kFiles = 128, kReads = 4096, kHandles = 512;
 constexpr unsigned kUntaggedWithPrediction = kReads / 2;
+constexpr unsigned kRecentStart = kReads / 2;
 constexpr DWORD kMinRead = 4096, kMaxRead = 2u << 20;
 constexpr DWORD kPrefixBytes = 8u << 20, kSessionBytes = 64u << 20;
 constexpr uint32_t kMagic = 0x314f4954;  // TIO1
@@ -42,6 +43,8 @@ static_assert(sizeof(File) == 536 && sizeof(Range) == 24 && offsetof(Trace, rang
 Trace g_trace, g_snapshot;
 unsigned g_untagged_limit = kReads, g_material_ranges = 0;
 unsigned g_saved_ranges = 0, g_saved_material_ranges = 0;
+unsigned g_last_range = 0, g_next_recent = kRecentStart;
+uint64_t g_revision = 0, g_saved_revision = 0, g_saved_tick = 0;
 struct OpenFile {
     std::atomic<HANDLE> handle;
     std::atomic<unsigned> file;
@@ -114,16 +117,26 @@ unsigned tracked(HANDLE h) {
 void record(unsigned file, uint64_t offset, DWORD bytes) {
     if (!TryAcquireSRWLockExclusive(&g_lock)) return;
     const uint64_t size = g_trace.file[file].size;
-    if (g_trace.ranges < kReads && offset < size) {
+    if (offset < size) {
         const uint64_t material = g_material.load(std::memory_order_relaxed);
         // Early I/O can fill the trace before the first material binds.
-        if (material || g_trace.ranges - g_material_ranges < g_untagged_limit) {
+        const bool full = g_trace.ranges == kReads;
+        if (material || (!full && g_trace.ranges - g_material_ranges < g_untagged_limit)) {
             const auto n = static_cast<DWORD>(std::min<uint64_t>(std::min(bytes, kMaxRead), size - offset));
-            const Range& prev = g_trace.range[g_trace.ranges ? g_trace.ranges - 1 : 0];
+            const Range& prev = g_trace.range[g_last_range];
             if (!g_trace.ranges || prev.file != file || prev.offset != offset || prev.bytes != n ||
                 prev.material != material) {
-                g_trace.range[g_trace.ranges++] = {offset, material, file, n};
+                if (full) {
+                    // Keep the startup and early reads while rotating in newer material reads.
+                    g_last_range = g_next_recent++;
+                    if (g_next_recent == kReads) g_next_recent = kRecentStart;
+                    g_material_ranges -= g_trace.range[g_last_range].material != 0;
+                } else {
+                    g_last_range = g_trace.ranges++;
+                }
+                g_trace.range[g_last_range] = {offset, material, file, n};
                 g_material_ranges += material != 0;
+                ++g_revision;
             }
         }
     }
@@ -351,13 +364,17 @@ void stream_start(const wchar_t* exe) {
 
 void stream_background_tick() {
     if (!g_learning.load(std::memory_order_acquire)) return;
+    const ULONGLONG now = GetTickCount64();
+    // A saturated rolling trace can stay dirty throughout play. Bound disk writes.
+    if (g_saved_ranges == kReads && now - g_saved_tick < 1000) return;
     AcquireSRWLockExclusive(&g_lock);
-    if (g_saved_ranges == g_trace.ranges) {
+    if (g_saved_revision == g_revision) {
         ReleaseSRWLockExclusive(&g_lock);
         return;
     }
     g_snapshot = g_trace;
     const unsigned material_ranges = g_material_ranges;
+    const uint64_t revision = g_revision;
     ReleaseSRWLockExclusive(&g_lock);
 
     wchar_t temp[MAX_PATH];
@@ -371,13 +388,16 @@ void stream_background_tick() {
         if (!g_saved_ranges) logf("stream I/O: saved learning trace");
         g_saved_ranges = g_snapshot.ranges;
         g_saved_material_ranges = material_ranges;
+        g_saved_revision = revision;
+        g_saved_tick = now;
     }
 }
 
 void stream_log_summary() {
     if (g_learning.load(std::memory_order_acquire))
-        logf("stream I/O: learning trace contains %u ranges, %u with materials", g_saved_ranges,
-             g_saved_material_ranges);
+        logf("stream I/O: learning trace contains %u ranges, %u with materials, %llu rolling replacements",
+             g_saved_ranges, g_saved_material_ranges,
+             static_cast<unsigned long long>(g_saved_revision - g_saved_ranges));
 }
 
 void stream_material(uint64_t key) { g_material.store(key, std::memory_order_relaxed); }
