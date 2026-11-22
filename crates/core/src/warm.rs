@@ -27,8 +27,9 @@ const STALL_S: u64 = 60;
 /// until the next warm-up they describe the driver that wrote them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WarmStats {
-    /// Compiled (used in a draw, or created when nothing can draw it).
+    /// Created and exercised in a draw or dispatch.
     pub ok: u64,
+    pub created_only: u64,
     pub failed: u64,
     /// Not D3D11 shaders (DXIL).
     pub skipped: u64,
@@ -68,14 +69,19 @@ pub fn stored(exe: &Path) -> crate::shaders::StoreStats {
     t
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Outcome {
-    Ok,
-    Failed,
     Skipped,
+    Failed,
+    Made,
+    Ok,
 }
 
-/// Adds a log's settled hashes to `seen` (first outcome wins) and returns
+pub(crate) fn merge_outcome(seen: &mut HashMap<u64, Outcome>, hash: u64, outcome: Outcome) {
+    seen.entry(hash).and_modify(|previous| *previous = (*previous).max(outcome)).or_insert(outcome);
+}
+
+/// Adds a log's latest outcomes to `seen` and returns
 /// the driver version in its header (None for a foreign file). A pending
 /// "try" (the run died on it) counts as failed, as the warm exe does on its
 /// next launch.
@@ -84,6 +90,7 @@ pub(crate) fn settle(text: &str, seen: &mut HashMap<u64, Outcome>) -> Option<u64
     let driver = lines.next()?.strip_prefix("tessera-warm 1 driver ")?;
     let driver = u64::from_str_radix(driver.trim(), 16).ok()?;
     let mut pending = None;
+    let mut latest = HashMap::new();
     for l in lines {
         let Some((word, h)) = l.split_once(' ') else { continue };
         let Ok(h) = u64::from_str_radix(h.trim(), 16) else { continue };
@@ -92,16 +99,22 @@ pub(crate) fn settle(text: &str, seen: &mut HashMap<u64, Outcome>) -> Option<u64
                 pending = Some(h);
                 continue;
             }
-            "ok" | "made" => Outcome::Ok,
+            "ok" => Outcome::Ok,
+            "made" => Outcome::Made,
             "fail" => Outcome::Failed,
             "skip" => Outcome::Skipped,
             _ => continue,
         };
-        pending = None;
-        seen.entry(h).or_insert(o);
+        if pending == Some(h) {
+            pending = None;
+        }
+        latest.insert(h, o);
     }
     if let Some(h) = pending {
-        seen.entry(h).or_insert(Outcome::Failed);
+        latest.insert(h, Outcome::Failed);
+    }
+    for (hash, outcome) in latest {
+        merge_outcome(seen, hash, outcome);
     }
     Some(driver)
 }
@@ -111,6 +124,7 @@ fn count(seen: &HashMap<u64, Outcome>) -> WarmStats {
     for o in seen.values() {
         match o {
             Outcome::Ok => st.ok += 1,
+            Outcome::Made => st.created_only += 1,
             Outcome::Failed => st.failed += 1,
             Outcome::Skipped => st.skipped += 1,
         }
@@ -128,9 +142,16 @@ pub fn parse_log(text: &str) -> WarmStats {
 /// Both stores' logs, each hash once.
 pub fn stats(exe: &Path) -> WarmStats {
     let mut seen = HashMap::new();
+    let drivers: Vec<_> = crate::driver::gpus().iter()
+        .filter_map(|g| crate::driver::umd_version(&g.driver_version)).collect();
     for b in bases(exe) {
         if let Ok(text) = fs::read_to_string(with_suffix(&b, ".twarm")) {
-            settle(&text, &mut seen);
+            let mut log = HashMap::new();
+            if settle(&text, &mut log).is_some_and(|driver| drivers.contains(&driver)) {
+                for (hash, outcome) in log {
+                    merge_outcome(&mut seen, hash, outcome);
+                }
+            }
         }
     }
     count(&seen)
@@ -166,8 +187,9 @@ pub fn run(exe: &Path, warm_exe: &Path, on_stall: &dyn Fn(u64)) -> io::Result<St
     let copy = dir.join(name);
     fs::copy(warm_exe, &copy)?;
     let mut lines = Vec::new();
-    for b in todo {
-        lines.push(run_one(&copy, &b, on_stall)?);
+    for b in &todo {
+        let peer = bases(exe).into_iter().find(|other| other != b);
+        lines.push(run_one(&copy, b, peer.as_deref(), on_stall)?);
     }
     Ok(lines.join("\n"))
 }
@@ -217,10 +239,13 @@ fn wait_reporting(mut cmd: Command, log: &Path, stall_s: u64, on_stall: &dyn Fn(
     Ok(std::process::Output { status, stdout, stderr })
 }
 
-fn run_one(copy: &Path, base: &Path, on_stall: &dyn Fn(u64)) -> io::Result<String> {
-    for _ in 0..=MAX_RELAUNCHES {
+fn run_one(copy: &Path, base: &Path, peer: Option<&Path>, on_stall: &dyn Fn(u64)) -> io::Result<String> {
+    for attempt in 0..=MAX_RELAUNCHES {
         let mut cmd = Command::new(copy);
-        cmd.arg(base);
+        cmd.arg(base).arg(peer.unwrap_or_else(|| Path::new("")));
+        if attempt == 0 {
+            cmd.arg("--retry-failed");
+        }
         let out = wait_reporting(cmd, &with_suffix(base, ".twarm"), STALL_S, on_stall)?;
         match out.status.code() {
             Some(0) => return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
@@ -254,7 +279,9 @@ mod tests {
     #[test]
     fn counts_each_hash_once_and_a_pending_try_as_failed() {
         let log = "tessera-warm 1 driver 0000000000000001\ntry a\nok a\ntry b\nfail b\ntry d\nmade d\nskip e\ntry c\n";
-        assert_eq!(parse_log(log), WarmStats { ok: 2, failed: 2, skipped: 1 });
+        assert_eq!(parse_log(log), WarmStats { ok: 1, created_only: 1, failed: 2, skipped: 1 });
+        let retried = "tessera-warm 1 driver 0000000000000001\nfail a\ntry a\nok a\n";
+        assert_eq!(parse_log(retried), WarmStats { ok: 1, ..WarmStats::default() });
         assert_eq!(parse_log("something else\nok a\n"), WarmStats::default());
     }
 }

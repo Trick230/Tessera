@@ -18,6 +18,8 @@ pub struct ShaderCheck {
     pub stored: u64,
     /// Stored and compiled by a warm-up with the installed driver.
     pub compiled: u64,
+    /// The driver created these shaders without a compatible draw or dispatch.
+    pub created_only: u64,
     /// Stored, refused by the driver in a warm-up with the installed driver.
     pub failed: u64,
     /// Stored but not D3D11 bytecode (DXIL): the D3D11 warm-up cannot take them.
@@ -31,6 +33,7 @@ pub struct ShaderCheck {
     pub damaged: u64,
     /// Containers in the install files that failed their checksum (last scan).
     pub bad_in_install: Option<u64>,
+    pub unsupported_in_install: Option<u64>,
     /// Whether the install changed since the last scan (None: never scanned
     /// or install folder unknown).
     pub scan_outdated: Option<bool>,
@@ -41,7 +44,7 @@ pub struct ShaderCheck {
 impl ShaderCheck {
     /// Every stored shader the warm-up can compile is compiled with this driver.
     pub fn all_compiled(&self) -> bool {
-        self.stored > 0 && self.pending == 0
+        self.compiled > 0 && self.pending == 0 && self.failed == 0 && self.created_only == 0
     }
 }
 
@@ -56,7 +59,7 @@ fn intact(code: &[u8]) -> bool {
 
 /// The check for one game. `root` is its install folder (for the scan's
 /// freshness), `drivers` the installed drivers' UMD versions (any GPU may
-/// have run the warm-up; empty means unknown and trusts the logs).
+/// have run the warm-up; empty means no current driver could be verified).
 pub fn check(exe: &Path, root: Option<&Path>, drivers: &[u64]) -> ShaderCheck {
     let layer = crate::warm::store_base(exe);
     let scan = crate::scan::scan_base(exe);
@@ -93,9 +96,9 @@ pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&
         let Ok(text) = fs::read_to_string(with_suffix(b, ".twarm")) else { continue };
         let mut seen = HashMap::new();
         let Some(driver) = settle(&text, &mut seen) else { continue };
-        let into = if drivers.is_empty() || drivers.contains(&driver) { &mut now } else { &mut before };
+        let into = if drivers.contains(&driver) { &mut now } else { &mut before };
         for (h, o) in seen {
-            into.entry(h).or_insert(o);
+            crate::warm::merge_outcome(into, h, o);
         }
     }
 
@@ -103,12 +106,13 @@ pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&
     for (h, &flags) in &stored {
         match now.get(h) {
             Some(Outcome::Ok) => c.compiled += 1,
+            Some(Outcome::Made) => c.created_only += 1,
             Some(Outcome::Failed) => c.failed += 1,
             Some(Outcome::Skipped) => c.skipped += 1,
             None if flags & FLAG_DXIL != 0 => c.skipped += 1,
             None => {
                 c.pending += 1;
-                c.old_driver += (before.get(h) == Some(&Outcome::Ok)) as u64;
+                c.old_driver += (!drivers.is_empty() && before.get(h) == Some(&Outcome::Ok)) as u64;
             }
         }
     }
@@ -117,6 +121,7 @@ pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&
 
     if let Some(r) = scan.and_then(crate::scan::record_at) {
         c.bad_in_install = r.invalid;
+        c.unsupported_in_install = r.unsupported;
         c.scan_outdated = install_key.map(|k| k != r.key);
     }
     c
@@ -170,6 +175,13 @@ mod tests {
 
         let same = check_at(Some(&layer), Some(&scan), Some("tessera-scan 2 files 1"), &[now]);
         assert_eq!(same.scan_outdated, Some(false));
+
+        fs::write(with_suffix(&scan, ".twarm"),
+            format!("tessera-warm 1 driver {now:016x}\nfail {:x}\nok {:x}\nmade {:x}\n", b.hash, b.hash, c.hash),
+        ).unwrap();
+        let updated = check_at(Some(&layer), Some(&scan), None, &[now]);
+        assert_eq!((updated.compiled, updated.created_only, updated.pending, updated.failed), (2, 1, 1, 0));
+        assert_eq!(check_at(Some(&layer), Some(&scan), None, &[]).compiled, 0);
     }
 
     #[test]

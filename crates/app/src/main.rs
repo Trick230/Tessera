@@ -387,16 +387,28 @@ fn shader_state(c: &ShaderCheck, run: Option<(u64, u64)>, can_prepare: bool) -> 
         (format!("All {}", c.compiled), OK)
     } else {
         d.push(format!(
-            "{} of {} stored shaders are compiled with the installed driver; {} would compile while playing. Prepare shaders compiles them first.",
+            "{} of {} stored shaders were exercised on the installed driver. {} are still pending.",
             c.compiled, warmable, c.pending
         ));
-        let v = if c.compiled == 0 { "Not yet".to_string() } else { format!("{} of {}", c.compiled, warmable) };
+        let v = format!("{} of {}", c.compiled, warmable);
         (v, WARN)
     };
     if c.skipped > 0 {
         d.push(format!("{} are D3D12 shaders (DXIL) the D3D11 warm-up cannot take.", c.skipped));
     }
+    if c.created_only > 0 {
+        d.push(format!("{} created successfully without a compatible draw or dispatch.", c.created_only));
+    }
+    if let Some(n) = c.unsupported_in_install.filter(|&n| n > 0) {
+        d.push(format!("The file scan also found {n} containers outside D3D11 warm-up support."));
+    }
     rows.push(line("Compiled", value, d, tone));
+    rows.push(line(
+        "Pending",
+        c.pending.to_string(),
+        vec!["Prepare shaders warms pending bytecode and retries previously failed shaders.".to_string()],
+        if c.pending > 0 { WARN } else { NEUTRAL },
+    ));
 
     // Coverage: how many of the shaders the last run created were already stored.
     let (value, tone, d) = match run {
@@ -410,7 +422,7 @@ fn shader_state(c: &ShaderCheck, run: Option<(u64, u64)>, can_prepare: bool) -> 
         None => (
             "Unknown".to_string(),
             NEUTRAL,
-            vec!["Play once with the layer on: the run records every shader the game creates.".to_string()],
+            vec!["Play once with the D3D11 layer on to capture shaders created during play.".to_string()],
         ),
     };
     rows.push(line("Coverage", value, d, tone));
@@ -701,10 +713,16 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         let result = tessera_core::warm::run(&exe, &app_dir().join(tessera_core::warm::WARM_EXE), &stall);
         let msg = match result {
             Ok(_) => {
-                let w = tessera_core::warm::stats(&exe);
+                let drivers: Vec<_> = tessera_core::driver::gpus()
+                    .iter()
+                    .filter_map(|gpu| tessera_core::driver::umd_version(&gpu.driver_version))
+                    .collect();
+                let w = tessera_core::shader_check::check(&exe, None, &drivers);
                 format!(
-                    "Shaders: {found}{} ready, {} failed ({:.1} s)",
-                    w.ok,
+                    "Shaders: {found}{} exercised, {} created only, {} pending, {} failed ({:.1} s)",
+                    w.compiled,
+                    w.created_only,
+                    w.pending,
                     w.failed,
                     t0.elapsed().as_secs_f64()
                 )

@@ -37,6 +37,7 @@ pub struct ScanStats {
     /// Containers found (before dedupe), by where they were.
     pub raw: u64,
     pub zlib: u64,
+    pub gzip: u64,
     pub zstd: u64,
     pub lz4: u64,
     pub oodle: u64,
@@ -55,6 +56,7 @@ impl ScanStats {
         self.bytes += o.bytes;
         self.raw += o.raw;
         self.zlib += o.zlib;
+        self.gzip += o.gzip;
         self.zstd += o.zstd;
         self.lz4 += o.lz4;
         self.oodle += o.oodle;
@@ -198,7 +200,8 @@ pub fn container_at(b: &[u8]) -> Option<Container> {
         3 => STAGE_HS,
         4 => STAGE_DS,
         5 => STAGE_CS,
-        _ => return None, // libraries, mesh/amplification, ray tracing
+        _ if dxil => u16::MAX, // discover libraries, mesh and ray tracing without warming them as D3D11
+        _ => return None,
     };
     let (major, minor) = (((token >> 4) & 0xF) as u8, (token & 0xF) as u8);
     if !(4..=6).contains(&major) {
@@ -234,7 +237,7 @@ impl Found {
         if self.shaders.contains_key(&c.hash) {
             return false;
         }
-        let fresh = checksum(code) == code[4..20];
+        let fresh = code[4..20].iter().all(|&b| b == 0) || checksum(code) == code[4..20];
         if !fresh {
             self.stats.invalid += 1;
         } else {
@@ -249,6 +252,8 @@ impl Found {
     fn search(&mut self, b: &[u8], depth: u32) -> u64 {
         const DXBC: u8 = 3;
         const OODLE: u8 = 4;
+        const GZIP: u8 = 5;
+        let gzip = memchr::memmem::Finder::new(b"\x1f\x8b\x08");
         let zstd = memchr::memmem::Finder::new(&[0x28, 0xB5, 0x2F, 0xFD]);
         let lz4 = memchr::memmem::Finder::new(&[0x04, 0x22, 0x4D, 0x18]);
         let dxbc = memchr::memmem::Finder::new(b"DXBC");
@@ -262,6 +267,7 @@ impl Found {
             cand.clear();
             cand.extend(dxbc.find_iter(w).map(|i| (start + i, DXBC)));
             if depth < MAX_DEPTH {
+                cand.extend(gzip.find_iter(w).map(|i| (start + i, GZIP)));
                 cand.extend(zstd.find_iter(w).map(|i| (start + i, 1)));
                 cand.extend(lz4.find_iter(w).map(|i| (start + i, 2)));
                 cand.extend(
@@ -303,6 +309,7 @@ impl Found {
                         _ => None,
                     },
                     1 => read_capped(ruzstd::decoding::StreamingDecoder::new(rest).ok(), &mut out).then_some(None),
+                    GZIP => read_capped(Some(flate2::read::GzDecoder::new(rest)), &mut out).then_some(None),
                     _ => read_capped(Some(lz4_flex::frame::FrameDecoder::new(rest)), &mut out).then_some(None),
                 };
                 let Some(consumed) = consumed else { continue };
@@ -317,6 +324,7 @@ impl Found {
                     0 => self.stats.zlib += n,
                     1 => self.stats.zstd += n,
                     OODLE => self.stats.oodle += n,
+                    GZIP => self.stats.gzip += n,
                     _ => self.stats.lz4 += n,
                 }
                 // Only a stream that ended cleanly is skipped: a false header
@@ -462,21 +470,22 @@ fn volatile(p: &Path) -> bool {
         || matches!(ext.as_str(), "ini" | "log" | "txt" | "dmp" | "cfg" | "tmp")
 }
 
-/// Identifies an install's contents cheaply: file count, total size, newest
-/// modification time. A game update changes it.
+/// Identifies the install by the names, sizes and timestamps of its files.
 fn install_key(root: &Path) -> String {
-    let (mut n, mut bytes, mut newest) = (0u64, 0u64, 0u64);
-    for p in files(root) {
+    use std::hash::{Hash, Hasher};
+    let mut paths = files(root);
+    paths.sort_unstable();
+    let mut key = std::collections::hash_map::DefaultHasher::new();
+    for p in paths {
         if volatile(&p) {
             continue;
         }
         let Ok(m) = fs::metadata(&p) else { continue };
-        n += 1;
-        bytes += m.len();
-        let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
-        newest = newest.max(t.map_or(0, |d| d.as_secs()));
+        p.strip_prefix(root).unwrap_or(&p).hash(&mut key);
+        m.len().hash(&mut key);
+        m.modified().ok().hash(&mut key);
     }
-    format!("tessera-scan 2 files {n} bytes {bytes} newest {newest}")
+    format!("tessera-scan 3 {:016x}", key.finish())
 }
 
 fn key_path(base: &Path) -> PathBuf {
@@ -491,14 +500,15 @@ fn key_path(base: &Path) -> PathBuf {
 pub struct ScanRecord {
     pub key: String,
     pub invalid: Option<u64>,
+    pub unsupported: Option<u64>,
 }
 
 pub fn record_at(base: &Path) -> Option<ScanRecord> {
     let text = fs::read_to_string(key_path(base)).ok()?;
     let mut lines = text.lines();
     let key = lines.next()?.to_string();
-    let invalid = lines.find_map(|l| l.strip_prefix("invalid ")?.trim().parse().ok());
-    Some(ScanRecord { key, invalid })
+    let value = |prefix| lines.clone().find_map(|l| l.strip_prefix(prefix)?.trim().parse().ok());
+    Some(ScanRecord { key, invalid: value("invalid "), unsupported: value("unsupported ") })
 }
 
 /// True when the scan store matches the install as it is now.
@@ -520,9 +530,7 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     let stored: std::collections::HashSet<u64> = crate::shaders::read(exe).iter().map(|s| s.hash).collect();
     shaders.retain(|s| !stored.contains(&s.hash));
     crate::shaders::write_base(&base, &shaders)?;
-    fs::write(key_path(&base), format!("{key}
-invalid {}
-", stats.invalid))?;
+    fs::write(key_path(&base), format!("{key}\ninvalid {}\nunsupported {}\n", stats.invalid, stats.skipped))?;
     Ok(stats)
 }
 
@@ -632,5 +640,20 @@ mod tests {
         want.sort();
         assert_eq!(shaders.iter().map(|s| (s.hash, s.stage)).collect::<Vec<_>>(), want);
         assert_eq!((stats.raw, stats.zstd, stats.lz4), (0, 1, 1));
+    }
+
+    #[test]
+    fn discovers_unsigned_dxbc_and_counts_dxil_libraries_in_gzip() {
+        use std::io::Write;
+        let shader = container(0x0000_0050, 0);
+        let mut library = container(0x0006_0060, 9);
+        library[36..40].copy_from_slice(b"DXIL");
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&[shader.clone(), library].concat()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("shaders.gz"), gzip.finish().unwrap()).unwrap();
+        let (shaders, stats) = scan_dir(dir.path());
+        assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&shader)]);
+        assert_eq!((stats.gzip, stats.skipped, stats.invalid), (2, 1, 0));
     }
 }

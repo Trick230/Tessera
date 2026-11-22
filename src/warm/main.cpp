@@ -166,49 +166,65 @@ struct Log {
     }
 };
 
-// Loads <base>.twarm; another driver version (or a foreign file) starts over.
-bool open_log(const std::wstring& path, unsigned long long driver, Log* log) {
+using Outcomes = std::unordered_map<uint64_t, char>;
+
+Outcomes outcomes(const std::vector<uint8_t>& old, uint64_t* pending) {
+    const std::string text(old.begin(), old.end());
+    Outcomes result;
+    *pending = 0;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        const std::string line = text.substr(at, end - at);
+        at = end + 1;
+        unsigned long long hash = 0;
+        if (sscanf_s(line.c_str(), "try %llx", &hash) == 1) {
+            *pending = hash;
+            continue;
+        }
+        if (sscanf_s(line.c_str(), "ok %llx", &hash) == 1 || sscanf_s(line.c_str(), "made %llx", &hash) == 1 ||
+            sscanf_s(line.c_str(), "fail %llx", &hash) == 1 || sscanf_s(line.c_str(), "skip %llx", &hash) == 1) {
+            result[hash] = line[0];
+            if (*pending == hash) *pending = 0;
+        }
+    }
+    return result;
+}
+
+bool read_matching_log(const std::wstring& path, const char* header, std::vector<uint8_t>& bytes) {
+    const size_t n = strlen(header);
+    return read_file(path, &bytes) && bytes.size() > n && memcmp(bytes.data(), header, n) == 0 && bytes[n] == '\n';
+}
+
+// Replays the latest result in each log. A peer can supply a successful result
+// for a duplicate, but a refusal in one store does not block the other store.
+bool open_log(const std::wstring& path, const wchar_t* peer, unsigned long long driver, bool retry, Log* log) {
     char head[64];
     snprintf(head, sizeof head, "tessera-warm 1 driver %016llx", driver);
     std::vector<uint8_t> old;
-    bool keep = read_file(path, &old) && old.size() > strlen(head) && memcmp(old.data(), head, strlen(head)) == 0;
-    if (keep) {
-        std::string text(old.begin(), old.end());
-        uint64_t pending = 0;
-        bool has_pending = false;
-        size_t at = 0;
-        while (at < text.size()) {
-            size_t end = text.find('\n', at);
-            if (end == std::string::npos) end = text.size();
-            const std::string l = text.substr(at, end - at);
-            at = end + 1;
-            unsigned long long h = 0;
-            uint32_t* count = nullptr;
-            if (sscanf_s(l.c_str(), "try %llx", &h) == 1) {
-                pending = h;
-                has_pending = true;
-                continue;
-            }
-            if (sscanf_s(l.c_str(), "ok %llx", &h) == 1 || sscanf_s(l.c_str(), "made %llx", &h) == 1)
-                count = &log->ok;
-            else if (sscanf_s(l.c_str(), "fail %llx", &h) == 1)
-                count = &log->failed;
-            else if (sscanf_s(l.c_str(), "skip %llx", &h) == 1)
-                count = &log->skipped;
-            if (count && log->done.insert(h).second) ++*count;
-            if (count) has_pending = false;
+    if (read_matching_log(path, head, old)) {
+        uint64_t pending;
+        for (const auto& [hash, status] : outcomes(old, &pending)) {
+            if (status == 'f' && retry) continue;
+            log->done.insert(hash);
+            ++*(status == 'f' ? &log->failed : status == 's' ? &log->skipped : &log->ok);
         }
         log->f = _wfopen(path.c_str(), L"ab");
         // A line cut short (power loss) must not swallow the next one.
         if (log->f && !old.empty() && old.back() != '\n') fputc('\n', log->f);
-        if (log->f && has_pending && !log->done.count(pending)) {  // the last run died on this one
+        if (log->f && pending) {  // the last run died on this one
             log->line("fail", pending);
-            log->done.insert(pending);
-            ++log->failed;
+            if (log->done.insert(pending).second) ++log->failed;
         }
     } else {
         log->f = _wfopen(path.c_str(), L"wb");
         if (log->f) fprintf(log->f, "%s\n", head);
+    }
+    if (peer && *peer && read_matching_log(std::wstring(peer) + L".twarm", head, old)) {
+        uint64_t pending;
+        for (const auto& [hash, status] : outcomes(old, &pending))
+            if (hash != pending && (status == 'o' || status == 'm')) log->done.insert(hash);
     }
     return log->f != nullptr;
 }
@@ -460,7 +476,9 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
     Log log;
-    if (!open_log(base + L".twarm", w.driver(), &log)) {
+    const wchar_t* peer = argc > 2 ? argv[2] : nullptr;
+    const bool retry = argc > 3 && wcscmp(argv[3], L"--retry-failed") == 0;
+    if (!open_log(base + L".twarm", peer, w.driver(), retry, &log)) {
         fprintf(stderr, "cannot write the warm-up log\n");
         return 1;
     }
