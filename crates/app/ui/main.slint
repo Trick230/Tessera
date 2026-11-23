@@ -1231,11 +1231,14 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    if root.shader-progress >= 0: Text {
-                        text: root.shader-progress-label;
+                    Text {
+                        width: 88px;
+                        text: root.shader-progress >= 0 ? root.shader-progress-label : "";
                         color: Theme.dim;
                         font-size: 13px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
+                        overflow: elide;
                     }
                 }
             }
