@@ -4,7 +4,7 @@
 
 use memchr::memmem;
 use object::read::pe::{ImageNtHeaders, PeFile, PeFile32, PeFile64, ResourceDirectory, ResourceDirectoryTable};
-use object::{LittleEndian as LE, ReadRef};
+use object::{LittleEndian as LE, NameOrOrdinal, Object, ReadRef};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io;
@@ -44,6 +44,7 @@ const DLLS: [(&str, u8, &str); 6] = [
     ("vulkan-1.dll", ApiSet::VULKAN, "Vulkan"),
     ("opengl32.dll", ApiSet::OPENGL, "OpenGL"),
 ];
+const D3D9_CREATORS: [&[u8]; 2] = [b"Direct3DCreate9\0", b"Direct3DCreate9Ex\0"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
@@ -75,6 +76,7 @@ fn map_binary(path: &Path) -> io::Result<memmap2::Mmap> {
 /// Inspect the executable and its adjacent, architecture-matched PE dependencies.
 pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
     let (mut scan, mut pending) = scan_binary(&map_binary(path)?);
+    let mut linked = scan.imported;
     let mut seen = HashSet::new();
     while let Some(name) = pending.pop() {
         let dll = Path::new(&name);
@@ -88,11 +90,12 @@ pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
         let Ok(data) = map_binary(&path.with_file_name(dll)) else { continue };
         let (dependency, imports) = scan_binary(&data);
         if dependency.architecture == scan.architecture {
+            linked.0 |= dependency.imported.0;
             scan.referenced.0 |= dependency.all().0;
             pending.extend(imports);
         }
     }
-    Ok(scan)
+    Ok(prefer_linked_direct3d(scan, linked))
 }
 
 /// Returns the best image in the executable's first icon group as an ICO file.
@@ -146,7 +149,17 @@ fn pe_icon<'a, Pe: ImageNtHeaders>(pe: PeFile<'a, Pe>) -> Option<Vec<u8>> {
 }
 
 pub fn scan_bytes(data: &[u8]) -> ExeScan {
-    scan_binary(data).0
+    let (scan, _) = scan_binary(data);
+    let linked = scan.imported;
+    prefer_linked_direct3d(scan, linked)
+}
+
+fn prefer_linked_direct3d(mut scan: ExeScan, linked: ApiSet) -> ExeScan {
+    // Windowing libraries can bundle D3D9 probes in games with a newer renderer.
+    if linked.has(ApiSet::D3D11 | ApiSet::D3D12) && !linked.has(ApiSet::D3D9) {
+        scan.referenced.0 &= !ApiSet::D3D9;
+    }
+    scan
 }
 
 fn scan_binary(data: &[u8]) -> (ExeScan, Vec<String>) {
@@ -154,20 +167,14 @@ fn scan_binary(data: &[u8]) -> (ExeScan, Vec<String>) {
     if scan.architecture.is_none() {
         return (ExeScan::default(), Vec::new());
     }
-    // D3DPERF functions are exposed by d3d9.dll and can be used without a D3D9 device.
-    if ![b"Direct3DCreate9\0".as_slice(), b"Direct3DCreate9Ex\0"].iter()
-        .any(|symbol| memmem::find(data, symbol).is_some())
-    {
-        scan.imported.0 &= !ApiSet::D3D9;
-    } else if !scan.imported.has(ApiSet::D3D9) {
-        scan.referenced.0 |= ApiSet::D3D9;
-    }
     // A graphics entry point is stronger evidence than a DLL name in text.
     // Vulkan loaders can also be present in windowing libraries without a Vulkan renderer.
     for (symbol, bit) in [
         (b"D3D12CreateDevice\0".as_slice(), ApiSet::D3D12),
         (b"D3D11CreateDevice\0", ApiSet::D3D11),
         (b"D3D11CreateDeviceAndSwapChain\0", ApiSet::D3D11),
+        (D3D9_CREATORS[0], ApiSet::D3D9),
+        (D3D9_CREATORS[1], ApiSet::D3D9),
         (b"Direct3DCreate8\0", ApiSet::D3D8),
         (b"vkCreateGraphicsPipelines\0", ApiSet::VULKAN),
         (b"glDrawElements\0", ApiSet::OPENGL),
@@ -181,7 +188,7 @@ fn scan_binary(data: &[u8]) -> (ExeScan, Vec<String>) {
 
 fn scan_imports(data: &[u8]) -> (ExeScan, Vec<String>) {
     let mut scan = ExeScan::default();
-    let imports = if let Ok(pe) = PeFile64::parse(data) {
+    let (imports, imports_d3d9_creator) = if let Ok(pe) = PeFile64::parse(data) {
         if pe.nt_headers().file_header().machine.get(LE) == object::pe::IMAGE_FILE_MACHINE_AMD64 {
             scan.architecture = Some(Architecture::X64);
         }
@@ -192,11 +199,11 @@ fn scan_imports(data: &[u8]) -> (ExeScan, Vec<String>) {
         }
         imports(&pe)
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
     for name in &imports {
         for (dll, bit, _) in DLLS {
-            if name.eq_ignore_ascii_case(dll) {
+            if name.eq_ignore_ascii_case(dll) && (bit != ApiSet::D3D9 || imports_d3d9_creator) {
                 scan.imported.0 |= bit;
             }
         }
@@ -204,7 +211,7 @@ fn scan_imports(data: &[u8]) -> (ExeScan, Vec<String>) {
     (scan, imports)
 }
 
-fn imports<'d, Pe: ImageNtHeaders, R: ReadRef<'d>>(pe: &PeFile<'d, Pe, R>) -> Vec<String> {
+fn imports<'d, Pe: ImageNtHeaders, R: ReadRef<'d>>(pe: &PeFile<'d, Pe, R>) -> (Vec<String>, bool) {
     let mut out = Vec::new();
     if let Ok(Some(table)) = pe.import_table() {
         if let Ok(mut it) = table.descriptors() {
@@ -224,7 +231,14 @@ fn imports<'d, Pe: ImageNtHeaders, R: ReadRef<'d>>(pe: &PeFile<'d, Pe, R>) -> Ve
             }
         }
     }
-    out
+    // d3d9.dll also exports the D3DPERF functions used by newer renderers.
+    let imports_d3d9_creator = out.iter().any(|name| name.eq_ignore_ascii_case("d3d9.dll"))
+        && pe.imports().is_ok_and(|imports| imports.flatten().any(|symbol| {
+            symbol.library().eq_ignore_ascii_case(b"d3d9.dll")
+                && matches!(symbol.name(), NameOrOrdinal::Name(name)
+                    if D3D9_CREATORS.iter().any(|creator| creator.strip_suffix(&[0]) == Some(name)))
+        }));
+    (out, imports_d3d9_creator)
 }
 
 #[cfg(test)]

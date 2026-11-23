@@ -225,6 +225,27 @@ mod tests {
     }
 
     #[test]
+    fn d3d12_import_takes_priority_over_unlinked_d3d9_probes() {
+        let mut executable = pe64_importing("d3d12.dll");
+        executable[0x230..0x23a].fill(0);
+        executable[0x250..0x25a].copy_from_slice(b"d3d12.dll\0");
+        executable[0x20c..0x210].copy_from_slice(&0x1050u32.to_le_bytes());
+        executable[0x200..0x204].copy_from_slice(&0x1080u32.to_le_bytes());
+        executable[0x280..0x288].copy_from_slice(&0x10b0u64.to_le_bytes());
+        executable[0x2b2..0x2c3].copy_from_slice(b"D3D12CreateDevice");
+        executable[0x220..0x224].copy_from_slice(&0x1060u32.to_le_bytes());
+        executable[0x260..0x269].copy_from_slice(b"d3d9.dll\0");
+        executable[0x214..0x218].copy_from_slice(&0x1070u32.to_le_bytes());
+        executable[0x270..0x278].copy_from_slice(&0x1090u64.to_le_bytes());
+        executable[0x292..0x2a2].copy_from_slice(b"D3DPERF_EndEvent");
+        executable.extend_from_slice(b"Direct3DCreate9\0Direct3DCreate9Ex\0");
+        assert_eq!(pe::scan_bytes(&executable).all(), ApiSet(ApiSet::D3D12));
+
+        executable[0x292..0x2a2].copy_from_slice(b"Direct3DCreate9\0");
+        assert_eq!(pe::scan_bytes(&executable).all(), ApiSet(ApiSet::D3D12 | ApiSet::D3D9));
+    }
+
+    #[test]
     fn unity_detects_graphics_api_in_player_dll() {
         let t = tempfile::tempdir().unwrap();
         let root = t.path();
