@@ -29,7 +29,7 @@ struct State {
     /// Indices into `games` currently shown (after the search filter).
     view: Vec<usize>,
     filter: String,
-    folders: Vec<PathBuf>,
+    folders: ManualFolders,
     recomp_icons: HashMap<PathBuf, art::Pixels>,
     shown_root: Option<PathBuf>,
     requested_root: Option<PathBuf>,
@@ -42,23 +42,60 @@ struct State {
 
 type Shared = Arc<Mutex<State>>;
 
-fn folders_file() -> PathBuf {
-    paths::data_dir().join("folders.txt")
+const GAME_FOLDERS_FILE: &str = "game-folders.txt";
+const LIBRARY_FOLDERS_FILE: &str = "library-folders.txt";
+
+#[derive(Clone, Default)]
+struct ManualFolders {
+    legacy: Vec<PathBuf>,
+    games: Vec<PathBuf>,
+    libraries: Vec<PathBuf>,
 }
 
-fn load_folders() -> Vec<PathBuf> {
-    std::fs::read_to_string(folders_file())
+fn load_folders(file: &str) -> Vec<PathBuf> {
+    std::fs::read_to_string(paths::data_dir().join(file))
         .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).collect())
         .unwrap_or_default()
 }
 
-fn save_folders(folders: &[PathBuf]) -> std::io::Result<()> {
+fn save_folders(file: &str, folders: &[PathBuf]) -> std::io::Result<()> {
     std::fs::create_dir_all(paths::data_dir())?;
     let text: String = folders.iter().map(|p| format!("{}\n", p.display())).collect();
-    let path = folders_file();
+    let path = paths::data_dir().join(file);
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&temp, text)?;
     std::fs::rename(temp, path)
+}
+
+fn add_folder(ui: &MainWindow, state: &Shared, library: bool) {
+    let (title, file) = if library {
+        ("Select a folder containing game folders", LIBRARY_FOLDERS_FILE)
+    } else {
+        ("Select the game's installation folder", GAME_FOLDERS_FILE)
+    };
+    let Some(dir) = rfd::FileDialog::new().set_title(title).pick_folder() else { return };
+    let key = tessera_core::library::install_key(&dir);
+    let matches = |path: &Path| tessera_core::library::install_key(path) == key;
+    {
+        let mut st = state.lock().unwrap();
+        if !library && (st.games.iter().any(|game| matches(&game.entry.root)) ||
+            st.folders.legacy.iter().any(|folder| matches(folder))) {
+            ui.set_status_text("This game folder is already in the library.".into());
+            return;
+        }
+        let folders = if library { &mut st.folders.libraries } else { &mut st.folders.games };
+        if folders.iter().any(|folder| matches(folder)) {
+            ui.set_status_text("This folder has already been added.".into());
+            return;
+        }
+        folders.push(dir);
+        if let Err(e) = save_folders(file, folders) {
+            folders.pop();
+            ui.set_status_text(format!("Could not save the folder: {e}").into());
+            return;
+        }
+    }
+    refresh(ui, state, (!library).then_some(key));
 }
 
 fn status_label(s: &InstallState) -> String {
@@ -820,7 +857,9 @@ fn refresh(ui: &MainWindow, state: &Shared, added: Option<String>) {
     let folders = state.lock().unwrap().folders.clone();
     std::thread::spawn(move || {
         let t = std::time::Instant::now();
-        let games = tessera_core::analyze_all(tessera_core::discover(&folders));
+        let games = tessera_core::analyze_all(tessera_core::library::discover_with_folders(
+            &folders.legacy, &folders.games, &folders.libraries,
+        ));
         let recomp_icons = games.iter().filter(|game| game.entry.store == Store::Recomp)
             .filter_map(|game| Some((game.entry.root.clone(), art::icon(game)?))).collect();
         let ms = t.elapsed().as_millis();
@@ -1092,7 +1131,14 @@ fn main() -> Result<(), slint::PlatformError> {
         return Ok(());
     }
     let ui = MainWindow::new()?;
-    let state: Shared = Arc::new(Mutex::new(State { folders: load_folders(), ..Default::default() }));
+    let state: Shared = Arc::new(Mutex::new(State {
+        folders: ManualFolders {
+            legacy: load_folders("folders.txt"),
+            games: load_folders(GAME_FOLDERS_FILE),
+            libraries: load_folders(LIBRARY_FOLDERS_FILE),
+        },
+        ..Default::default()
+    }));
 
     {
         let (w, s) = (ui.as_weak(), state.clone());
@@ -1108,26 +1154,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());
-        ui.on_add_folder(move || {
-            let ui = w.unwrap();
-            let Some(dir) = rfd::FileDialog::new().set_title("Select the game's installation folder").pick_folder() else { return };
-            let key = tessera_core::library::install_key(&dir);
-            {
-                let mut st = s.lock().unwrap();
-                if st.games.iter().any(|game| tessera_core::library::install_key(&game.entry.root) == key) ||
-                    st.folders.iter().any(|folder| tessera_core::library::install_key(folder) == key) {
-                    ui.set_status_text("This game folder is already in the library.".into());
-                    return;
-                }
-                st.folders.push(dir);
-                if let Err(e) = save_folders(&st.folders) {
-                    st.folders.pop();
-                    ui.set_status_text(format!("Could not save the game folder: {e}").into());
-                    return;
-                }
-            }
-            refresh(&ui, &s, Some(key));
-        });
+        ui.on_add_folder(move |library| add_folder(&w.unwrap(), &s, library));
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());

@@ -1064,7 +1064,7 @@ export component MainWindow inherits Window {
     callback hover-game(int);
     callback reset-safe-mode(int);
     callback warm-shaders(int);
-    callback add-folder();
+    callback add-folder(bool);
     callback filter-changed(string);
     callback install(int);
     callback uninstall(int);
@@ -1089,7 +1089,8 @@ export component MainWindow inherits Window {
                 padding-bottom: 8px;
                 spacing: 2px;
                 alignment: start;
-                Btn { flat: true; icon: "\u{E8F4}"; text: "Add game"; enabled: !root.busy; clicked => { root.add-folder(); } }
+                Btn { flat: true; icon: "\u{E8F4}"; text: "Add game folder"; enabled: !root.busy; clicked => { root.add-folder(false); } }
+                Btn { flat: true; icon: "\u{E8B7}"; text: "Add library folder"; enabled: !root.busy; clicked => { root.add-folder(true); } }
                 Btn { flat: true; icon: "\u{E72C}"; text: "Refresh"; enabled: !root.busy; clicked => { root.refresh(); } }
                 ToolSep { }
                 if !root.has-sel || !root.cur.installed: Btn {

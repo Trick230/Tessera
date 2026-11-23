@@ -36,9 +36,16 @@ pub struct GameEntry {
 
 /// All games from every source, deduplicated by install folder.
 pub fn discover(manual: &[PathBuf]) -> Vec<GameEntry> {
+    discover_with_folders(manual, &[], &[])
+}
+
+/// Adds explicitly selected games and the immediate game folders in each library.
+pub fn discover_with_folders(legacy: &[PathBuf], games: &[PathBuf], libraries: &[PathBuf]) -> Vec<GameEntry> {
     let mut out = steam_games();
     out.extend(epic_games());
-    out.extend(manual_games(manual));
+    out.extend(games.iter().filter_map(|root| game_folder(root)));
+    out.extend(manual_games(legacy));
+    out.extend(libraries.iter().flat_map(|root| library_games(root)));
     let mut seen = HashSet::new();
     let mut recomp_exes = HashSet::new();
     out.retain(|g| {
@@ -61,16 +68,26 @@ fn manual_games(manual: &[PathBuf]) -> Vec<GameEntry> {
                 continue;
             }
         }
-        if root.is_dir() {
-            if let Some(game) = crate::recomp::game(root) {
-                out.push(game);
-                continue;
-            }
-            let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            out.push(GameEntry { name, root: root.clone(), store: Store::Manual, exe_hint: None, steam_appid: None });
-        }
+        out.extend(game_folder(root));
     }
     out
+}
+
+fn game_folder(root: &Path) -> Option<GameEntry> {
+    if !root.is_dir() {
+        return None;
+    }
+    crate::recomp::game(root).or_else(|| {
+        let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        Some(GameEntry { name, root: root.to_path_buf(), store: Store::Manual, exe_hint: None, steam_appid: None })
+    })
+}
+
+fn library_games(root: &Path) -> impl Iterator<Item = GameEntry> {
+    std::fs::read_dir(root).into_iter().flatten().flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| game_folder(&entry.path()))
+        .filter(|game| crate::game::find_main_exe(&game.root, game.exe_hint.as_deref()).is_some())
 }
 
 pub fn install_key(root: &Path) -> String {
@@ -427,6 +444,24 @@ fn parse_epic_preview(text: &str) -> Vec<GameEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_folders_list_games_while_single_folders_stay_single() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("Recompiled Games");
+        let first = library.join("First");
+        let second = library.join("Second");
+        let data = library.join("Data");
+        for folder in [&first, &second, &data] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        std::fs::write(first.join("ExampleRecomp.exe"), []).unwrap();
+        std::fs::write(second.join("Another.exe"), []).unwrap();
+
+        assert_eq!(game_folder(&first).unwrap().root, first);
+        let roots: HashSet<_> = library_games(&library).map(|game| game.root).collect();
+        assert_eq!(roots, HashSet::from([first, second]));
+    }
 
     #[test]
     fn epic_manifest_reader_keeps_installed_games() {
