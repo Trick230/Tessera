@@ -42,6 +42,7 @@ pub struct ShaderCheck {
     pub locked_unreal_paks: u64,
     pub auto_key_archives: u64,
     pub glsl: u64,
+    pub spirv: Option<u64>,
     /// Whether the install changed since the last scan (None: never scanned
     /// or install folder unknown).
     pub scan_outdated: Option<bool>,
@@ -152,6 +153,7 @@ pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&
         c.locked_unreal_paks = r.locked_unreal_paks.unwrap_or(0);
         c.auto_key_archives = r.auto_key_archives.unwrap_or(0);
         c.glsl = r.glsl.unwrap_or(0);
+        c.spirv = r.spirv;
         c.scan_outdated = install_key.map(|k| k != r.key);
     }
     c

@@ -167,7 +167,9 @@ fn row(g: &GameInfo, icon: Option<&art::Pixels>) -> GameRow {
         blocked: !g.anticheat.is_empty(),
         can_install: g.can_install(),
         d3d11: can_prepare(g),
-        scan_shaders: can_scan_gl(g),
+        scan_shaders: g.exe.is_some() && g.graphics_apis().has(
+            tessera_core::pe::ApiSet::OPENGL | tessera_core::pe::ApiSet::VULKAN,
+        ),
         icon: icon.cloned().map(slint::Image::from_rgba8).unwrap_or_default(),
         initial: s(g.entry.name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_default()),
     }
@@ -184,10 +186,6 @@ fn can_prepare(g: &GameInfo) -> bool {
         g.scan.architecture.is_some() && all.has(tessera_core::pe::ApiSet::D3D11)
             && (!all.has(tessera_core::pe::ApiSet::D3D12) || ff7_dx11 || tessera_core::shaders::stats(e).shaders > 0)
     })
-}
-
-fn can_scan_gl(g: &GameInfo) -> bool {
-    g.exe.is_some() && g.graphics_apis().has(tessera_core::pe::ApiSet::OPENGL)
 }
 
 fn num(v: f64, decimals: usize) -> String {
@@ -454,7 +452,7 @@ fn shader_state(
     c: &ShaderCheck,
     run: Option<(u64, u64)>,
     can_prepare: bool,
-    scan_gl: bool,
+    apis: tessera_core::pe::ApiSet,
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<&tessera_core::driver::NvidiaGameCache>,
 ) -> ShaderState {
@@ -470,6 +468,9 @@ fn shader_state(
         tone: if c.stored == 0 && tone == OK { NEUTRAL } else { tone },
     };
     let mut rows = Vec::new();
+    let scan_gl = apis.has(tessera_core::pe::ApiSet::OPENGL);
+    let scan_vulkan = apis.has(tessera_core::pe::ApiSet::VULKAN);
+    let scan_only = !can_prepare && (scan_gl || scan_vulkan);
 
     if c.auto_key_archives > 0 && c.scan_outdated == Some(false) {
         rows.push(line("Unreal archive keys", "Detected".to_string(), vec![
@@ -501,6 +502,14 @@ fn shader_state(
         rows.push(line("OpenGL shaders", value, vec![detail.to_string()], NEUTRAL));
     }
 
+    if scan_vulkan {
+        let (value, detail) = match c.spirv.filter(|_| c.scan_outdated == Some(false)) {
+            Some(n) => (format!("{} found", count(n)), "SPIR-V modules found in .spv files and ZIP archives."),
+            None => ("Scan available".to_string(), "Search the game files for SPIR-V shader modules."),
+        };
+        rows.push(line("Vulkan shaders", value, vec![detail.to_string()], NEUTRAL));
+    }
+
     let mut d = Vec::new();
     let (value, tone) = if c.stored == 0 {
         ("Not measured".to_string(), NEUTRAL)
@@ -511,7 +520,7 @@ fn shader_state(
     if c.compiled > 0 {
         d.push("Prepared shaders passed a D3D11 execution test on the current driver.".to_string());
     }
-    if c.stored == 0 && (can_prepare || !scan_gl) {
+    if c.stored == 0 && !scan_only {
         d.push(if can_prepare {
             "Prepare shaders searches the game files for bytecode, and the layer captures more during play."
         } else {
@@ -548,7 +557,9 @@ fn shader_state(
         let usage = if cache.bytes == 0 { "0 KB".to_string() } else { size(cache.bytes) };
         d.push(format!("NVIDIA shader cache uses {usage}."));
     }
-    rows.push(line("Shaders", value, d, tone));
+    if can_prepare || !scan_vulkan {
+        rows.push(line("Shaders", value, d, tone));
+    }
 
     // Newly captured shaders from the last recorded game session.
     let (value, tone, d) = match run {
@@ -565,7 +576,7 @@ fn shader_state(
             vec!["Play once with the D3D11 layer on to capture shaders created during play.".to_string()],
         ),
     };
-    if can_prepare || !scan_gl {
+    if !scan_only {
         rows.push(line("Last game session", value, d, tone));
     }
 
@@ -591,7 +602,7 @@ fn shader_state(
     // Scan freshness and driver compatibility can change independently.
     let mut d = Vec::new();
     if c.scan_outdated == Some(true) {
-        let action = if !can_prepare && scan_gl { "Scan shaders" } else { "Prepare shaders" };
+        let action = if scan_only { "Scan shaders" } else { "Prepare shaders" };
         d.push(format!("Run {action} to refresh the game file scan."));
     }
     if c.old_driver > 0 {
@@ -762,7 +773,7 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
         _ => (GameSettings::default(), None),
     };
     let shaders = view.shader_check.as_ref().map_or_else(ShaderState::default, |check| {
-        shader_state(check, view.run, can_prepare(game), can_scan_gl(game), view.pak_key, view.disk_cache.as_ref())
+        shader_state(check, view.run, can_prepare(game), game.graphics_apis(), view.pak_key, view.disk_cache.as_ref())
     });
 
     // Publish the models and selection together before the next frame.
@@ -952,11 +963,12 @@ fn payload_path(architecture: Architecture) -> PathBuf {
 /// install changed), then compiles everything stored in the driver, off the
 /// UI thread.
 fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
-    let Some((exe, root, prepare, architecture)) = ({
+    let Some((exe, root, prepare, architecture, vulkan)) = ({
         let st = state.lock().unwrap();
         st.view.get(view_idx as usize).and_then(|&gi| {
             let g = &st.games[gi];
-            g.exe.clone().map(|e| (e, g.entry.root.clone(), can_prepare(g), g.scan.architecture))
+            let vulkan = g.graphics_apis().has(tessera_core::pe::ApiSet::VULKAN);
+            g.exe.clone().map(|e| (e, g.entry.root.clone(), can_prepare(g), g.scan.architecture, vulkan))
         })
     }) else {
         return;
@@ -974,7 +986,7 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         };
         let mut found = String::new();
         let running = tessera_core::warm::is_running(&exe);
-        if !running && (!prepare || !tessera_core::scan::up_to_date(&exe, &root)) {
+        if !running && (!prepare || !tessera_core::scan::up_to_date(&exe, &root, vulkan)) {
             status("Searching the game files for shaders (read only)…");
             match scan_isolated(&exe, &root) {
                 Ok(n) => found = format!("{n} found in the files, "),
@@ -1181,11 +1193,11 @@ fn scan_isolated(exe: &Path, root: &Path) -> Result<u64, String> {
 }
 
 /// `tessera.exe --scan <game exe> <install folder>`: the child side of
-/// scan_isolated. Prints the total of D3D11 bytecode and GLSL sources found.
+/// scan_isolated. Prints the total of D3D11 bytecode, GLSL sources and SPIR-V modules found.
 fn scan_child(args: &[String]) -> i32 {
     match tessera_core::scan::scan_game(Path::new(&args[0]), Path::new(&args[1])) {
         Ok(st) => {
-            println!("{}", st.usable + st.glsl);
+            println!("{}", st.usable + st.glsl + st.spirv);
             0
         }
         Err(e) => {

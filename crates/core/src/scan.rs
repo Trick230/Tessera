@@ -39,6 +39,7 @@ pub struct ScanStats {
     /// Containers found (before dedupe), by where they were.
     pub raw: u64,
     pub glsl: u64,
+    pub spirv: u64,
     pub cpk_entries: u64,
     pub dcx_entries: u64,
     pub zip_entries: u64,
@@ -242,6 +243,7 @@ struct Found {
     shaders: HashMap<u64, Shader>,
     skipped: HashMap<u64, ()>,
     glsl: HashSet<u128>,
+    spirv: HashSet<u128>,
     stats: ScanStats,
     oodle: Option<Oodle>,
 }
@@ -273,6 +275,7 @@ impl Found {
         }
         self.skipped.extend(o.skipped);
         self.glsl.extend(o.glsl);
+        self.spirv.extend(o.spirv);
         self
     }
 
@@ -282,14 +285,20 @@ impl Found {
         for i in 0..archive.len() {
             let Ok(entry) = archive.by_index(i) else { continue };
             let size = entry.size();
-            if !entry.is_file() || entry.compression() == zip::CompressionMethod::Stored ||
-                !(MIN_FILE..=STREAM_CAP).contains(&size) {
+            let spirv = is_spv_path(Path::new(entry.name()));
+            let stored = entry.compression() == zip::CompressionMethod::Stored;
+            if !entry.is_file() || (stored && !spirv) || !(MIN_FILE..=STREAM_CAP).contains(&size) {
                 continue;
             }
             out.clear();
             if entry.take(size + 1).read_to_end(&mut out).is_ok() && out.len() as u64 == size {
-                self.stats.zip_entries += 1;
-                self.search(&out, 1);
+                if spirv {
+                    self.record_spirv(&out);
+                }
+                if !stored {
+                    self.stats.zip_entries += 1;
+                    self.search(&out, 1);
+                }
             }
         }
     }
@@ -370,6 +379,12 @@ impl Found {
                 continue;
             }
             self.glsl.insert(xxhash_rust::xxh3::xxh3_128(source));
+        }
+    }
+
+    fn record_spirv(&mut self, bytes: &[u8]) {
+        if let Some(hash) = spirv_hash(bytes) {
+            self.spirv.insert(hash);
         }
     }
 
@@ -562,6 +577,63 @@ fn read_capped<R: Read>(r: Option<R>, out: &mut Vec<u8>) -> bool {
     !out.is_empty()
 }
 
+fn is_spv_path(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("spv"))
+}
+
+/// Recognises a complete shader module at a file or archive entry boundary.
+/// Checks the binary structure without validating device-specific capabilities.
+fn spirv_hash(bytes: &[u8]) -> Option<u128> {
+    const MAGIC: u32 = 0x0723_0203;
+    if bytes.len() < 20 || bytes.len() % 4 != 0 {
+        return None;
+    }
+    let read = match u32_at(bytes, 0) {
+        MAGIC => u32::from_le_bytes,
+        magic if magic == MAGIC.swap_bytes() => u32::from_be_bytes,
+        _ => return None,
+    };
+    let word = |offset| read(bytes[offset..offset + 4].try_into().unwrap());
+    let version = word(4);
+    let bound = word(12);
+    if version & 0xffff_00ff != 0x0001_0000 || bound == 0 || word(16) != 0 {
+        return None;
+    }
+    let (mut memory_model, mut entry_point, mut function_end) = (false, false, false);
+    let mut offset = 20;
+    while offset < bytes.len() {
+        let instruction = word(offset);
+        let words = (instruction >> 16) as usize;
+        let end = offset + words * 4;
+        if words == 0 || end > bytes.len() {
+            return None;
+        }
+        match instruction as u16 {
+            14 if words == 3 => memory_model = matches!(word(offset + 8), 1 | 3), // OpMemoryModel
+            15 if words >= 4 => { // OpEntryPoint
+                let id = word(offset + 8);
+                entry_point |= matches!(word(offset + 4), 0..=5 | 5267..=5268 | 5313..=5318 | 5364..=5365)
+                    && id > 0 && id < bound && bytes[offset + 12..end].contains(&0);
+            }
+            56 if words == 1 => function_end = true, // OpFunctionEnd
+            _ => {}
+        }
+        offset = end;
+    }
+    if !(memory_model && entry_point && function_end) {
+        return None;
+    }
+    if u32_at(bytes, 0) == MAGIC {
+        return Some(xxhash_rust::xxh3::xxh3_128(bytes));
+    }
+    // Deduplicate equivalent modules encoded in the opposite byte order.
+    let mut hash = xxhash_rust::xxh3::Xxh3::new();
+    for offset in (0..bytes.len()).step_by(4) {
+        hash.update(&word(offset).to_le_bytes());
+    }
+    Some(hash.digest128())
+}
+
 fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>) -> Found {
     let mut f = Found { oodle, ..Found::default() };
     let Ok(file) = fs::File::open(path) else { return f };
@@ -597,6 +669,9 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>) -> Found {
     }
     if extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll") {
         f.search_glsl(&map);
+    }
+    if is_spv_path(path) {
+        f.record_spirv(&map);
     }
     f
 }
@@ -636,6 +711,7 @@ fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
     stats.usable = shaders.len() as u64;
     stats.skipped = found.skipped.len() as u64;
     stats.glsl = found.glsl.len() as u64;
+    stats.spirv = found.spirv.len() as u64;
     (shaders, stats)
 }
 
@@ -742,6 +818,7 @@ pub struct ScanRecord {
     pub locked_unreal_paks: Option<u64>,
     pub auto_key_archives: Option<u64>,
     pub glsl: Option<u64>,
+    pub spirv: Option<u64>,
 }
 
 pub fn record_at(base: &Path) -> Option<ScanRecord> {
@@ -754,13 +831,15 @@ pub fn record_at(base: &Path) -> Option<ScanRecord> {
         unreal_packages: value("unreal_packages "), unreadable_unreal_packages: value("unreadable_unreal_packages "),
         locked_unreal_paks: value("locked_unreal_paks "),
         auto_key_archives: value("auto_key_archives "),
-        glsl: value("glsl "),
+        glsl: value("glsl "), spirv: value("spirv "),
     })
 }
 
 /// True when the scan store matches the install as it is now.
-pub fn up_to_date(exe: &Path, root: &Path) -> bool {
-    scan_base(exe).and_then(|b| record_at(&b)).is_some_and(|r| r.key == install_key(exe, root))
+pub fn up_to_date(exe: &Path, root: &Path, require_spirv: bool) -> bool {
+    scan_base(exe).and_then(|b| record_at(&b)).is_some_and(|r| {
+        (!require_spirv || r.spirv.is_some()) && r.key == install_key(exe, root)
+    })
 }
 
 /// The key of the install as it is now (walks the folder's file metadata).
@@ -781,9 +860,9 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     shaders.retain(|s| !stored.contains(&s.hash));
     crate::shaders::write_base(&base, &shaders)?;
     fs::write(key_path(&base), format!(
-        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\n",
+        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\nspirv {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\n",
         stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks,
-        detected.count(), stats.glsl, stats.cpk_entries, stats.dcx_entries, stats.zip_entries, stats.apk_entries
+        detected.count(), stats.glsl, stats.spirv, stats.cpk_entries, stats.dcx_entries, stats.zip_entries, stats.apk_entries
     ))?;
     Ok(stats)
 }
@@ -810,6 +889,49 @@ mod tests {
         assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
         assert_eq!(stats.zip_entries, 1);
         assert_eq!(stats.glsl, 1);
+    }
+
+    #[test]
+    fn counts_complete_spirv_modules_in_files_and_zip_entries() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let module: [u32; 35] = [
+            0x0723_0203, 0x0001_0000, 0, 5, 0,
+            0x0002_0011, 1, // OpCapability Shader
+            0x0003_000e, 0, 1, // OpMemoryModel Logical GLSL450
+            0x0005_000f, 5, 3, 0x6e69_616d, 0, // OpEntryPoint GLCompute %3 "main"
+            0x0006_0010, 3, 17, 1, 1, 1, // OpExecutionMode %3 LocalSize
+            0x0002_0013, 1, // OpTypeVoid
+            0x0003_0021, 2, 1, // OpTypeFunction
+            0x0005_0036, 1, 3, 0, 2, // OpFunction
+            0x0002_00f8, 4, // OpLabel
+            0x0001_00fd, // OpReturn
+            0x0001_0038, // OpFunctionEnd
+        ];
+        let bytes: Vec<_> = module.into_iter().flat_map(u32::to_le_bytes).collect();
+        let swapped: Vec<_> = module.into_iter().flat_map(u32::to_be_bytes).collect();
+        assert!(spirv_hash(&bytes).is_some());
+        assert_eq!(spirv_hash(&bytes), spirv_hash(&swapped));
+        assert!(spirv_hash(&bytes[..bytes.len() - 8]).is_none());
+        fs::write(dir.path().join("loose.SPV"), &bytes).unwrap();
+        fs::write(dir.path().join("partial.spv"), &bytes[..bytes.len() - 8]).unwrap();
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (i, compression) in [zip::CompressionMethod::Deflated, zip::CompressionMethod::Stored].into_iter().enumerate() {
+            archive.start_file(format!("shader/{i}.spv"), zip::write::SimpleFileOptions::default()
+                .compression_method(compression)).unwrap();
+            let mut distinct = module;
+            // Give the module a different local size and use big-endian encoding.
+            distinct[18] += 1 + i as u32;
+            let distinct: Vec<_> = distinct.into_iter().flat_map(u32::to_be_bytes).collect();
+            archive.write_all(&distinct).unwrap();
+        }
+        archive.start_file("shader/copy.spv", zip::write::SimpleFileOptions::default()).unwrap();
+        archive.write_all(&swapped).unwrap();
+        fs::write(dir.path().join("shaders.zip"), archive.finish().unwrap().into_inner()).unwrap();
+        let (shaders, stats) = scan_dir(dir.path());
+        assert!(shaders.is_empty());
+        assert_eq!(stats.spirv, 3);
     }
 
     /// A minimal container: one SHEX part with the given version token.
