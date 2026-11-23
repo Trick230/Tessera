@@ -881,7 +881,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 13 {:016x}", key.finish())
+    format!("tessera-scan 14 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -1430,6 +1430,12 @@ mod tests {
 
     #[test]
     fn extracts_unreal_shader_libraries_and_resolves_shared_iostore_groups() {
+        for hash_size in [20, 8] {
+            check_unreal_shader_libraries(hash_size);
+        }
+    }
+
+    fn check_unreal_shader_libraries(hash_size: usize) {
         fn number(out: &mut Vec<u8>, n: u32) { out.extend_from_slice(&n.to_le_bytes()); }
         fn table(out: &mut Vec<u8>, size: u32, bytes: &[u8]) {
             number(out, size);
@@ -1472,7 +1478,7 @@ mod tests {
 
         let mut library = 1u32.to_le_bytes().to_vec();
         table(&mut library, 0, &[]);
-        table(&mut library, 2, &[0; 40]);
+        table(&mut library, 2, &vec![0; 2 * hash_size]);
         table(&mut library, 1, &group_id);
         table(&mut library, 0, &[]);
         number(&mut library, 2);
@@ -1488,7 +1494,7 @@ mod tests {
 
         let mut standalone = 2u32.to_le_bytes().to_vec();
         table(&mut standalone, 0, &[]);
-        table(&mut standalone, 1, &[0; 20]);
+        table(&mut standalone, 1, &vec![0; hash_size]);
         table(&mut standalone, 0, &[]);
         number(&mut standalone, 1);
         standalone.extend_from_slice(&0u64.to_le_bytes());

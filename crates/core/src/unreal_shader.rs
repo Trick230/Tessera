@@ -39,7 +39,12 @@ pub(crate) fn scan_file(mut data: &[u8], oodle: Option<Oodle>,
     let (entries, stride, hash_size) = match number(&mut data)? {
         // Early UE4 libraries serialized a map from SHA-1 to code entry.
         1 => (array(&mut data, 37)?, 37, 20),
-        2 => (serialized_entries(&mut data)?, 17, 0),
+        2 => {
+            let (entries, code) = serialized_entries(data, 20)
+                .or_else(|| serialized_entries(data, 8))?;
+            data = code;
+            (entries, 17, 0)
+        }
         _ => return None,
     };
     let mut out = Vec::new();
@@ -58,15 +63,15 @@ pub(crate) fn scan_file(mut data: &[u8], oodle: Option<Oodle>,
     Some((entries.len() / stride) as u64)
 }
 
-fn serialized_entries<'a>(data: &mut &'a [u8]) -> Option<&'a [u8]> {
-    let map_hashes = array(data, 20)?;
-    let shader_hashes = array(data, 20)?;
-    let maps = array(data, 16)?;
-    let entries = array(data, 17)?;
-    array(data, 16)?; // Preload ranges.
-    array(data, 4)?; // Shader-map indices.
-    (map_hashes.len() / 20 == maps.len() / 16 && shader_hashes.len() / 20 == entries.len() / 17)
-        .then_some(entries)
+fn serialized_entries(mut data: &[u8], hash_size: usize) -> Option<(&[u8], &[u8])> {
+    let map_hashes = array(&mut data, hash_size)?;
+    let shader_hashes = array(&mut data, hash_size)?;
+    let maps = array(&mut data, 16)?;
+    let entries = array(&mut data, 17)?;
+    array(&mut data, 16)?; // Preload ranges.
+    array(&mut data, 4)?; // Shader-map indices.
+    (map_hashes.len() / hash_size == maps.len() / 16 &&
+        shader_hashes.len() / hash_size == entries.len() / 17).then_some((entries, data))
 }
 
 pub(crate) struct Groups<'a> {
@@ -79,15 +84,21 @@ pub(crate) struct Groups<'a> {
 impl<'a> Groups<'a> {
     pub(crate) fn parse(mut data: &'a [u8]) -> Option<Self> {
         if number(&mut data)? != 1 { return None; }
-        let map_hashes = array(&mut data, 20)?;
-        let shader_hashes = array(&mut data, 20)?;
+        // UE 5.8 switched both hash arrays to 64-bit values, while keeping
+        // the same library version and group descriptor layouts.
+        Self::parse_tables(data, 20).or_else(|| Self::parse_tables(data, 8))
+    }
+
+    fn parse_tables(mut data: &'a [u8], hash_size: usize) -> Option<Self> {
+        let map_hashes = array(&mut data, hash_size)?;
+        let shader_hashes = array(&mut data, hash_size)?;
         let ids = array(&mut data, 12)?;
         let maps = array(&mut data, 8)?;
         let shaders = array(&mut data, 8)?;
         let groups = array(&mut data, 16)?;
         let indices = array(&mut data, 4)?;
-        if !data.is_empty() || map_hashes.len() / 20 != maps.len() / 8 ||
-            shader_hashes.len() / 20 != shaders.len() / 8 || ids.len() / 12 != groups.len() / 16 {
+        if !data.is_empty() || map_hashes.len() / hash_size != maps.len() / 8 ||
+            shader_hashes.len() / hash_size != shaders.len() / 8 || ids.len() / 12 != groups.len() / 16 {
             return None;
         }
         Some(Self { ids, shaders, groups, indices })
