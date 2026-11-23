@@ -4,8 +4,9 @@
 
 use crate::engine::{self, Engine};
 use crate::install::{self, InstallState};
-use crate::library::GameEntry;
+use crate::library::{GameEntry, Store};
 use crate::pe::{self, ApiSet, ExeScan};
+use crate::recomp;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -28,6 +29,12 @@ impl GameInfo {
 
     /// Short API description for the UI, e.g. "D3D12, D3D11 (-dx11)".
     pub fn api_label(&self) -> String {
+        if let Some(backends) = recomp_backends(&self.entry, self.exe.as_deref()) {
+            return match backends.default_label {
+                Some(label) => label.into(),
+                None => backends.supported.names().join(", "),
+            };
+        }
         let all = self.scan.all();
         if all.is_empty() {
             return "Unknown API".into();
@@ -44,6 +51,13 @@ impl GameInfo {
     pub fn can_install(&self) -> bool {
         self.anticheat.is_empty() && self.exe.is_some() && self.scan.architecture.is_some() && self.scan.all().has(ApiSet::D3D11)
     }
+}
+
+fn recomp_backends(entry: &GameEntry, exe: Option<&Path>) -> Option<recomp::GraphicsBackends> {
+    if entry.store != Store::Recomp {
+        return None;
+    }
+    recomp::graphics_backends(exe?)
 }
 
 pub fn analyze(entry: GameEntry) -> GameInfo {
@@ -68,6 +82,10 @@ pub fn analyze(entry: GameEntry) -> GameInfo {
         }) {
             scan.referenced.0 |= ApiSet::OPENGL;
         }
+    }
+    if let Some(backends) = recomp_backends(&entry, exe.as_deref()) {
+        scan.imported.0 &= backends.supported.0;
+        scan.referenced.0 &= backends.supported.0;
     }
     let install = exe
         .as_deref()
@@ -183,13 +201,35 @@ mod tests {
         let game = analyze(GameEntry {
             name: "Game".into(),
             root: root.to_path_buf(),
-            store: crate::library::Store::Manual,
+            store: Store::Manual,
             exe_hint: None,
             steam_appid: None,
         });
         assert_eq!(game.engine, Engine::Unity);
         assert_eq!(game.api_label(), "D3D11");
         assert!(game.can_install());
+    }
+
+    #[test]
+    fn known_recomps_show_documented_windows_backends() {
+        for (exe, contents, expected) in [
+            ("UnleashedRecomp.exe", &b"d3d11.dll\0d3d12.dll\0vulkan-1.dll\0opengl32.dll\0"[..], "D3D12 (default)"),
+            ("BanjoRecompiled.exe", &b"no DLL names"[..], "D3D12, Vulkan"),
+            ("UnknownRecompiled.exe", &b"vulkan-1.dll\0"[..], "Vulkan"),
+        ] {
+            let t = tempfile::tempdir().unwrap();
+            std::fs::write(t.path().join(exe), contents).unwrap();
+            let game = analyze(GameEntry {
+                name: exe.into(),
+                root: t.path().into(),
+                store: Store::Recomp,
+                exe_hint: Some(exe.into()),
+                steam_appid: None,
+            });
+            assert_eq!(game.api_label(), expected, "{exe}");
+            assert!(!game.scan.all().has(ApiSet::D3D11), "{exe}");
+            assert!(!game.scan.all().has(ApiSet::OPENGL), "{exe}");
+        }
     }
 
     #[test]

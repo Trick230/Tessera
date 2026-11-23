@@ -5,9 +5,33 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::library::{GameEntry, Store};
+use crate::pe::ApiSet;
 
 fn compact(name: &str) -> String {
     name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
+}
+
+pub(crate) struct GraphicsBackends {
+    pub supported: ApiSet,
+    pub default_label: Option<&'static str>,
+}
+
+/// Documented Windows renderers for ports that can bundle unrelated API references.
+pub(crate) fn graphics_backends(exe: &Path) -> Option<GraphicsBackends> {
+    let stem = compact(exe.file_stem()?.to_str()?);
+    let (supported, default_label) = match stem.as_str() {
+        // hedge-dev/UnleashedRecomp: Video::CreateHostDevice.
+        "unleashedrecomp" | "unleashedrecompiled" => (ApiSet::D3D12 | ApiSet::VULKAN, Some("D3D12 (default)")),
+        // BanjoRecomp and Zelda64Recomp use RT64.
+        "banjorecomp" | "banjorecompiled" | "zelda64recomp" | "zelda64recompiled" =>
+            (ApiSet::D3D12 | ApiSet::VULKAN, None),
+        // TwilitRealm/dusklight's Windows backends.
+        "dusklight" => (ApiSet::D3D12 | ApiSet::D3D11 | ApiSet::VULKAN, None),
+        // The Shipwright and 2ship2harkinian READMEs document the Windows backends.
+        "shipofharkinian" | "soh" | "2ship2harkinian" | "2ship" => (ApiSet::D3D11 | ApiSet::OPENGL, None),
+        _ => return None,
+    };
+    Some(GraphicsBackends { supported: ApiSet(supported), default_label })
 }
 
 pub(crate) fn collection_for(path: &Path) -> Option<&Path> {
