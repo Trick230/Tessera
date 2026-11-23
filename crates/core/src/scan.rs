@@ -131,23 +131,31 @@ pub fn checksum(code: &[u8]) -> [u8; 16] {
     0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
     0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
     ];
-    fn block(st: &mut [u32; 4], b: &[u8]) {
-        let x = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
-        let [mut a, mut bb, mut c, mut d] = *st;
-        for i in 0..64 {
-            let (f, g) = match i / 16 {
+    #[inline(always)]
+    fn round<const R: usize>(state: [u32; 4], words: &[u32; 16]) -> [u32; 4] {
+        let [mut a, mut bb, mut c, mut d] = state;
+        for i in 0..16 {
+            let (f, g) = match R {
                 0 => ((bb & c) | (!bb & d), i),
                 1 => ((d & bb) | (!d & c), (5 * i + 1) % 16),
                 2 => (bb ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (bb | !d), (7 * i) % 16),
             };
-            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(x(g));
+            let f = f.wrapping_add(a).wrapping_add(K[R * 16 + i]).wrapping_add(words[g]);
             a = d;
             d = c;
             c = bb;
-            bb = bb.wrapping_add(f.rotate_left(S[(i / 16) * 4 + i % 4]));
+            bb = bb.wrapping_add(f.rotate_left(S[R * 4 + i % 4]));
         }
-        for (s, v) in st.iter_mut().zip([a, bb, c, d]) {
+        [a, bb, c, d]
+    }
+    fn block(st: &mut [u32; 4], b: &[u8; 64]) {
+        let words = std::array::from_fn(|i| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap()));
+        let state = round::<0>(*st, &words);
+        let state = round::<1>(state, &words);
+        let state = round::<2>(state, &words);
+        let state = round::<3>(state, &words);
+        for (s, v) in st.iter_mut().zip(state) {
             *s = s.wrapping_add(v);
         }
     }
@@ -155,7 +163,7 @@ pub fn checksum(code: &[u8]) -> [u8; 16] {
     let bits = (data.len() as u32).wrapping_mul(8);
     let mut st = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
     let full = data.len() - data.len() % 64;
-    for c in data[..full].chunks_exact(64) {
+    for c in data[..full].as_chunks::<64>().0 {
         block(&mut st, c);
     }
     let left = &data[full..];
@@ -652,21 +660,33 @@ fn volatile(p: &Path) -> bool {
 /// Identifies the install by the names, sizes and timestamps of its files.
 fn install_key(exe: &Path, root: &Path) -> String {
     use std::hash::{Hash, Hasher};
-    let mut paths = files(root);
-    paths.sort_unstable();
+    let mut dirs = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if kind.is_file() && !volatile(&path) {
+                // On Windows the directory entry already contains this metadata.
+                if let Ok(meta) = entry.metadata() {
+                    files.push((path, meta.len(), meta.modified().ok()));
+                }
+            }
+        }
+    }
+    files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut key = std::collections::hash_map::DefaultHasher::new();
     if let Some((path, _)) = unreal_key_file(exe) {
         path.hash(&mut key);
         fs::metadata(path).ok().and_then(|meta| meta.modified().ok()).hash(&mut key);
     }
-    for p in paths {
-        if volatile(&p) {
-            continue;
-        }
-        let Ok(m) = fs::metadata(&p) else { continue };
+    for (p, len, modified) in files {
         p.strip_prefix(root).unwrap_or(&p).hash(&mut key);
-        m.len().hash(&mut key);
-        m.modified().ok().hash(&mut key);
+        len.hash(&mut key);
+        modified.hash(&mut key);
     }
     format!("tessera-scan 6 {:016x}", key.finish())
 }

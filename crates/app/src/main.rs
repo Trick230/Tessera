@@ -7,6 +7,7 @@
 mod advanced;
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,8 +27,13 @@ struct State {
     view: Vec<usize>,
     filter: String,
     folders: Vec<PathBuf>,
-    /// Executable whose last session the detail panel shows (or is loading).
-    shown_exe: Option<PathBuf>,
+    shown_root: Option<PathBuf>,
+    requested_root: Option<PathBuf>,
+    hovered_root: Option<PathBuf>,
+    ready_views: HashMap<PathBuf, GameView>,
+    view_epoch: u64,
+    view_worker_running: bool,
+    settings_sync: Option<(GameInfo, u32)>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -195,17 +201,20 @@ fn session_info(exe: &Path) -> (SessionInfo, (u32, Option<u32>), Option<(u64, u6
     let s = |v: String| SharedString::from(v);
     let mut info = SessionInfo {
         safe_mode: session::safe_mode_active(exe),
-        shaders: s(shader_text(exe, None)),
         tiled_tier: -1,
         ..Default::default()
     };
-    let Some(path) = session::latest(exe) else { return (info, (0, None), None) };
+    let Some(path) = session::latest(exe) else {
+        info.shaders = s(shader_text(exe, None));
+        return (info, (0, None), None);
+    };
     info.present = true;
     let sum = match session::summarize_file(&path) {
         Ok(v) => v,
         Err(e) => {
             info.when = s(session_when(&path));
             info.note = s(format!("Could not read {}: {e}", path.display()));
+            info.shaders = s(shader_text(exe, None));
             return (info, (0, None), None);
         }
     };
@@ -367,28 +376,13 @@ fn session_info(exe: &Path) -> (SessionInfo, (u32, Option<u32>), Option<(u64, u6
 
 /// The Shaders tab: what the driver already compiled, how much of what the
 /// game uses is covered, what is damaged and what is out of date.
-fn shader_preview(exe: &Path, can_prepare: bool, scan_gl: bool) -> ShaderState {
-    let mut rows = Vec::new();
-    if can_prepare || !scan_gl {
-        let stored = tessera_core::warm::stored(exe).shaders;
-        let value = if stored == 0 { "Nothing stored".to_string() } else { format!("{stored} stored") };
-        rows.push(ShaderRow { label: "Shader preparation".into(), value: value.into(), ..Default::default() });
-    }
-    if scan_gl {
-        let record = tessera_core::scan::scan_base(exe).and_then(|base| tessera_core::scan::record_at(&base));
-        let value = record.and_then(|r| r.glsl).map_or_else(|| "Scan available".to_string(), |n| n.to_string());
-        rows.push(ShaderRow { label: "OpenGL shaders".into(), value: value.into(), ..Default::default() });
-    }
-    ShaderState { present: true, rows: ModelRc::new(VecModel::from(rows)) }
-}
-
 fn shader_state(
     c: &ShaderCheck,
     run: Option<(u64, u64)>,
     can_prepare: bool,
     scan_gl: bool,
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
-    disk_cache: Option<tessera_core::driver::NvidiaGameCache>,
+    disk_cache: Option<&tessera_core::driver::NvidiaGameCache>,
 ) -> ShaderState {
     const NEUTRAL: i32 = 0;
     const OK: i32 = 1;
@@ -635,99 +629,173 @@ fn game_settings(
     })
 }
 
-/// Loads the selected game's last session off the UI thread; a 1 h log is tens of MB.
-/// Skipped when the selected game did not change, unless `force`.
-fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
-    let game = st.view.get(view_idx as usize).map(|&gi| &st.games[gi]);
-    let exe = game.and_then(|g| g.exe.clone());
-    let dir = game.filter(|g| g.install.is_installed()).and_then(|g| g.exe_dir().map(Path::to_path_buf));
-    if !force && exe == st.shown_exe {
-        return;
-    }
-    st.shown_exe = exe.clone();
-    ui.set_hero(game.map(|g| steam_image(g, true)).unwrap_or_default());
-    *SETTINGS.lock().unwrap() = None;
-    // A newer load supersedes any still running, even for the same view index.
-    let gen = SESSION_GEN.fetch_add(1, Ordering::Relaxed) + 1;
-    ui.set_session(SessionInfo::default());
-    ui.set_settings(GameSettings::default());
-    let Some(exe) = exe else {
-        ui.set_shader_state(ShaderState::default());
-        return;
-    };
-    let root = game.map(|g| g.entry.root.clone());
-    let prepare = game.is_some_and(can_prepare);
-    let scan_gl = game.is_some_and(can_scan_gl);
-    let cached = SHADER_VIEWS.with(|views| {
-        let mut views = views.borrow_mut();
-        if force {
-            views.remove(&exe);
-        }
-        views.get(&exe).cloned()
-    });
-    ui.set_shader_state(cached.unwrap_or_else(|| shader_preview(&exe, prepare, scan_gl)));
-    let is_unreal = game.is_some_and(|g| matches!(g.engine, tessera_core::engine::Engine::Unreal { .. }));
-    let ue_exe = is_unreal.then(|| exe.clone());
-    let weak = ui.as_weak();
-    std::thread::spawn(move || {
-        // P1: before the settings card reads tessera.ini (NVAPI DRS takes tens of ms).
-        if let (Some(d), Some(name)) = (&dir, exe.file_name().and_then(|n| n.to_str())) {
-            let _ = install::note_external_limit(d, name);
-        }
-        let (info, budget, run) = session_info(&exe);
+#[derive(Default)]
+struct GameView {
+    session: SessionInfo,
+    budget: (u32, Option<u32>),
+    run: Option<(u64, u64)>,
+    facts: Option<advanced::Facts>,
+    shader_check: Option<ShaderCheck>,
+    pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
+    disk_cache: Option<tessera_core::driver::NvidiaGameCache>,
+}
+
+fn is_unreal(game: &GameInfo) -> bool {
+    matches!(game.engine, tessera_core::engine::Engine::Unreal { .. })
+}
+
+impl GameView {
+    fn read(game: &GameInfo) -> Self {
+        let Some(exe) = &game.exe else { return Self::default() };
+        let root = Some(game.entry.root.as_path());
+        let (session, budget, run) = session_info(exe);
         let gpus = tessera_core::driver::gpus();
-        let facts = dir.as_deref().map(|d| advanced::Facts::read(&exe, d, root.as_deref(), info.tiled_tier, &gpus));
-        // U1: slots from this build of the executable (an update moves them).
-        if let (Some(d), Some(e)) = (&dir, &ue_exe) {
-            let _ = install::apply_ue_cvars(d, e, ue_vram_mb(budget.0));
-        }
-        // GameSettings holds models (not Send); tessera.ini is tiny, read it on the UI thread.
-        let _ = weak.upgrade_in_event_loop(move |ui| {
-            if SESSION_GEN.load(Ordering::Relaxed) != gen {
-                return;
-            }
-            ui.set_session(info);
-            if let Some((gs, lists)) = dir.zip(facts).map(|(d, facts)| game_settings(&d, ue_exe, budget, facts)) {
-                *SETTINGS.lock().unwrap() = Some(lists);
-                ui.set_settings(gs);
-            }
-        });
-        // Reads whole stores (checksums): after the session, which shows first.
-        if SESSION_GEN.load(Ordering::Relaxed) != gen {
-            return;
-        }
-        let drivers: Vec<u64> = gpus
-            .iter()
+        let facts = game.exe_dir().filter(|_| game.install.is_installed())
+            .map(|dir| advanced::Facts::read(exe, dir, root, session.tiled_tier, &gpus));
+        let drivers: Vec<_> = gpus.iter()
             .filter_map(|g| tessera_core::driver::umd_version(&g.driver_version))
             .collect();
-        let check = tessera_core::shader_check::check(&exe, root.as_deref(), &drivers);
-        let pak_key = is_unreal.then(|| tessera_core::scan::unreal_key_status(&exe));
-        let disk_cache = tessera_core::driver::nvidia_game_cache(&exe);
-        let _ = weak.upgrade_in_event_loop(move |ui| {
-            if SESSION_GEN.load(Ordering::Relaxed) == gen {
-                let view = shader_state(&check, run, prepare, scan_gl, pak_key, disk_cache);
-                SHADER_VIEWS.with(|views| views.borrow_mut().insert(exe, view.clone()));
-                ui.set_shader_state(view);
-            }
-        });
-    });
+        Self {
+            session, budget, run, facts,
+            shader_check: Some(tessera_core::shader_check::check(exe, root, &drivers)),
+            pak_key: is_unreal(game).then(|| tessera_core::scan::unreal_key_status(exe)),
+            disk_cache: tessera_core::driver::nvidia_game_cache(exe),
+        }
+    }
 }
 
 static SESSION_GEN: AtomicU64 = AtomicU64::new(0);
-thread_local! {
-    static SHADER_VIEWS: std::cell::RefCell<std::collections::HashMap<PathBuf, ShaderState>> = Default::default();
+
+fn visible_index(st: &State, root: &Path) -> Option<i32> {
+    st.view.iter().position(|&gi| st.games[gi].entry.root == root).map(|i| i as i32)
+}
+
+fn show_requested_view(ui: &MainWindow, st: &mut State) {
+    let Some(root) = st.requested_root.as_ref() else { return };
+    let Some(index) = visible_index(st, root) else { return };
+    let Some(view) = st.ready_views.get(root) else { return };
+    let game = &st.games[st.view[index as usize]];
+    let (settings, lists) = match (view.facts, game.exe_dir()) {
+        (Some(facts), Some(dir)) => {
+            let (settings, lists) = game_settings(dir, game.exe.clone().filter(|_| is_unreal(game)), view.budget, facts);
+            (settings, Some(lists))
+        }
+        _ => (GameSettings::default(), None),
+    };
+    let shaders = view.shader_check.as_ref().map_or_else(ShaderState::default, |check| {
+        shader_state(check, view.run, can_prepare(game), can_scan_gl(game), view.pak_key, view.disk_cache.as_ref())
+    });
+
+    // Publish the models and selection together before the next frame.
+    SESSION_GEN.fetch_add(1, Ordering::Relaxed);
+    *SETTINGS.lock().unwrap() = lists;
+    ui.set_hero(steam_image(game, true));
+    ui.set_session(view.session.clone());
+    ui.set_settings(settings);
+    ui.set_shader_state(shaders);
+    ui.set_selected(index);
+    st.shown_root = st.requested_root.take();
+    st.settings_sync = game.install.is_installed().then(|| (game.clone(), view.budget.0));
+}
+
+enum ViewJob {
+    Read(GameInfo, u64),
+    SyncSettings(GameInfo, u32),
+}
+
+fn next_view_job(st: &mut State) -> Option<ViewJob> {
+    let unread = |game: &&GameInfo| !st.ready_views.contains_key(&game.entry.root);
+    if let Some(game) = st.requested_root.iter().chain(&st.hovered_root)
+        .find_map(|root| st.games.iter().filter(unread).find(|game| &game.entry.root == root)) {
+        return Some(ViewJob::Read(game.clone(), st.view_epoch));
+    }
+    if let Some((game, budget)) = st.settings_sync.take() {
+        return Some(ViewJob::SyncSettings(game, budget));
+    }
+    st.games.iter().find(unread).map(|game| ViewJob::Read(game.clone(), st.view_epoch))
+}
+
+fn start_view_worker(ui: &MainWindow, state: &Shared, st: &mut State) {
+    if st.view_worker_running {
+        return;
+    }
+    st.view_worker_running = true;
+    let weak = ui.as_weak();
+    let state = state.clone();
+    std::thread::spawn(move || loop {
+        let job = {
+            let mut st = state.lock().unwrap();
+            let Some(job) = next_view_job(&mut st) else {
+                st.view_worker_running = false;
+                return;
+            };
+            job
+        };
+        match job {
+            ViewJob::Read(game, epoch) => {
+                let view = GameView::read(&game);
+                let mut st = state.lock().unwrap();
+                if epoch != st.view_epoch {
+                    continue;
+                }
+                let root = game.entry.root;
+                let requested = st.requested_root.as_ref() == Some(&root);
+                st.ready_views.insert(root, view);
+                if requested {
+                    let state = state.clone();
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        let mut st = state.lock().unwrap();
+                        show_requested_view(&ui, &mut st);
+                        start_view_worker(&ui, &state, &mut st);
+                    });
+                }
+            }
+            ViewJob::SyncSettings(game, budget) => {
+                if let Some((dir, exe)) = game.exe_dir().zip(game.exe.as_deref()) {
+                    if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
+                        let _ = install::note_external_limit(dir, name);
+                    }
+                    if is_unreal(&game) {
+                        let _ = install::apply_ue_cvars(dir, exe, ue_vram_mb(budget));
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn request_view(ui: &MainWindow, state: &Shared, st: &mut State, index: i32, refresh: bool) {
+    let Some(&gi) = st.view.get(index as usize) else { return };
+    let root = st.games[gi].entry.root.clone();
+    if refresh {
+        invalidate_view(st, &root);
+    } else if st.shown_root.as_ref() == Some(&root) && ui.get_selected() == index &&
+        st.requested_root.as_ref() != Some(&root) {
+        st.requested_root = None;
+        return;
+    }
+    st.requested_root = Some(root);
+    show_requested_view(ui, st);
+    start_view_worker(ui, state, st);
+}
+
+fn invalidate_view(st: &mut State, root: &Path) {
+    st.ready_views.remove(root);
+    st.view_epoch += 1;
+    if st.settings_sync.as_ref().is_some_and(|(game, _)| game.entry.root == root) {
+        st.settings_sync = None;
+    }
 }
 
 fn apply_view(ui: &MainWindow, st: &mut State) {
     let f = st.filter.to_lowercase();
     st.view = (0..st.games.len()).filter(|&i| f.is_empty() || st.games[i].entry.name.to_lowercase().contains(&f)).collect();
     let rows: Vec<GameRow> = st.view.iter().map(|&i| row(&st.games[i])).collect();
-    let sel = ui.get_selected();
     ui.set_games(ModelRc::new(VecModel::from(rows)));
-    if sel >= st.view.len() as i32 {
-        ui.set_selected(-1);
+    ui.set_selected(st.shown_root.as_deref().and_then(|root| visible_index(st, root)).unwrap_or(-1));
+    if st.requested_root.as_deref().is_some_and(|root| visible_index(st, root).is_none()) {
+        st.requested_root = None;
     }
-    load_session(ui, st, ui.get_selected(), false);
 }
 
 fn refresh(ui: &MainWindow, state: &Shared, added: Option<String>) {
@@ -744,30 +812,33 @@ fn refresh(ui: &MainWindow, state: &Shared, added: Option<String>) {
             let mut st = state.lock().unwrap();
             let n = games.len();
             st.games = games;
-            SHADER_VIEWS.with(|views| views.borrow_mut().clear());
-            st.shown_exe = None; // a session may have been written since the last load
-            if added.is_some() {
-                ui.set_selected(-1);
-            }
+            st.ready_views.clear();
+            st.view_epoch += 1;
+            st.settings_sync = None;
             apply_view(&ui, &mut st);
-            if let Some(i) = added.as_ref().and_then(|key| st.view.iter().position(|&gi| {
+            let added_index = added.as_ref().and_then(|key| st.view.iter().position(|&gi| {
                 tessera_core::library::install_key(&st.games[gi].entry.root) == *key
-            })) {
-                ui.set_selected(i as i32);
-                load_session(&ui, &mut st, i as i32, false);
-            }
+            })).map(|i| i as i32);
             // TESSERA_SELECT=<name part>: preselect a game (scripted screenshots).
-            if let (true, Ok(want)) = (ui.get_selected() < 0, std::env::var("TESSERA_SELECT")) {
+            let scripted_index = if let (true, Ok(want)) = (ui.get_selected() < 0 && added_index.is_none(), std::env::var("TESSERA_SELECT")) {
                 let want = want.to_lowercase();
-                if let Some(i) = st.view.iter().position(|&gi| st.games[gi].entry.name.to_lowercase().contains(&want)) {
-                    ui.set_selected(i as i32);
-                    load_session(&ui, &mut st, i as i32, true);
+                let index = st.view.iter().position(|&gi| st.games[gi].entry.name.to_lowercase().contains(&want));
+                if index.is_some() {
                     // TESSERA_TAB=<0..4>: open that tab (4 = Textures) (scripted screenshots).
                     if let Some(t) = std::env::var("TESSERA_TAB").ok().and_then(|v| v.parse().ok()) {
                         ui.set_tab(t);
                     }
                 }
+                index.map(|i| i as i32)
+            } else {
+                None
+            };
+            if let Some(i) = added_index.or(scripted_index).or_else(|| {
+                st.requested_root.as_deref().and_then(|root| visible_index(&st, root))
+            }).or_else(|| (ui.get_selected() >= 0).then(|| ui.get_selected())) {
+                st.requested_root = st.view.get(i as usize).map(|&gi| st.games[gi].entry.root.clone());
             }
+            start_view_worker(&ui, &state, &mut st);
             ui.set_busy(false);
             ui.set_status_text(format!("{n} games found in {ms} ms").into());
         });
@@ -843,13 +914,16 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_busy(false);
             ui.set_status_text(msg.into());
-            SHADER_VIEWS.with(|views| views.borrow_mut().remove(&exe));
             // The selection may have moved while this ran: reload only this game.
             let mut st = state.lock().unwrap();
             let sel = ui.get_selected();
             let same = st.view.get(sel as usize).is_some_and(|&gi| st.games[gi].exe.as_deref() == Some(&exe));
             if same {
-                load_session(&ui, &mut st, sel, true);
+                request_view(&ui, &state, &mut st, sel, true);
+            } else if let Some(game) = st.games.iter().find(|g| g.exe.as_deref() == Some(&exe)) {
+                let root = game.entry.root.clone();
+                invalidate_view(&mut st, &root);
+                start_view_worker(&ui, &state, &mut st);
             }
         });
     });
@@ -876,7 +950,7 @@ fn layer_action(ui: &MainWindow, state: &Shared, view_idx: i32, do_install: bool
     };
     st.games[gi].install = install::state(&dir, install::PROXY_D3D11);
     apply_view(ui, &mut st);
-    load_session(ui, &mut st, view_idx, true); // the settings card follows the install state
+    request_view(ui, state, &mut st, view_idx, true); // the settings card follows the install state
     ui.set_status_text(msg.into());
 }
 
@@ -884,18 +958,23 @@ fn quality_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
     if ui.get_busy() {
         return;
     }
-    let exe = {
+    let target = {
         let st = state.lock().unwrap();
         st.view.get(view_idx as usize).and_then(|&i| {
             let game = &st.games[i];
-            (game.install.is_installed() && game.can_install()).then(|| game.exe.clone()).flatten()
+            if game.install.is_installed() && game.can_install() {
+                game.exe.clone().map(|exe| (exe, game.entry.root.clone()))
+            } else {
+                None
+            }
         })
     };
-    let Some(exe) = exe else { return };
+    let Some((exe, root)) = target else { return };
     let gen = SESSION_GEN.load(Ordering::Relaxed);
     ui.set_busy(true);
     ui.set_status_text("Preparing quality caches…".into());
     let weak = ui.as_weak();
+    let state = state.clone();
     std::thread::spawn(move || {
         let texcomp = app_dir().join(tessera_core::quality::TEXCOMP_EXE);
         let msg = match tessera_core::quality::prepare(&exe, &texcomp) {
@@ -913,6 +992,9 @@ fn quality_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
                     ui.set_settings(view);
                 }
             }
+            let mut st = state.lock().unwrap();
+            invalidate_view(&mut st, &root);
+            start_view_worker(&ui, &state, &mut st);
             ui.set_status_text(msg.into());
         });
     });
@@ -1019,7 +1101,15 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());
-        ui.on_select(move |i| load_session(&w.unwrap(), &mut s.lock().unwrap(), i, false));
+        ui.on_select(move |i| request_view(&w.unwrap(), &s, &mut s.lock().unwrap(), i, false));
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_hover_game(move |i| {
+            let mut st = s.lock().unwrap();
+            st.hovered_root = st.view.get(i as usize).map(|&gi| st.games[gi].entry.root.clone());
+            start_view_worker(&w.unwrap(), &s, &mut st);
+        });
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());
@@ -1032,7 +1122,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 Err(e) => format!("Error: {e}"),
             };
             ui.set_status_text(msg.into());
-            load_session(&ui, &mut st, i, true);
+            request_view(&ui, &s, &mut st, i, true);
         });
     }
     {

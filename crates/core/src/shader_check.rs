@@ -8,8 +8,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
-use crate::shaders::{FLAG_DXBC, FLAG_DXIL};
+use rayon::prelude::*;
+
+use crate::shaders::{ShaderEntry, FLAG_DXBC, FLAG_DXIL};
 use crate::warm::{settle, with_suffix, Outcome};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,21 @@ fn intact(code: &[u8]) -> bool {
     code[4..20].iter().all(|&b| b == 0) || crate::scan::checksum(code) == code[4..20]
 }
 
+fn intact_entries(entries: &[ShaderEntry<'_>]) -> Vec<bool> {
+    let intact = |entry: &ShaderEntry<'_>| entry.flags & FLAG_DXBC == 0 || intact(entry.code);
+    // The workers share a single store buffer. Small stores stay serial.
+    if entries.iter().map(|entry| entry.code.len()).sum::<usize>() >= 8 << 20 {
+        static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+        if let Some(pool) = POOL.get_or_init(|| {
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
+            rayon::ThreadPoolBuilder::new().num_threads(threads).build().ok()
+        }) {
+            return pool.install(|| entries.par_iter().map(intact).collect());
+        }
+    }
+    entries.iter().map(intact).collect()
+}
+
 /// The check for one game. `root` is its install folder (for the scan's
 /// freshness), `drivers` the installed drivers' UMD versions (any GPU may
 /// have run the warm-up; empty means no current driver could be verified).
@@ -83,12 +101,15 @@ pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&
     let mut stored: HashMap<u64, u16> = HashMap::new();
     for b in &bases {
         let (store, index) = (with_suffix(b, ".tshd"), with_suffix(b, ".tshi"));
-        let valid = crate::shaders::visit_at(&store, &index, |hash, _, flags, code| {
-            if flags & FLAG_DXBC != 0 && !intact(code) {
-                c.damaged += 1;
-            } else {
-                stored.entry(hash).or_insert(flags);
+        let valid = crate::shaders::with_entries_at(&store, &index, |entries| {
+            for (entry, intact) in entries.iter().zip(intact_entries(entries)) {
+                if intact {
+                    stored.entry(entry.hash).or_insert(entry.flags);
+                } else {
+                    c.damaged += 1;
+                }
             }
+            entries.len() as u64
         });
         c.damaged += crate::shaders::listed_at(&index).saturating_sub(valid);
     }

@@ -70,7 +70,7 @@ export struct ShaderRow {
     tone: int,
 }
 
-// The Shaders tab starts with a summary from the store indexes.
+// The Shaders tab receives the completed check with the game details.
 export struct ShaderState {
     present: bool,
     rows: [ShaderRow],
@@ -464,6 +464,7 @@ component GameItem inherits Rectangle {
     in property <GameRow> game;
     in property <bool> selected;
     callback clicked;
+    callback hovered;
     border-radius: Theme.r-ctl;
     background: root.selected ? #ffffff17 : ta.has-hover ? Theme.hover : transparent;
     Rectangle {
@@ -518,6 +519,7 @@ component GameItem inherits Rectangle {
         }
     }
     ta := TouchArea {
+        changed has-hover => { if self.has-hover { root.hovered(); } }
         clicked => { root.clicked(); }
     }
 }
@@ -1040,6 +1042,7 @@ export component MainWindow inherits Window {
     in property <string> driver-notice;
     callback refresh();
     callback select(int);
+    callback hover-game(int);
     callback reset-safe-mode(int);
     callback warm-shaders(int);
     callback add-folder();
@@ -1130,10 +1133,8 @@ export component MainWindow inherits Window {
                             height: root.row-h - 2px;
                             game: g;
                             selected: i == root.selected;
-                            clicked => {
-                                root.selected = i;
-                                root.select(i);
-                            }
+                            clicked => { root.select(i); }
+                            hovered => { root.hover-game(i); }
                         }
                     }
                 }

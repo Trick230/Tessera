@@ -101,20 +101,25 @@ pub fn stats(exe: &Path) -> StoreStats {
 
 /// Every stored shader whose entry is whole and matches its index hash.
 pub fn read_at(store: &Path, index: &Path) -> Vec<Shader> {
-    let mut out = Vec::new();
-    visit_at(store, index, |hash, stage, flags, code| {
-        out.push(Shader { hash, stage, flags, code: code.to_vec() });
-    });
-    out
+    with_entries_at(store, index, |entries| entries.iter().map(|entry| Shader {
+        hash: entry.hash, stage: entry.stage, flags: entry.flags, code: entry.code.to_vec(),
+    }).collect())
 }
 
-/// Visits well-formed entries without copying their bytecode out of the store buffer.
-pub(crate) fn visit_at(store: &Path, index: &Path, mut visit: impl FnMut(u64, u16, u16, &[u8])) -> u64 {
-    let (Ok(b), Ok(idx)) = (fs::read(store), fs::read(index)) else { return 0 };
+pub(crate) struct ShaderEntry<'a> {
+    pub hash: u64,
+    pub stage: u16,
+    pub flags: u16,
+    pub code: &'a [u8],
+}
+
+/// Supplies well-formed entries borrowing their bytecode from one store buffer.
+pub(crate) fn with_entries_at<T>(store: &Path, index: &Path, read: impl FnOnce(&[ShaderEntry<'_>]) -> T) -> T {
+    let (Ok(b), Ok(idx)) = (fs::read(store), fs::read(index)) else { return read(&[]) };
     if !header_ok(&b, STORE_MAGIC, ENTRY) {
-        return 0;
+        return read(&[]);
     }
-    let mut count = 0;
+    let mut entries = Vec::new();
     for (hash, start, end) in index_entries(&idx, b.len() as u64) {
         let e = &b[start as usize..end as usize];
         if e.len() < ENTRY {
@@ -125,15 +130,14 @@ pub(crate) fn visit_at(store: &Path, index: &Path, mut visit: impl FnMut(u64, u1
         if h != hash || ENTRY + size > e.len() {
             break;
         }
-        visit(
+        entries.push(ShaderEntry {
             hash,
-            u16::from_le_bytes([e[12], e[13]]),
-            u16::from_le_bytes([e[14], e[15]]),
-            &e[ENTRY..ENTRY + size],
-        );
-        count += 1;
+            stage: u16::from_le_bytes([e[12], e[13]]),
+            flags: u16::from_le_bytes([e[14], e[15]]),
+            code: &e[ENTRY..ENTRY + size],
+        });
     }
-    count
+    read(&entries)
 }
 
 pub fn read(exe: &Path) -> Vec<Shader> {
