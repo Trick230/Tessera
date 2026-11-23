@@ -628,9 +628,7 @@ component AppSettings inherits VerticalLayout {
     callback startup-changed(bool);
 
     padding: 24px;
-    spacing: 14px;
     alignment: start;
-    Text { text: "App settings"; color: Theme.text; font-size: 22px; font-weight: 700; }
     VerticalLayout {
         PropRow {
             label: "Theme";
@@ -1142,142 +1140,166 @@ export component MainWindow inherits Window {
     property <GameRow> cur: root.games[root.selected];
 
     VerticalLayout {
-        // Command bar: library commands, then the commands for the selected game.
         Rectangle {
-            height: 50px;
+            height: 40px;
             background: Theme.side;
             HorizontalLayout {
                 padding-left: 8px;
-                padding-right: 8px;
-                padding-top: 8px;
-                padding-bottom: 8px;
-                spacing: 2px;
                 alignment: start;
-                if !root.show-app-settings: Btn { flat: true; icon: "\u{E8F4}"; text: "Add game folder"; enabled: !root.busy; clicked => { root.add-folder(false); } }
-                if !root.show-app-settings: Btn { flat: true; icon: "\u{E8B7}"; text: "Add library folder"; enabled: !root.busy; clicked => { root.add-folder(true); } }
-                if !root.show-app-settings: Btn { flat: true; icon: "\u{E72C}"; text: "Refresh"; enabled: !root.busy; clicked => { root.refresh(); } }
-                if !root.show-app-settings: ToolSep { }
-                if !root.show-app-settings && (!root.has-sel || !root.cur.installed): Btn {
-                    flat: !(root.has-sel && root.cur.can-install);
-                    primary: root.has-sel && root.cur.can-install;
-                    icon: "\u{E896}";
-                    text: "Install layer";
-                    enabled: root.has-sel && root.cur.can-install && !root.cur.blocked && !root.busy;
-                    clicked => { root.install(root.selected); }
-                }
-                if !root.show-app-settings && root.has-sel && root.cur.installed: Btn {
-                    flat: true;
-                    icon: "\u{E74D}";
-                    text: "Uninstall";
-                    enabled: !root.busy;
-                    clicked => { root.uninstall(root.selected); }
-                }
-                if !root.show-app-settings: Btn {
-                    flat: true;
-                    icon: "\u{E945}";
-                    text: root.has-sel && !root.cur.d3d11 && root.cur.scan-shaders ? "Scan shaders" : "Prepare shaders";
-                    enabled: root.has-sel && (root.cur.d3d11 || root.cur.scan-shaders) && !root.busy;
-                    clicked => { root.warm-shaders(root.selected); }
-                }
-                if !root.show-app-settings: ToolSep { }
-                if !root.show-app-settings: Btn {
-                    flat: true;
-                    icon: "\u{E838}";
-                    text: "Open folder";
-                    enabled: root.has-sel;
-                    clicked => { root.open-folder(root.selected); }
-                }
-                if root.show-app-settings: Btn {
-                    flat: true;
-                    icon: "\u{E8B7}";
+                library-tab := Tab {
+                    width: 84px;
                     text: "Library";
+                    active: !root.show-app-settings;
                     clicked => { root.show-app-settings = false; }
                 }
-            }
-            Btn {
-                x: parent.width - self.width - 8px;
-                y: 8px;
-                width: self.preferred-width;
-                flat: true;
-                primary: root.show-app-settings;
-                icon: "\u{E713}";
-                text: "App settings";
-                clicked => { root.show-app-settings = !root.show-app-settings; }
+                app-settings-tab := Tab {
+                    width: 116px;
+                    text: "App settings";
+                    active: root.show-app-settings;
+                    clicked => { root.show-app-settings = true; }
+                }
             }
             Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
-        }
-
-        if !root.show-app-settings && root.driver-notice != "": VerticalLayout {
-            padding: 8px;
-            Banner { text: root.driver-notice; }
-        }
-
-        if root.show-app-settings: AppSettings {
-            vertical-stretch: 1;
-            theme: root.app-theme;
-            start-with-windows <=> root.start-with-windows;
-            theme-changed(theme) => { root.app-theme-changed(theme); }
-            startup-changed(enabled) => { root.startup-changed(enabled); }
-        }
-
-        if !root.show-app-settings: HorizontalLayout {
-            vertical-stretch: 1;
-            // Game list.
             Rectangle {
-                width: 300px;
-                background: Theme.side;
+                x: root.show-app-settings ? app-settings-tab.x + 12px : library-tab.x + 12px;
+                y: parent.height - self.height;
+                width: (root.show-app-settings ? app-settings-tab.width : library-tab.width) - 24px;
+                height: 2px;
+                background: Theme.accent;
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            Rectangle {
+                visible: !root.show-app-settings;
+                width: parent.width;
+                height: parent.height;
                 VerticalLayout {
-                    padding: 8px;
-                    spacing: 8px;
-                    SearchField { edited(t) => { root.filter-changed(t); } }
-                    list := ScrollView {
+                    // Commands for the library and the selected game.
+                    Rectangle {
+                        height: 42px;
+                        background: Theme.surface;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            spacing: 2px;
+                            alignment: start;
+                            Btn { flat: true; icon: "\u{E8F4}"; text: "Add game folder"; enabled: !root.busy; clicked => { root.add-folder(false); } }
+                            Btn { flat: true; icon: "\u{E8B7}"; text: "Add library folder"; enabled: !root.busy; clicked => { root.add-folder(true); } }
+                            Btn { flat: true; icon: "\u{E72C}"; text: "Refresh"; enabled: !root.busy; clicked => { root.refresh(); } }
+                            ToolSep { }
+                            if !root.has-sel || !root.cur.installed: Btn {
+                                flat: !(root.has-sel && root.cur.can-install);
+                                primary: root.has-sel && root.cur.can-install;
+                                icon: "\u{E896}";
+                                text: "Install layer";
+                                enabled: root.has-sel && root.cur.can-install && !root.cur.blocked && !root.busy;
+                                clicked => { root.install(root.selected); }
+                            }
+                            if root.has-sel && root.cur.installed: Btn {
+                                flat: true;
+                                icon: "\u{E74D}";
+                                text: "Uninstall";
+                                enabled: !root.busy;
+                                clicked => { root.uninstall(root.selected); }
+                            }
+                            Btn {
+                                flat: true;
+                                icon: "\u{E945}";
+                                text: root.has-sel && !root.cur.d3d11 && root.cur.scan-shaders ? "Scan shaders" : "Prepare shaders";
+                                enabled: root.has-sel && (root.cur.d3d11 || root.cur.scan-shaders) && !root.busy;
+                                clicked => { root.warm-shaders(root.selected); }
+                            }
+                            ToolSep { }
+                            Btn {
+                                flat: true;
+                                icon: "\u{E838}";
+                                text: "Open folder";
+                                enabled: root.has-sel;
+                                clicked => { root.open-folder(root.selected); }
+                            }
+                        }
+                        Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                    }
+
+                    if root.driver-notice != "": VerticalLayout {
+                        padding: 8px;
+                        Banner { text: root.driver-notice; }
+                    }
+
+                    HorizontalLayout {
                         vertical-stretch: 1;
-                        content-width: self.visible-width;
-                        content-height: root.games.length * root.row-h;
-                        for g[i] in root.games: GameItem {
-                            x: 0;
-                            y: i * root.row-h;
-                            width: list.visible-width;
-                            height: root.row-h - 2px;
-                            game: g;
-                            selected: i == root.selected;
-                            clicked => { root.select(i); }
-                            hovered => { root.hover-game(i); }
+                        // Game list.
+                        Rectangle {
+                            width: 300px;
+                            background: Theme.side;
+                            VerticalLayout {
+                                padding: 8px;
+                                spacing: 8px;
+                                SearchField { edited(t) => { root.filter-changed(t); } }
+                                list := ScrollView {
+                                    vertical-stretch: 1;
+                                    content-width: self.visible-width;
+                                    content-height: root.games.length * root.row-h;
+                                    for g[i] in root.games: GameItem {
+                                        x: 0;
+                                        y: i * root.row-h;
+                                        width: list.visible-width;
+                                        height: root.row-h - 2px;
+                                        game: g;
+                                        selected: i == root.selected;
+                                        clicked => { root.select(i); }
+                                        hovered => { root.hover-game(i); }
+                                    }
+                                }
+                            }
+                            Rectangle { x: parent.width - 1px; width: 1px; background: Theme.line; }
+                        }
+
+                        if root.has-sel: Detail {
+                            horizontal-stretch: 1;
+                            game: root.cur;
+                            hero: root.hero;
+                            session: root.session;
+                            settings: root.settings;
+                            busy: root.busy;
+                            shaders: root.shader-state;
+                            tab <=> root.tab;
+                            reset-safe-mode => { root.reset-safe-mode(root.selected); }
+                            clear-shaders => { root.clear-shaders(root.selected); }
+                            settings-changed(p, r, fl, rc, u, f, v) => { root.settings-changed(root.selected, p, r, fl, rc, u, f, v); }
+                            advanced-changed(key, value) => { root.advanced-changed(root.selected, key, value); }
+                            prepare-quality => { root.prepare-quality(root.selected); }
+                        }
+                        if !root.has-sel: VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 16px;
+                            HorizontalLayout {
+                                alignment: center;
+                                Mark { tile: 12px; busy: root.busy; }
+                            }
+                            Text {
+                                text: root.busy ? "Looking for games…" : "Select a game from the list.";
+                                color: Theme.dim;
+                                font-size: 15px;
+                                horizontal-alignment: center;
+                            }
                         }
                     }
-                }
-                Rectangle { x: parent.width - 1px; width: 1px; background: Theme.line; }
-            }
 
-            if root.has-sel: Detail {
-                horizontal-stretch: 1;
-                game: root.cur;
-                hero: root.hero;
-                session: root.session;
-                settings: root.settings;
-                busy: root.busy;
-                shaders: root.shader-state;
-                tab <=> root.tab;
-                reset-safe-mode => { root.reset-safe-mode(root.selected); }
-                clear-shaders => { root.clear-shaders(root.selected); }
-                settings-changed(p, r, fl, rc, u, f, v) => { root.settings-changed(root.selected, p, r, fl, rc, u, f, v); }
-                advanced-changed(key, value) => { root.advanced-changed(root.selected, key, value); }
-                prepare-quality => { root.prepare-quality(root.selected); }
+                }
             }
-            if !root.has-sel: VerticalLayout {
-                horizontal-stretch: 1;
-                alignment: center;
-                spacing: 16px;
-                HorizontalLayout {
-                    alignment: center;
-                    Mark { tile: 12px; busy: root.busy; }
-                }
-                Text {
-                    text: root.busy ? "Looking for games…" : "Select a game from the list.";
-                    color: Theme.dim;
-                    font-size: 15px;
-                    horizontal-alignment: center;
-                }
+            if root.show-app-settings: AppSettings {
+                width: parent.width;
+                height: parent.height;
+                theme: root.app-theme;
+                start-with-windows <=> root.start-with-windows;
+                theme-changed(theme) => { root.app-theme-changed(theme); }
+                startup-changed(enabled) => { root.startup-changed(enabled); }
             }
         }
 
