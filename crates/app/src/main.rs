@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use tessera_core::install::{self, InstallState};
 use tessera_core::pe::Architecture;
 use tessera_core::shader_check::ShaderCheck;
-use tessera_core::{paths, session, GameInfo, Store};
+use tessera_core::{paths, session, GameInfo};
 
 slint::include_modules!();
 
@@ -31,7 +31,7 @@ struct State {
     view: Vec<usize>,
     filter: String,
     folders: ManualFolders,
-    recomp_icons: HashMap<PathBuf, art::Pixels>,
+    icons: HashMap<PathBuf, art::Pixels>,
     shown_root: Option<PathBuf>,
     requested_root: Option<PathBuf>,
     hovered_root: Option<PathBuf>,
@@ -181,8 +181,7 @@ fn row(g: &GameInfo, icon: Option<&art::Pixels>) -> GameRow {
         can_install: g.can_install(),
         d3d11: can_prepare(g),
         scan_shaders: can_scan_gl(g),
-        recomp: g.entry.store == Store::Recomp,
-        icon: icon.cloned().map(slint::Image::from_rgba8).unwrap_or_else(|| steam_image(g, false)),
+        icon: icon.cloned().map(slint::Image::from_rgba8).unwrap_or_default(),
         initial: s(g.entry.name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_default()),
     }
 }
@@ -202,23 +201,6 @@ fn can_prepare(g: &GameInfo) -> bool {
 
 fn can_scan_gl(g: &GameInfo) -> bool {
     g.exe.is_some() && g.scan.all().has(tessera_core::pe::ApiSet::OPENGL)
-}
-
-/// Cached Steam icon or hero so filtering does not decode it again.
-fn steam_image(g: &GameInfo, hero: bool) -> slint::Image {
-    thread_local! {
-        static CACHE: std::cell::RefCell<std::collections::HashMap<(u32, bool), slint::Image>> = Default::default();
-    }
-    let Some(id) = g.entry.steam_appid else { return slint::Image::default() };
-    CACHE.with_borrow_mut(|c| {
-        c.entry((id, hero))
-            .or_insert_with(|| {
-                let art = tessera_core::library::steam_art(id);
-                let path = if hero { art.hero } else { art.icon };
-                path.and_then(|p| slint::Image::load_from_path(&p).ok()).unwrap_or_default()
-            })
-            .clone()
-    })
 }
 
 fn num(v: f64, decimals: usize) -> String {
@@ -730,7 +712,6 @@ fn game_settings(
 #[derive(Default)]
 struct GameView {
     session: SessionInfo,
-    hero: Option<art::Pixels>,
     budget: (u32, Option<u32>),
     run: Option<(u64, u64)>,
     facts: Option<advanced::Facts>,
@@ -756,7 +737,6 @@ impl GameView {
             .collect();
         Self {
             session, budget, run, facts,
-            hero: (game.entry.store == Store::Recomp).then(|| art::hero(game)).flatten(),
             shader_check: Some(tessera_core::shader_check::check(exe, root, &drivers)),
             pak_key: is_unreal(game).then(|| tessera_core::scan::unreal_key_status(exe)),
             disk_cache: tessera_core::driver::nvidia_game_cache(exe),
@@ -790,7 +770,6 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
     // Publish the models and selection together before the next frame.
     SESSION_GEN.fetch_add(1, Ordering::Relaxed);
     *SETTINGS.lock().unwrap() = lists;
-    ui.set_hero(view.hero.clone().map(slint::Image::from_rgba8).unwrap_or_else(|| steam_image(game, true)));
     ui.set_session(view.session.clone());
     ui.set_settings(settings);
     ui.set_shader_state(shaders);
@@ -893,7 +872,7 @@ fn apply_view(ui: &MainWindow, st: &mut State) {
     st.view = (0..st.games.len()).filter(|&i| f.is_empty() || st.games[i].entry.name.to_lowercase().contains(&f)).collect();
     let rows: Vec<GameRow> = st.view.iter().map(|&i| {
         let game = &st.games[i];
-        row(game, st.recomp_icons.get(&game.entry.root))
+        row(game, st.icons.get(&game.entry.root))
     }).collect();
     ui.set_games(ModelRc::new(VecModel::from(rows)));
     ui.set_selected(st.shown_root.as_deref().and_then(|root| visible_index(st, root)).unwrap_or(-1));
@@ -914,14 +893,14 @@ fn refresh(ui: &MainWindow, state: &Shared, added: Option<String>) {
         let games = tessera_core::analyze_all(tessera_core::library::discover_with_folders(
             &folders.legacy, &folders.games, &folders.libraries,
         ));
-        let recomp_icons = games.iter().filter(|game| game.entry.store == Store::Recomp)
+        let icons = games.iter()
             .filter_map(|game| Some((game.entry.root.clone(), art::icon(game)?))).collect();
         let ms = t.elapsed().as_millis();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             let mut st = state.lock().unwrap();
             let n = games.len();
             st.games = games;
-            st.recomp_icons = recomp_icons;
+            st.icons = icons;
             st.ready_views.clear();
             st.view_epoch += 1;
             st.settings_sync = None;

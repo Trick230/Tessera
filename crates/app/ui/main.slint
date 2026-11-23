@@ -21,7 +21,6 @@ export struct GameRow {
     can-install: bool,
     d3d11: bool,
     scan-shaders: bool,
-    recomp: bool,
     // First letter, shown when there is no icon.
     initial: string,
     // Library icon, empty when there is no image.
@@ -740,10 +739,6 @@ component Detail inherits Rectangle {
             root.entering-page = false;
         }
     }
-    // The game's key art, if available.
-    in property <image> hero;
-    property <bool> has-hero: root.hero.width > 0;
-    property <bool> wide-hero: root.has-hero && (!root.game.recomp || root.hero.width > root.hero.height);
     callback reset-safe-mode();
     callback clear-shaders();
     callback settings-changed(bool, bool, bool, bool, bool, int, int);
@@ -752,35 +747,7 @@ component Detail inherits Rectangle {
 
     VerticalLayout {
         // The game and what Tessera knows about it at a glance.
-        Rectangle {
-            height: root.has-hero || root.game.recomp ? 168px : head.preferred-height;
-            clip: true;
-            if root.game.recomp && !root.wide-hero: Rectangle {
-                background: @linear-gradient(105deg, Theme.bg 0%, Theme.dark ? #20272a : #e6ebed 65%, Theme.dark ? #35434a : #d1dde2 100%);
-            }
-            if root.wide-hero: Image {
-                source: root.hero;
-                width: parent.width;
-                height: parent.height;
-                image-fit: cover;
-            }
-            if root.wide-hero: Rectangle {
-                background: @linear-gradient(90deg, Theme.bg.with-alpha(0.92) 0%, Theme.bg.with-alpha(0.64) 45%, Theme.bg.with-alpha(0.15) 100%);
-            }
-            if root.wide-hero: Rectangle {
-                background: @linear-gradient(180deg, Theme.bg.with-alpha(0) 40%, Theme.bg 100%);
-            }
-            if root.game.recomp && !root.wide-hero && (root.has-hero || root.game.icon.width > 0): Image {
-                width: 132px;
-                height: 132px;
-                x: parent.width - self.width - 20px;
-                y: (parent.height - self.height) / 2;
-                source: root.has-hero ? root.hero : root.game.icon;
-                image-fit: contain;
-            }
-        head := VerticalLayout {
-            y: parent.height - self.preferred-height;
-            height: self.preferred-height;
+        VerticalLayout {
             padding-left: 20px;
             padding-right: 20px;
             padding-top: 14px;
@@ -810,7 +777,6 @@ component Detail inherits Rectangle {
                 if root.game.engine != "": Text { text: root.game.engine; color: Theme.dim; font-size: 13px; }
                 Text { text: root.game.store; color: Theme.dim; font-size: 13px; }
             }
-        }
         }
 
         if root.game.blocked || root.session.safe-mode: VerticalLayout {
@@ -1181,7 +1147,6 @@ export component MainWindow inherits Window {
     init => { root.apply-theme(); }
     changed dark-theme => { root.apply-theme(); }
     // Key art of the selected game.
-    in property <image> hero;
     // S7: driver shader cache advice, empty when all is well.
     in property <string> driver-notice;
     callback refresh();
@@ -1329,7 +1294,6 @@ export component MainWindow inherits Window {
                         if root.has-sel: Detail {
                             horizontal-stretch: 1;
                             game: root.cur;
-                            hero: root.hero;
                             session: root.session;
                             settings: root.settings;
                             busy: root.busy;

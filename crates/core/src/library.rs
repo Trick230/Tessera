@@ -78,8 +78,11 @@ fn game_folder(root: &Path) -> Option<GameEntry> {
         return None;
     }
     crate::recomp::game(root).or_else(|| {
-        let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        Some(GameEntry { name, root: root.to_path_buf(), store: Store::Manual, exe_hint: None, steam_appid: None })
+        let (name, exe_hint) = crate::recomp::fan_project(root).map_or_else(
+            || (root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), None),
+            |(name, exe)| (name.to_owned(), Some(exe)),
+        );
+        Some(GameEntry { name, root: root.to_path_buf(), store: Store::Manual, exe_hint, steam_appid: None })
     })
 }
 
@@ -141,24 +144,10 @@ pub fn steam_games() -> Vec<GameEntry> {
         .collect()
 }
 
-/// Art Steam keeps for an installed app in appcache/librarycache.
-#[derive(Debug, Default, Clone)]
-pub struct SteamArt {
-    /// 32x32 icon.
-    pub icon: Option<PathBuf>,
-    /// Wide key art shown at the top of the Steam library page.
-    pub hero: Option<PathBuf>,
-}
-
-/// Steam's cached art for an app. Handles both the per-app folder layout
-/// (`<id>\library_hero.jpg`, `<id>\<sha1>.jpg` icon, maybe one level deeper)
-/// and the older flat one (`<id>_library_hero.jpg`, `<id>_icon.jpg`).
-pub fn steam_art(appid: u32) -> SteamArt {
+/// Steam's cached library icon, in the per-app or legacy flat cache layout.
+pub fn steam_icon(appid: u32) -> Option<PathBuf> {
     static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    let mut art = SteamArt::default();
-    let Some(cache) = ROOT.get_or_init(steam_root).as_ref().map(|r| r.join("appcache").join("librarycache")) else {
-        return art;
-    };
+    let cache = ROOT.get_or_init(steam_root).as_ref()?.join("appcache").join("librarycache");
     let dir = cache.join(appid.to_string());
     let mut dirs = vec![dir.clone()];
     if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -168,17 +157,15 @@ pub fn steam_art(appid: u32) -> SteamArt {
         let Ok(rd) = std::fs::read_dir(d) else { continue };
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().to_ascii_lowercase();
-            if n == "library_hero.jpg" {
-                art.hero.get_or_insert(e.path());
-            } else if n.len() == 44 && n.ends_with(".jpg") && n[..40].bytes().all(|b| b.is_ascii_hexdigit()) {
-                art.icon.get_or_insert(e.path());
+            if [".jpg", ".png", ".ico"].iter().any(|ext| n.strip_suffix(ext).is_some_and(|stem| {
+                stem == "icon" || (stem.len() == 40 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
+            })) && e.file_type().is_ok_and(|kind| kind.is_file()) {
+                return Some(e.path());
             }
         }
     }
-    let flat = |suffix: &str| Some(cache.join(format!("{appid}_{suffix}"))).filter(|p| p.is_file());
-    art.hero = art.hero.or_else(|| flat("library_hero.jpg"));
-    art.icon = art.icon.or_else(|| flat("icon.jpg"));
-    art
+    ["jpg", "png", "ico"].into_iter().map(|ext| cache.join(format!("{appid}_icon.{ext}")))
+        .find(|path| path.is_file())
 }
 
 /// Steam app types that are not games.
@@ -436,7 +423,8 @@ fn parse_epic_preview(text: &str) -> Vec<GameEntry> {
         if !root.is_absolute() || !root.join(&exe).is_file() {
             return None;
         }
-        let name = root.file_name()?.to_string_lossy().into_owned();
+        let name = record["displayName"].as_str().map(str::trim).filter(|name| !name.is_empty())
+            .map(str::to_owned).or_else(|| root.file_name().map(|name| name.to_string_lossy().into_owned()))?;
         Some(GameEntry { name, root, store: Store::Epic, exe_hint: Some(exe), steam_appid: None })
     }).collect()
 }
@@ -461,6 +449,22 @@ mod tests {
         assert_eq!(game_folder(&first).unwrap().root, first);
         let roots: HashSet<_> = library_games(&library).map(|game| game.root).collect();
         assert_eq!(roots, HashSet::from([first, second]));
+    }
+
+    #[test]
+    fn recognizes_project_p06_in_a_renamed_game_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Portable Game");
+        let data = root.join("Sonic the Hedgehog_Data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(root.join("Sonic the Hedgehog.exe"), []).unwrap();
+        assert_eq!(game_folder(&root).unwrap().name, "Portable Game");
+
+        std::fs::write(data.join("app.info"), "Nights of Kronos\r\nSonic the Hedgehog\r\n").unwrap();
+        let game = game_folder(&root).unwrap();
+        assert_eq!(game.name, "Sonic the Hedgehog (P-06)");
+        assert_eq!(game.store, Store::Manual);
+        assert_eq!(game.exe_hint.as_deref(), Some(Path::new("Sonic the Hedgehog.exe")));
     }
 
     #[test]
@@ -520,6 +524,10 @@ mod tests {
         assert_eq!(games[0].root, root);
         assert_eq!(games[0].store, Store::Epic);
         assert_eq!(games[0].exe_hint.as_deref(), Some(Path::new("Game.exe")));
+
+        record["displayName"] = "Game Title".into();
+        let games = parse_epic_preview(&format!("{log}\n{record}"));
+        assert_eq!(games[0].name, "Game Title");
     }
 
     #[test]

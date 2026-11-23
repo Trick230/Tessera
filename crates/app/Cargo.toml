@@ -9,7 +9,7 @@ name = "tessera"
 path = "src/main.rs"
 
 [dependencies]
-image = { version = "0.25.10", default-features = false, features = ["ico"] }
+image = { version = "0.25.10", default-features = false, features = ["ico", "jpeg", "webp"] }
 rfd = "0.18.0"
 slint = { version = "1.19.0", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility", "image-default-formats"] }
 tessera-core = { version = "0.1.0", path = "../core" }

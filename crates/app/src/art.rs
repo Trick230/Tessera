@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, imageops::FilterType};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
-use tessera_core::GameInfo;
+use tessera_core::{GameInfo, library};
 
 pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 
@@ -52,16 +52,17 @@ fn pixels(image: DynamicImage, width: u32, height: u32) -> Pixels {
 }
 
 pub fn icon(game: &GameInfo) -> Option<Pixels> {
-    let image = art_paths(game, &["icon", "game-icon", "app-icon"])
-        .find_map(|path| load_file(&path)).or_else(|| {
-            let ico = tessera_core::pe::executable_icon(game.exe.as_deref()?)?;
+    let launch = game.entry.exe_hint.as_ref().map(|exe| game.entry.root.join(exe));
+    let executables = || launch.as_deref().into_iter()
+        .chain(game.exe.as_deref().filter(|exe| Some(*exe) != launch.as_deref()));
+    let image = game.entry.steam_appid.and_then(library::steam_icon)
+        .and_then(|path| load_file(&path))
+        .or_else(|| executables().find_map(|exe| load_file(&exe.with_extension("ico"))))
+        .or_else(|| art_paths(game, &["icon", "game-icon", "app-icon"]).find_map(|path| load_file(&path)))
+        .or_else(|| executables().find_map(|exe| {
+            let ico = tessera_core::pe::executable_icon(exe)?;
             decode(Cursor::new(ico), Some(ImageFormat::Ico))
-        })?;
-    Some(pixels(image, 128, 128))
-}
+        }))?;
 
-pub fn hero(game: &GameInfo) -> Option<Pixels> {
-    let image = art_paths(game, &["hero", "banner", "artwork", "header", "prelaunch-bg", "cover", "logo"])
-        .find_map(|path| load_file(&path))?;
-    Some(pixels(image, 1400, 630))
+    Some(pixels(image, 64, 64))
 }

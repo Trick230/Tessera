@@ -23,10 +23,13 @@ pub(crate) fn collection_games(path: &Path) -> Vec<GameEntry> {
 }
 
 fn title(stem: &str) -> Option<&'static str> {
+    // Match shipped executable names to the titles in the projects' releases.
     Some(match stem {
         "banjorecomp" | "banjorecompiled" => "Banjo: Recompiled",
         "dusklight" => "Dusklight: Twilight Princess",
         "edgeoftimerecomp" | "edgeoftimerecompiled" => "Spider-Man: Edge of Time Recompiled",
+        // https://github.com/klorfmorf/Goemon64Recomp
+        "goemon64recomp" | "goemon64recompiled" => "Goemon 64: Recompiled",
         "jetsetradiofuture" => "Jet Set Radio Future",
         "legodimensions" => "LEGO Dimensions",
         "projectdream" => "Sonic Dream Team (Project Dream)",
@@ -34,10 +37,26 @@ fn title(stem: &str) -> Option<&'static str> {
         "2ship2harkinian" | "2ship" => "2 Ship 2 Harkinian",
         "skate3" | "skate3recomp" => "Skate 3 Recompiled",
         "sotn" | "symphonyrecomp" => "Castlevania: Symphony of the Night Recompiled",
+        // https://github.com/JackandBeans/Snap64Recomp
+        "snap64recomp" => "Snap64 Recomp",
+        // https://github.com/HarbourMasters/Starship
+        "starship" => "Starship",
         "unleashedrecomp" | "unleashedrecompiled" => "Unleashed Recompiled",
         "zelda64recomp" | "zelda64recompiled" => "Zelda 64: Recompiled",
         _ => return None,
     })
+}
+
+pub(crate) fn fan_project(root: &Path) -> Option<(&'static str, PathBuf)> {
+    let exe = PathBuf::from("Sonic the Hedgehog.exe");
+    if !root.join(&exe).is_file() {
+        return None;
+    }
+    let info = std::fs::read_to_string(root.join("Sonic the Hedgehog_Data").join("app.info")).ok()?;
+    let mut lines = info.lines().map(str::trim);
+    // Project '06 ships under the original game's executable and product name.
+    (lines.next() == Some("Nights of Kronos") && lines.next() == Some("Sonic the Hedgehog"))
+        .then_some(("Sonic the Hedgehog (P-06)", exe))
 }
 
 pub(crate) fn game(root: &Path) -> Option<GameEntry> {
