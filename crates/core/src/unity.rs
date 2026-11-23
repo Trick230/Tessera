@@ -27,6 +27,24 @@ pub(crate) fn graphics_apis(exe: &Path) -> Option<ApiSet> {
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 const MAX_BLOCK: usize = 64 * 1024 * 1024;
 const LEGACY_WEB: u32 = 0x1_0000;
+const WEB_DATA: &[u8] = b"UnityWebData1.0\0";
+
+pub(crate) fn web_entries(data: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut header = data.strip_prefix(WEB_DATA)?;
+    let end = le_u32(&mut header)? as usize;
+    if end > MAX_METADATA { return None; }
+    let mut header = header.get(..end.checked_sub(WEB_DATA.len() + 4)?)?;
+    let mut entries = Vec::new();
+    while !header.is_empty() {
+        let start = le_u32(&mut header)? as usize;
+        let size = le_u32(&mut header)? as usize;
+        let name_len = le_u32(&mut header)? as usize;
+        take(&mut header, name_len)?;
+        if start < end { return None; }
+        entries.push(data.get(start..start.checked_add(size)?)?);
+    }
+    Some(entries)
+}
 
 fn be_u32(data: &mut &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(take(data, 4)?.try_into().ok()?))

@@ -431,20 +431,36 @@ impl Found {
 
     fn search_glsl(&mut self, data: &[u8]) {
         if memchr::memmem::find(data, b"glShaderSource").is_none() { return; }
-        self.search_glsl_source(data);
+        self.search_glsl_source(data, false);
     }
 
-    fn search_glsl_source(&mut self, data: &[u8]) {
-        for at in memchr::memmem::find_iter(data, b"#version ") {
-            let rest = &data[at..data.len().min(at.saturating_add(64 << 10))];
-            let Some(end) = memchr::memchr(0, rest) else { continue };
-            let source = &rest[..end];
+    fn search_glsl_source(&mut self, data: &[u8], unity: bool) {
+        let mut versions = memchr::memmem::find_iter(data, b"#version ").peekable();
+        while let Some(at) = versions.next() {
+            let guarded = unity && unity_glsl_guard(&data[..at]).is_some();
+            let bound = if unity { data.len() } else { data.len().min(at.saturating_add(64 << 10)) };
+            let rest = &data[at..bound];
+            let nul = memchr::memchr(0, rest);
+            let next_stage = versions.peek().filter(|_| guarded)
+                .and_then(|&next| unity_glsl_guard(&data[at..next]));
+            let end = match (nul, next_stage) {
+                (Some(nul), Some(next)) => nul.min(next),
+                (Some(end), None) | (None, Some(end)) => end,
+                (None, None) if unity => rest.len(),
+                _ => continue,
+            };
+            let mut source = rest[..end].trim_ascii_end();
+            if guarded {
+                let Some(body) = source.strip_suffix(b"#endif") else { continue };
+                source = body.trim_ascii_end();
+            }
             if !source.iter().all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace()) ||
                 memchr::memmem::find(source, b"void main").is_none() ||
-                source.iter().rev().find(|b| !b.is_ascii_whitespace()) != Some(&b'}') {
+                source.last() != Some(&b'}') {
                 continue;
             }
-            self.glsl.insert(xxhash_rust::xxh3::xxh3_128(source));
+            let bytes = if unity { source } else { &rest[..end] };
+            self.glsl.insert(xxhash_rust::xxh3::xxh3_128(bytes));
         }
     }
 
@@ -458,9 +474,27 @@ impl Found {
         self.record_spirv(bytes);
         if shader_data {
             self.spirv.extend(counted_spirv(bytes));
-            self.search_glsl_source(bytes);
+            self.search_glsl_source(bytes, true);
         }
         self.search(bytes, 0);
+    }
+
+    fn search_unity(&mut self, bytes: &[u8]) -> bool {
+        if [b"UnityFS\0".as_slice(), b"UnityWeb\0", b"UnityRaw\0"].iter().any(|s| bytes.starts_with(s)) {
+            let Some((entries, unreadable, shaders, failed)) = crate::unity::scan_bundle(bytes,
+                |bytes, shader| self.unity_payload(bytes, shader)) else { return false };
+            self.stats.unity_entries += entries;
+            self.stats.unreadable_unity_entries += unreadable;
+            self.stats.unity_shader_objects += shaders;
+            self.stats.unreadable_unity_shader_objects += failed;
+            return unreadable == 0;
+        }
+        if let Some((shaders, failed)) = crate::unity::scan_serialized_slice(bytes,
+            |bytes, shader| self.unity_payload(bytes, shader)) {
+            self.stats.unity_shader_objects += shaders;
+            self.stats.unreadable_unity_shader_objects += failed;
+        }
+        false
     }
 
     fn record(&mut self, c: &Container, code: &[u8]) -> bool {
@@ -656,6 +690,13 @@ fn is_spv_path(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("spv"))
 }
 
+fn unity_glsl_guard(prefix: &[u8]) -> Option<usize> {
+    let head = prefix.trim_ascii_end();
+    [b"#ifdef VERTEX".as_slice(), b"#ifdef FRAGMENT", b"#ifdef GEOMETRY",
+     b"#ifdef HULL", b"#ifdef DOMAIN", b"#ifdef COMPUTE"].into_iter()
+        .find_map(|guard| head.strip_suffix(guard).map(<[u8]>::len))
+}
+
 /// Recognises a complete shader module at a file or archive entry boundary.
 /// Checks the binary structure without validating device-specific capabilities.
 fn spirv_hash(bytes: &[u8]) -> Option<u128> {
@@ -753,23 +794,15 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
     f.stats.unreal_shaders_expected += pak.expected_shaders;
     f.stats.unreal_libraries_unreadable += pak.unreadable_libraries;
     let apk = map.starts_with(b"ENDILTLE") && f.search_apk(&map);
-    let unity = if [b"UnityFS\0".as_slice(), b"UnityWeb\0", b"UnityRaw\0"].iter().any(|s| map.starts_with(s)) {
-        crate::unity::scan_bundle(&map, |bytes, shader_data| f.unity_payload(bytes, shader_data))
+    let unity = if let Some(entries) = crate::unity::web_entries(&map) {
+        for entry in entries {
+            if !f.search_unity(entry) { f.search(entry, 0); }
+        }
+        true
     } else {
-        None
+        f.search_unity(&map)
     };
-    if let Some((entries, unreadable, shaders, failed)) = unity {
-        f.stats.unity_entries += entries;
-        f.stats.unreadable_unity_entries += unreadable;
-        f.stats.unity_shader_objects += shaders;
-        f.stats.unreadable_unity_shader_objects += failed;
-    } else if let Some((shaders, failed)) = crate::unity::scan_serialized_slice(&map, |bytes, shader_data| {
-        f.unity_payload(bytes, shader_data)
-    }) {
-        f.stats.unity_shader_objects += shaders;
-        f.stats.unreadable_unity_shader_objects += failed;
-    }
-    if (!pak.opened || pak.unreadable > 0) && !apk && !unity.is_some_and(|(_, unreadable, _, _)| unreadable == 0) {
+    if (!pak.opened || pak.unreadable > 0) && !apk && !unity {
         f.search(&map, 0);
     }
     if map.starts_with(b"PK\x03\x04") {
@@ -882,7 +915,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 16 {:016x}", key.finish())
+    format!("tessera-scan 17 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -1078,7 +1111,15 @@ mod tests {
         bundle.extend_from_slice(&table);
         let bundle_size = bundle.len() as u64;
         bundle[size_at..size_at + 8].copy_from_slice(&bundle_size.to_be_bytes());
-        fs::write(dir.path().join("modern.bundle"), bundle).unwrap();
+        let entry = b"data.unity3d";
+        let mut web_data = b"UnityWebData1.0\0".to_vec();
+        let header_size = (web_data.len() + 16 + entry.len()) as u32;
+        for field in [header_size, header_size, bundle.len() as u32, entry.len() as u32] {
+            web_data.extend_from_slice(&field.to_le_bytes());
+        }
+        web_data.extend_from_slice(entry);
+        web_data.extend_from_slice(&bundle);
+        fs::write(dir.path().join("modern.data"), web_data).unwrap();
 
         let mut assets = 1u32.to_be_bytes().to_vec();
         string(&mut assets, b"legacy.assets");
@@ -1106,6 +1147,17 @@ mod tests {
         assert_eq!((stats.unity_entries, stats.unreadable_unity_entries), (3, 0));
         assert_eq!(stats.dxil, 1);
         assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
+    }
+
+    #[test]
+    fn finds_both_unity_glsl_stages_in_a_program() {
+        let glsl = b"\0\x01#ifdef VERTEX\n#version 300 es\nvoid main() { gl_Position = vec4(0); }\n\n#endif\n\
+                     #ifdef FRAGMENT\n#version 300 es\nvoid main() { }\n\n#endif\n\0";
+        let fragment = b"#version 300 es\nvoid main() { }\0";
+        let mut found = Found::default();
+        found.unity_payload(glsl, true);
+        found.unity_payload(fragment, true);
+        assert_eq!(found.glsl.len(), 2);
     }
 
     #[test]
