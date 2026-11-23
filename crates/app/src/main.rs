@@ -513,6 +513,9 @@ fn shader_state(
         (value, NEUTRAL)
     } else if c.compiled > 0 {
         (format!("{} compiled", c.compiled), OK)
+    } else if disk_cache.is_some() {
+        d.push("0 KB in matching NVIDIA cache files.".to_string());
+        ("0 NVIDIA cache entries".to_string(), NEUTRAL)
     } else {
         ("Unconfirmed".to_string(), NEUTRAL)
     };
@@ -1054,7 +1057,7 @@ fn clear_shader_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
     };
     let answer = rfd::MessageDialog::new()
         .set_title("Clear shader cache")
-        .set_description(format!("Clear the shaders Tessera collected or prepared for {name}?"))
+        .set_description(format!("Clear Tessera's shader data for {name} and the NVIDIA cache shared by executables named {}?", exe.file_name().unwrap_or_default().to_string_lossy()))
         .set_level(rfd::MessageLevel::Warning)
         .set_buttons(rfd::MessageButtons::OkCancel)
         .show();
@@ -1066,8 +1069,8 @@ fn clear_shader_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
     let (weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
         let msg = match tessera_core::warm::clear_shader_cache(&exe) {
-            Ok(0) => format!("{name} has no Tessera shader cache."),
-            Ok(_) => format!("Cleared the Tessera shader cache for {name}."),
+            Ok(0) => format!("No matching shader cache files for {name}."),
+            Ok(_) => format!("Cleared Tessera shader data and matching NVIDIA cache files for {name}."),
             Err(e) => format!("Could not clear the shader cache: {e}"),
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {

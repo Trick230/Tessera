@@ -3,7 +3,8 @@
 //! of its shader cache folders and (NVIDIA) the cache size limit, and notices
 //! driver updates, after which every game recompiles its shaders.
 
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::fs;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// AMD keeps at most this much shader cache; past it old entries are evicted.
@@ -182,28 +183,32 @@ pub struct NvidiaGameCache {
 
 /// Counts entries in supported NVIDIA DXCache files naming the executable.
 pub fn nvidia_game_cache(exe: &Path) -> Option<NvidiaGameCache> {
-    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
-    nvidia_game_cache_at(&local.join("NVIDIA/DXCache"), exe.file_name()?.to_str()?)
+    nvidia_game_cache_at(&nvidia_cache_dir()?, exe.file_name()?.to_str()?)
+}
+
+fn nvidia_cache_dir() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("NVIDIA/DXCache"))
+}
+
+fn nvidia_cache_file(entry: &fs::DirEntry) -> Option<(fs::File, Vec<u8>, u64)> {
+    let path = entry.path();
+    if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nvph"))
+        || !entry.file_type().ok()?.is_file()
+    {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut header = Vec::with_capacity(0x111);
+    (&file).take(0x111).read_to_end(&mut header).ok()?;
+    Some((file, header, len))
 }
 
 fn nvidia_game_cache_at(dir: &Path, exe_name: &str) -> Option<NvidiaGameCache> {
     let mut cache = NvidiaGameCache::default();
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nvph")) {
-            continue;
-        }
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        let mut header = Vec::with_capacity(0x111);
-        let Ok(metadata) = file.metadata() else {
-            continue;
-        };
-        if (&file).take(0x111).read_to_end(&mut header).is_err() {
-            continue;
-        }
-        let Some((name, bytes)) = nvidia_cache_header(&header, metadata.len()) else {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let Some((file, header, len)) = nvidia_cache_file(&entry) else { continue };
+        let Some((name, bytes)) = nvidia_cache_header(&header, len) else {
             continue;
         };
         if name.eq_ignore_ascii_case(exe_name.as_bytes()) {
@@ -219,6 +224,36 @@ fn nvidia_game_cache_at(dir: &Path, exe_name: &str) -> Option<NvidiaGameCache> {
         }
     }
     Some(cache)
+}
+
+/// Clears NVIDIA DXCache files whose header identifies this executable name.
+pub(crate) fn clear_nvidia_game_cache(exe: &Path) -> io::Result<usize> {
+    let Some(dir) = nvidia_cache_dir() else { return Ok(0) };
+    let name = exe.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable name"))?;
+    clear_nvidia_game_cache_at(&dir, name)
+}
+
+fn clear_nvidia_game_cache_at(dir: &Path, exe_name: &str) -> io::Result<usize> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let Some((_file, header, len)) = nvidia_cache_file(&entry) else { continue };
+        if nvidia_cache_header(&header, len).is_some_and(|(name, _)| name.eq_ignore_ascii_case(exe_name.as_bytes())) {
+            let path = entry.path();
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+            }
+        }
+    }
+    Ok(removed)
 }
 
 fn nvidia_cache_header(header: &[u8], file_len: u64) -> Option<(&[u8], u64)> {
@@ -569,6 +604,11 @@ mod tests {
             nvidia_game_cache_at(dir.path(), "ff7remake_.exe"),
             Some(NvidiaGameCache { files: 1, bytes: 80, ..NvidiaGameCache::default() }),
         );
+        assert_eq!(clear_nvidia_game_cache_at(dir.path(), "ff7remake_.exe").unwrap(), 1);
+        assert_eq!(nvidia_game_cache_at(dir.path(), "ff7remake_.exe"), Some(NvidiaGameCache::default()));
+        assert!(dir.path().join("b.nvph").is_file());
+        assert!(dir.path().join("c.nvph").is_file());
+        assert_eq!(clear_nvidia_game_cache_at(dir.path(), "ff7remake_.exe").unwrap(), 0);
     }
 
     #[test]
@@ -602,5 +642,7 @@ mod tests {
             nvidia_game_cache_at(dir.path(), "GAME.EXE"),
             Some(NvidiaGameCache { files: 2, bytes: used + truncated, entries: 2, counted_files: 1 }),
         );
+        assert_eq!(clear_nvidia_game_cache_at(dir.path(), "game.exe").unwrap(), 2);
+        assert_eq!(nvidia_game_cache_at(dir.path(), "game.exe"), Some(NvidiaGameCache::default()));
     }
 }

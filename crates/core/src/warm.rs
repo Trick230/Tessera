@@ -53,13 +53,14 @@ pub fn bases(exe: &Path) -> Vec<PathBuf> {
     [store_base(exe), crate::scan::scan_base(exe)].into_iter().flatten().collect()
 }
 
-/// Clears the shader data Tessera owns for this executable.
+/// Clears the shader data Tessera owns and matching NVIDIA cache files.
 pub fn clear_shader_cache(exe: &Path) -> io::Result<usize> {
-    if is_running(exe) {
+    if process_is_running(exe)? {
         return Err(io::Error::other("close the game before clearing its shader cache"));
     }
     let key = crate::session::exe_key_name(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
-    clear_shader_files(&crate::paths::data_dir(), &key)
+    let driver = crate::driver::clear_nvidia_game_cache(exe)?;
+    Ok(driver + clear_shader_files(&crate::paths::data_dir(), &key)?)
 }
 
 fn clear_shader_files(data: &Path, key: &str) -> io::Result<usize> {
@@ -191,13 +192,21 @@ pub fn stats(exe: &Path) -> WarmStats {
 
 /// True when a process with this exe file name is running.
 pub fn is_running(exe: &Path) -> bool {
-    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else { return false };
+    process_is_running(exe).unwrap_or(false)
+}
+
+fn process_is_running(exe: &Path) -> io::Result<bool> {
+    let name = exe.file_name().and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable name"))?;
     let out = Command::new("tasklist")
         .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH", "/FO", "CSV"])
         .creation_flags(CREATE_NO_WINDOW)
-        .output();
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other("could not check whether the game is running"));
+    }
     let needle = format!("\"{}\"", name.to_ascii_lowercase());
-    out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains(&needle))
+    Ok(String::from_utf8_lossy(&out.stdout).to_ascii_lowercase().contains(&needle))
 }
 
 /// Warms every store of `exe` with `warm_exe`; returns the warm exe's summary
