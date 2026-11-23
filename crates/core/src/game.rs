@@ -136,7 +136,16 @@ pub fn find_main_exe(root: &Path, hint: Option<&Path>) -> Option<PathBuf> {
             best = Some((score, size, path.to_path_buf()));
         }
     }
-    best.map(|(_, _, p)| p)
+    best.map(|(_, _, p)| p).or_else(|| {
+        // A store manifest can name an executable outside the normal search.
+        let hint = hint?;
+        if !hint.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) ||
+            !hint.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) {
+            return None;
+        }
+        let exe = root.join(hint);
+        exe.is_file().then_some(exe)
+    })
 }
 
 #[cfg(test)]
@@ -168,5 +177,14 @@ mod tests {
         touch(&r.join("unins000.exe"), 9000);
         touch(&r.join("UnityCrashHandler64.exe"), 9000);
         assert!(find_main_exe(r, None).unwrap().ends_with("game.exe"));
+    }
+
+    #[test]
+    fn manifest_can_name_an_executable_under_engine() {
+        let t = tempfile::tempdir().unwrap();
+        let hint = Path::new("Engine/Binaries/Win64/Game.exe");
+        let exe = t.path().join(hint);
+        touch(&exe, 1000);
+        assert_eq!(find_main_exe(t.path(), Some(hint)), Some(exe));
     }
 }

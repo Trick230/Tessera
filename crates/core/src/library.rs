@@ -15,7 +15,7 @@ impl Store {
     pub fn label(self) -> &'static str {
         match self {
             Store::Steam => "Steam",
-            Store::Epic => "Epic",
+            Store::Epic => "Epic Games",
             Store::Manual => "Folder",
         }
     }
@@ -43,9 +43,14 @@ pub fn discover(manual: &[PathBuf]) -> Vec<GameEntry> {
         }
     }
     let mut seen = std::collections::HashSet::new();
-    out.retain(|g| seen.insert(g.root.to_string_lossy().to_ascii_lowercase()));
+    out.retain(|g| seen.insert(install_key(&g.root)));
     out.sort_by_key(|g| g.name.to_lowercase());
     out
+}
+
+pub fn install_key(root: &Path) -> String {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy().to_ascii_lowercase()
 }
 
 // ---------------------------------------------------------------- Steam
@@ -293,31 +298,169 @@ fn quoted(line: &str) -> impl Iterator<Item = String> + '_ {
 // ---------------------------------------------------------------- Epic
 
 pub fn epic_games() -> Vec<GameEntry> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY};
+    use winreg::RegKey;
+
     let base = std::env::var_os("PROGRAMDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
-    let dir = base.join("Epic\\EpicGamesLauncher\\Data\\Manifests");
+    let launcher = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(r"SOFTWARE\Epic Games\EpicGamesLauncher", KEY_READ | KEY_WOW64_32KEY)
+        .and_then(|key| key.get_value::<String, _>("AppDataPath"))
+        .ok().map(PathBuf::from).filter(|path| path.is_absolute()).map(|path| path.join("Manifests"));
+    let eos = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Epic Games\EOS")
+        .and_then(|key| key.get_value::<String, _>("ModSdkMetadataDir"))
+        .ok().map(PathBuf::from).filter(|path| path.is_absolute());
+    let preview = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Epic Games\EpicGamesLauncher")
+        .and_then(|key| key.get_value::<String, _>("AppDataPath"))
+        .ok().map(PathBuf::from).filter(|path| path.is_absolute());
+    let preview_default = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        .map(|path| path.join("com.epicgames.eglv2"));
+    let default = base.join(r"Epic\EpicGamesLauncher\Data\Manifests");
+    let mut seen = HashSet::new();
+    let mut games: Vec<_> = [launcher, eos, Some(default)].into_iter().flatten()
+        .filter(|dir| seen.insert(install_key(dir)))
+        .flat_map(|dir| read_epic_manifests(&dir))
+        .collect();
+    seen.clear();
+    games.extend([preview, preview_default].into_iter().flatten()
+        .filter(|dir| seen.insert(install_key(dir)))
+        .filter_map(|dir| std::fs::read_to_string(dir.join("installations.jsonl")).ok())
+        .flat_map(|text| parse_epic_preview(&text)));
+    games
+}
+
+fn read_epic_manifests(dir: &Path) -> Vec<GameEntry> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut out = Vec::new();
     for f in rd.flatten() {
-        if f.path().extension().is_none_or(|e| e != "item") {
+        let path = f.path();
+        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("item")) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(f.path()) else { continue };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-        let is_game = v["AppCategories"].as_array().is_none_or(|c| c.iter().any(|x| x == "games"));
-        let (Some(name), Some(loc)) = (v["DisplayName"].as_str(), v["InstallLocation"].as_str()) else { continue };
-        let root = PathBuf::from(loc);
-        if !is_game || !root.is_dir() {
-            continue;
+        if let Ok(text) = std::fs::read_to_string(path) {
+            out.extend(parse_epic_manifest(&text));
         }
-        let exe_hint = v["LaunchExecutable"].as_str().filter(|s| !s.is_empty()).map(PathBuf::from);
-        out.push(GameEntry { name: name.to_string(), root, store: Store::Epic, exe_hint, steam_appid: None });
     }
     out
+}
+
+fn parse_epic_manifest(text: &str) -> Option<GameEntry> {
+    let v: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let is_game = v["AppCategories"].as_array().is_none_or(|categories| {
+        categories.iter().filter_map(|c| c.as_str()).any(|c| {
+            c.eq_ignore_ascii_case("games") || c.to_ascii_lowercase().starts_with("games/")
+        })
+    });
+    if !is_game || v["bIsIncompleteInstall"].as_bool() == Some(true) ||
+        v["bIsExecutable"].as_bool() == Some(false) {
+        return None;
+    }
+    let root = PathBuf::from(v["InstallLocation"].as_str()?);
+    if !root.is_absolute() || !root.is_dir() {
+        return None;
+    }
+    let name = v["DisplayName"].as_str().map(str::trim).filter(|s| !s.is_empty())
+        .map(str::to_owned).or_else(|| root.file_name().map(|s| s.to_string_lossy().into_owned()))?;
+    let exe_hint = v["LaunchExecutable"].as_str().and_then(|exe| epic_exe_hint(&root, exe));
+    Some(GameEntry { name, root, store: Store::Epic, exe_hint, steam_appid: None })
+}
+
+fn epic_exe_hint(root: &Path, exe: &str) -> Option<PathBuf> {
+    let exe = Path::new(exe);
+    let relative = if exe.is_absolute() { exe.strip_prefix(root).ok()? } else { exe };
+    if !relative.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) ||
+        !relative.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+        return None;
+    }
+    Some(relative.to_path_buf())
+}
+
+fn parse_epic_preview(text: &str) -> Vec<GameEntry> {
+    let mut latest = HashMap::new();
+    for line in text.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line.trim_start_matches('\u{feff}')) else { continue };
+        if let Some(id) = record["installationId"].as_str().filter(|id| !id.is_empty()) {
+            latest.insert(id.to_owned(), record);
+        }
+    }
+    latest.into_values().filter_map(|record| {
+        if record["complete"].as_bool() != Some(true) ||
+            !record["platform"].as_str().is_some_and(|p| p.eq_ignore_ascii_case("Windows")) {
+            return None;
+        }
+        let root = PathBuf::from(record["dir"].as_str()?);
+        let exe = epic_exe_hint(&root, record["launchExecutable"].as_str()?)?;
+        if !root.is_absolute() || !root.join(&exe).is_file() {
+            return None;
+        }
+        let name = root.file_name()?.to_string_lossy().into_owned();
+        Some(GameEntry { name, root, store: Store::Epic, exe_hint: Some(exe), steam_appid: None })
+    }).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epic_manifest_reader_keeps_installed_games() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifests = dir.path().join("Manifests");
+        std::fs::create_dir(&manifests).unwrap();
+        let root = dir.path().join("Example Game");
+        std::fs::create_dir(&root).unwrap();
+        let manifest = serde_json::json!({
+            "DisplayName": "Example Game",
+            "InstallLocation": root,
+            "LaunchExecutable": root.join("Bin").join("Example.exe"),
+            "AppCategories": ["games/example"],
+            "bIsExecutable": true,
+        });
+        std::fs::write(manifests.join("installed.ITEM"), format!("\u{feff}{manifest}")).unwrap();
+        let mut incomplete = manifest.clone();
+        incomplete["bIsIncompleteInstall"] = true.into();
+        std::fs::write(manifests.join("incomplete.item"), incomplete.to_string()).unwrap();
+        let mut addon = manifest.clone();
+        addon["AppCategories"] = serde_json::json!(["addons"]);
+        std::fs::write(manifests.join("addon.item"), addon.to_string()).unwrap();
+        let mut missing = manifest;
+        missing["InstallLocation"] = serde_json::json!(root.join("missing"));
+        std::fs::write(manifests.join("missing.item"), missing.to_string()).unwrap();
+        std::fs::write(manifests.join("broken.item"), "{").unwrap();
+
+        let games = read_epic_manifests(&manifests);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].name, "Example Game");
+        assert_eq!(games[0].root, root);
+        assert_eq!(games[0].store, Store::Epic);
+        assert_eq!(games[0].exe_hint, Some(PathBuf::from("Bin").join("Example.exe")));
+    }
+
+    #[test]
+    fn epic_preview_uses_the_latest_record_for_each_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Preview Game");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("Game.exe"), []).unwrap();
+        let mut record = serde_json::json!({
+            "installationId": "old", "complete": true, "platform": "Windows",
+            "dir": root, "launchExecutable": "Game.exe",
+        });
+        let mut log = format!("{{\"version\":1,\"entries\":0}}\n{record}\n");
+        record["complete"] = false.into();
+        log.push_str(&format!("{record}\n"));
+        record["installationId"] = "current".into();
+        log.push_str(&format!("{record}\n"));
+        record["complete"] = true.into();
+        log.push_str(&format!("{record}\n{{"));
+        let games = parse_epic_preview(&log);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].name, "Preview Game");
+        assert_eq!(games[0].root, root);
+        assert_eq!(games[0].store, Store::Epic);
+        assert_eq!(games[0].exe_hint.as_deref(), Some(Path::new("Game.exe")));
+    }
 
     #[test]
     fn vdf_paths_are_unescaped() {

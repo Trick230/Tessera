@@ -42,10 +42,13 @@ fn load_folders() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn save_folders(folders: &[PathBuf]) {
-    let _ = std::fs::create_dir_all(paths::data_dir());
+fn save_folders(folders: &[PathBuf]) -> std::io::Result<()> {
+    std::fs::create_dir_all(paths::data_dir())?;
     let text: String = folders.iter().map(|p| format!("{}\n", p.display())).collect();
-    let _ = std::fs::write(folders_file(), text);
+    let path = folders_file();
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, text)?;
+    std::fs::rename(temp, path)
 }
 
 fn status_label(s: &InstallState) -> String {
@@ -695,7 +698,7 @@ fn apply_view(ui: &MainWindow, st: &mut State) {
     load_session(ui, st, ui.get_selected(), false);
 }
 
-fn refresh(ui: &MainWindow, state: &Shared) {
+fn refresh(ui: &MainWindow, state: &Shared, added: Option<String>) {
     ui.set_busy(true);
     ui.set_status_text("Looking for games…".into());
     let weak = ui.as_weak();
@@ -710,7 +713,16 @@ fn refresh(ui: &MainWindow, state: &Shared) {
             let n = games.len();
             st.games = games;
             st.shown_exe = None; // a session may have been written since the last load
+            if added.is_some() {
+                ui.set_selected(-1);
+            }
             apply_view(&ui, &mut st);
+            if let Some(i) = added.as_ref().and_then(|key| st.view.iter().position(|&gi| {
+                tessera_core::library::install_key(&st.games[gi].entry.root) == *key
+            })) {
+                ui.set_selected(i as i32);
+                load_session(&ui, &mut st, i as i32, false);
+            }
             // TESSERA_SELECT=<name part>: preselect a game (scripted screenshots).
             if let (true, Ok(want)) = (ui.get_selected() < 0, std::env::var("TESSERA_SELECT")) {
                 let want = want.to_lowercase();
@@ -930,7 +942,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let (w, s) = (ui.as_weak(), state.clone());
-        ui.on_refresh(move || refresh(&w.unwrap(), &s));
+        ui.on_refresh(move || refresh(&w.unwrap(), &s, None));
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());
@@ -943,15 +955,24 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_add_folder(move || {
-            let Some(dir) = rfd::FileDialog::new().set_title("Game folder").pick_folder() else { return };
+            let ui = w.unwrap();
+            let Some(dir) = rfd::FileDialog::new().set_title("Select the game's installation folder").pick_folder() else { return };
+            let key = tessera_core::library::install_key(&dir);
             {
                 let mut st = s.lock().unwrap();
-                if !st.folders.contains(&dir) {
-                    st.folders.push(dir);
-                    save_folders(&st.folders);
+                if st.games.iter().any(|game| tessera_core::library::install_key(&game.entry.root) == key) ||
+                    st.folders.iter().any(|folder| tessera_core::library::install_key(folder) == key) {
+                    ui.set_status_text("This game folder is already in the library.".into());
+                    return;
+                }
+                st.folders.push(dir);
+                if let Err(e) = save_folders(&st.folders) {
+                    st.folders.pop();
+                    ui.set_status_text(format!("Could not save the game folder: {e}").into());
+                    return;
                 }
             }
-            refresh(&w.unwrap(), &s);
+            refresh(&ui, &s, Some(key));
         });
     }
     {
@@ -1079,7 +1100,7 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    refresh(&ui, &state);
+    refresh(&ui, &state, None);
     {
         // S7: read-only driver shader cache check, off the UI thread.
         let weak = ui.as_weak();
