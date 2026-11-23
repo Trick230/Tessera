@@ -501,7 +501,16 @@ fn shader_state(
     let (value, tone) = if let Some(cache) = cache {
         let files = if cache.files == 1 { "file" } else { "files" };
         d.push(format!("{} across {} matching NVIDIA cache {files}.", size(cache.bytes), cache.files));
-        ("Stored".to_string(), NEUTRAL)
+        let value = if cache.counted_files == 0 {
+            "Count unavailable".to_string()
+        } else {
+            if cache.counted_files < cache.files {
+                d.push(format!("Count covers {} of {} files.", cache.counted_files, cache.files));
+            }
+            let entries = if cache.entries == 1 { "entry" } else { "entries" };
+            format!("{} cache {entries}", cache.entries)
+        };
+        (value, NEUTRAL)
     } else if c.compiled > 0 {
         (format!("{} compiled", c.compiled), OK)
     } else {

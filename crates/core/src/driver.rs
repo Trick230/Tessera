@@ -3,6 +3,7 @@
 //! of its shader cache folders and (NVIDIA) the cache size limit, and notices
 //! driver updates, after which every game recompiles its shaders.
 
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// AMD keeps at most this much shader cache; past it old entries are evicted.
@@ -174,17 +175,18 @@ pub struct NvidiaGameCache {
     pub files: u64,
     /// Used bytes in the matched files, read from their headers.
     pub bytes: u64,
+    /// Driver cache entries in files whose record stream was fully parsed.
+    pub entries: u64,
+    pub counted_files: u64,
 }
 
-/// Reads supported NVIDIA DXCache headers and totals those naming the executable.
+/// Counts entries in supported NVIDIA DXCache files naming the executable.
 pub fn nvidia_game_cache(exe: &Path) -> Option<NvidiaGameCache> {
     let local = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
     nvidia_game_cache_at(&local.join("NVIDIA/DXCache"), exe.file_name()?.to_str()?)
 }
 
 fn nvidia_game_cache_at(dir: &Path, exe_name: &str) -> Option<NvidiaGameCache> {
-    use std::io::Read;
-
     let mut cache = NvidiaGameCache::default();
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
@@ -207,6 +209,13 @@ fn nvidia_game_cache_at(dir: &Path, exe_name: &str) -> Option<NvidiaGameCache> {
         if name.eq_ignore_ascii_case(exe_name.as_bytes()) {
             cache.files += 1;
             cache.bytes += bytes;
+            if header[0x10] == 1 {
+                let mut reader = BufReader::with_capacity(64 * 1024, file);
+                if let Some(entries) = nvidia_cache_entries(&mut reader, bytes) {
+                    cache.entries += entries;
+                    cache.counted_files += 1;
+                }
+            }
         }
     }
     Some(cache)
@@ -220,6 +229,56 @@ fn nvidia_cache_header(header: &[u8], file_len: u64) -> Option<(&[u8], u64)> {
     let name_field = header.get(0x11..)?;
     let name = &name_field[..name_field.iter().position(|&b| b == 0)?];
     (used >= 0x12 && used <= file_len && !name.is_empty()).then_some((name, used))
+}
+
+/// Observed named NVPH layout on Windows. Each `phwr` record wraps a
+/// `0x1234` v12/v13 object and a `0x5678` compressed payload. Count the
+/// records, including driver variants, without decompressing their contents.
+fn nvidia_cache_entries(reader: &mut BufReader<std::fs::File>, used: u64) -> Option<u64> {
+    const RECORDS_START: u64 = 0x5d0;
+    const PREFIX_LEN: u64 = 0x90;
+    let mut remaining = used.checked_sub(RECORDS_START)?;
+    reader.seek_relative(RECORDS_START as i64 - 0x111).ok()?;
+    let mut count = 0;
+    let mut prefix = [0; PREFIX_LEN as usize];
+    let mut magic = [0; 4];
+    while remaining != 0 {
+        if remaining < PREFIX_LEN + 4 {
+            return None;
+        }
+        reader.read_exact(&mut prefix).ok()?;
+        let field = |offset| u64::from_le_bytes(prefix[offset..offset + 8].try_into().unwrap());
+        let body_len = field(0x08);
+        let metadata_len = field(0x70);
+        let compressed_len = field(0x78);
+        let payload_len = body_len.checked_sub(PREFIX_LEN - 0x20)?;
+        if &prefix[..8] != b"phwr\0\0\0\0"
+            || !matches!(field(0x20), 0x0c1234 | 0x0d1234)
+            || field(0x28) != 0x40
+            || field(0x30) != body_len - 0x40
+            || field(0x60) != 0x5678
+            || field(0x68) != 0x30
+            || field(0x88) != 2
+            || compressed_len < 4
+            || payload_len.checked_sub(metadata_len)? != compressed_len
+            || body_len > remaining - 0x20
+        {
+            return None;
+        }
+        reader.seek_relative(i64::try_from(metadata_len).ok()?).ok()?;
+        reader.read_exact(&mut magic).ok()?;
+        if magic != [0x28, 0xb5, 0x2f, 0xfd] {
+            return None;
+        }
+        reader.seek_relative(i64::try_from(compressed_len - 4).ok()?).ok()?;
+        remaining -= 0x20 + body_len;
+        count += 1;
+    }
+    // The driver can append while the app is reading the cache.
+    reader.seek(SeekFrom::Start(8)).ok()?;
+    let mut current_used = [0; 8];
+    reader.read_exact(&mut current_used).ok()?;
+    (u64::from_le_bytes(current_used) == used).then_some(count)
 }
 
 #[cfg(windows)]
@@ -501,11 +560,47 @@ mod tests {
         write_cache("b.nvph", b"ff7remake_.exe.bak", 100);
         assert_eq!(
             nvidia_game_cache_at(dir.path(), "ff7remake_.exe"),
-            Some(NvidiaGameCache { files: 1, bytes: 80 }),
+            Some(NvidiaGameCache { files: 1, bytes: 80, ..NvidiaGameCache::default() }),
         );
         assert_eq!(nvidia_game_cache_at(dir.path(), "other.exe"), Some(NvidiaGameCache::default()));
         write_cache("c.nvph", b"other.exe", 129);
         assert_eq!(nvidia_game_cache_at(dir.path(), "other.exe"), Some(NvidiaGameCache::default()));
-        assert_eq!(nvidia_game_cache_at(dir.path(), "ff7remake_.exe"), Some(NvidiaGameCache { files: 1, bytes: 80 }));
+        assert_eq!(
+            nvidia_game_cache_at(dir.path(), "ff7remake_.exe"),
+            Some(NvidiaGameCache { files: 1, bytes: 80, ..NvidiaGameCache::default() }),
+        );
+    }
+
+    #[test]
+    fn nvidia_cache_counts_only_complete_record_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut data = vec![0; 0x5d0];
+        data[..4].copy_from_slice(b"nvph");
+        data[0x10] = 1;
+        data[0x11..0x19].copy_from_slice(b"game.exe");
+        for (version, metadata_len) in [(0x0c1234u64, 1u64), (0x0d1234, 8)] {
+            let body_len = 0x70 + metadata_len + 4;
+            let mut record = vec![0; 0x20 + body_len as usize];
+            record[..4].copy_from_slice(b"phwr");
+            for (offset, value) in [
+                (0x08, body_len), (0x20, version), (0x28, 0x40), (0x30, body_len - 0x40),
+                (0x60, 0x5678), (0x68, 0x30), (0x70, metadata_len), (0x78, 4), (0x88, 2),
+            ] {
+                record[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            record[0x90 + metadata_len as usize..].copy_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]);
+            data.extend(record);
+        }
+        let used = data.len() as u64;
+        data[8..16].copy_from_slice(&used.to_le_bytes());
+        std::fs::write(dir.path().join("complete.nvph"), &data).unwrap();
+
+        let truncated = used - 1;
+        data[8..16].copy_from_slice(&truncated.to_le_bytes());
+        std::fs::write(dir.path().join("truncated.nvph"), data).unwrap();
+        assert_eq!(
+            nvidia_game_cache_at(dir.path(), "GAME.EXE"),
+            Some(NvidiaGameCache { files: 2, bytes: used + truncated, entries: 2, counted_files: 1 }),
+        );
     }
 }
