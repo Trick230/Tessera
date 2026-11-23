@@ -44,6 +44,8 @@ pub struct ShaderCheck {
     pub glsl: u64,
     pub spirv: Option<u64>,
     pub dxil: Option<u64>,
+    pub unity_shader_objects: u64,
+    pub unreadable_unity_shader_objects: u64,
     pub unreal_libraries_unreadable: u64,
     pub unreal_shaders_expected: u64,
     pub unreal_shaders_decoded: u64,
@@ -162,6 +164,8 @@ pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&
         c.glsl = r.glsl.unwrap_or(0);
         c.spirv = r.spirv;
         c.dxil = r.dxil;
+        c.unity_shader_objects = r.unity_shader_objects.unwrap_or(0);
+        c.unreadable_unity_shader_objects = r.unreadable_unity_shader_objects.unwrap_or(0);
         c.unreal_libraries_unreadable = r.unreal_libraries_unreadable.unwrap_or(0);
         c.unreal_shaders_expected = r.unreal_shaders_expected.unwrap_or(0);
         c.unreal_shaders_decoded = r.unreal_shaders_decoded.unwrap_or(0);

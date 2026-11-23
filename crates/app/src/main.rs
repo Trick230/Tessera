@@ -554,6 +554,13 @@ fn shader_state(
         d.push(format!("{} failed preparation.", count(c.failed)));
     }
     if c.scan_outdated == Some(false) {
+        if c.unity_shader_objects > 0 {
+            let failed = c.unreadable_unity_shader_objects;
+            let decoded = c.unity_shader_objects.saturating_sub(failed);
+            rows.push(line("Unity shader objects",
+                format!("{} of {} objects read", count(decoded), count(c.unity_shader_objects)),
+                Vec::new(), if failed > 0 { WARN } else { OK }));
+        }
         if c.unreal_shaders_expected > 0 || c.unreal_libraries_unreadable > 0 {
             let decoded = c.unreal_shaders_decoded;
             let expected = c.unreal_shaders_expected;

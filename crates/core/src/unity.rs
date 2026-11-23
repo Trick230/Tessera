@@ -6,6 +6,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+mod shader;
+
 pub(crate) fn graphics_apis(exe: &Path) -> Option<ApiSet> {
     let mut data_dir = exe.file_stem()?.to_os_string();
     data_dir.push("_Data");
@@ -110,7 +112,7 @@ impl<R: Read + Seek> Bundle<R> {
         c_string(&mut fields)?;
         c_string(&mut fields)?;
         match signature {
-            b"UnityFS" if (6..=8).contains(&version) => {}
+            b"UnityFS" if (6..=9).contains(&version) => {}
             b"UnityWeb" | b"UnityRaw" if version == 6 => {}
             b"UnityWeb" | b"UnityRaw" if (1..=5).contains(&version) => {
                 return Self::legacy(file, fields, length, version, signature == b"UnityWeb");
@@ -230,22 +232,37 @@ fn bundle_managers(file: impl Read + Seek) -> Option<Vec<u8>> {
     Some(output)
 }
 
-pub(crate) fn scan_bundle(data: &[u8], mut visit: impl FnMut(&[u8])) -> Option<(u64, u64)> {
+pub(crate) fn scan_bundle(data: &[u8], mut visit: impl FnMut(&[u8], bool))
+    -> Option<(u64, u64, u64, u64)>
+{
     let mut bundle = Bundle::open(std::io::Cursor::new(data))?;
     bundle.nodes.sort_unstable_by_key(|node| node.offset);
     let mut out = Vec::new();
+    let mut object = Vec::new();
+    let mut decoded = Vec::new();
     let (mut read, mut unreadable) = (0, 0);
+    let (mut shaders, mut unreadable_shaders) = (0, 0);
     const WINDOW: u64 = 16 << 20;
     const OVERLAP: u64 = 1 << 20;
     for index in 0..bundle.nodes.len() {
         let node = &bundle.nodes[index];
-        let end = node.offset + node.size;
-        let mut offset = node.offset;
+        let (start, length) = (node.offset, node.size);
+        let end = start + length;
+        if let Some((found, failed)) = scan_serialized(length, |offset, size, consume| {
+            if size > MAX_BLOCK { return None; }
+            bundle.read(start + offset, size, &mut object)?;
+            consume(&object);
+            Some(())
+        }, &mut decoded, &mut visit) {
+            shaders += found;
+            unreadable_shaders += failed;
+        }
+        let mut offset = start;
         let mut complete = true;
         while offset < end {
             let size = WINDOW.min(end - offset);
             if bundle.read(offset, size as usize, &mut out).is_some() {
-                visit(&out);
+                visit(&out, false);
             } else {
                 complete = false;
             }
@@ -255,7 +272,41 @@ pub(crate) fn scan_bundle(data: &[u8], mut visit: impl FnMut(&[u8])) -> Option<(
         read += u64::from(complete);
         unreadable += u64::from(!complete);
     }
-    Some((read, unreadable))
+    Some((read, unreadable, shaders, unreadable_shaders))
+}
+
+pub(crate) fn scan_serialized_slice(data: &[u8], mut visit: impl FnMut(&[u8], bool)) -> Option<(u64, u64)> {
+    scan_serialized(data.len() as u64, |offset, size, consume| {
+        let start = usize::try_from(offset).ok()?;
+        consume(data.get(start..start.checked_add(size)?)?);
+        Some(())
+    }, &mut Vec::new(), &mut visit)
+}
+
+fn scan_serialized(
+    length: u64,
+    mut read: impl FnMut(u64, usize, &mut dyn FnMut(&[u8])) -> Option<()>,
+    decoded: &mut Vec<u8>,
+    visit: &mut impl FnMut(&[u8], bool),
+) -> Option<(u64, u64)> {
+    let mut header = None;
+    read(0, length.min(48) as usize,
+         &mut |bytes| header = shader::SerializedFile::open(bytes, length))?;
+    let header = header?;
+    let mut index = None;
+    read(header.header_size as u64, header.metadata_size,
+         &mut |bytes| index = header.shaders(bytes))?;
+    let (layout, objects) = index?;
+    let found = objects.len() as u64;
+    let mut failed = 0;
+    for (offset, size) in objects {
+        let mut complete = false;
+        read(offset, size, &mut |bytes| {
+            complete = layout.scan(bytes, decoded, |code| visit(code, true)).is_some();
+        });
+        failed += u64::from(!complete);
+    }
+    Some((found, failed))
 }
 
 fn take<'a>(data: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {

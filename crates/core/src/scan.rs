@@ -47,6 +47,8 @@ pub struct ScanStats {
     pub apk_entries: u64,
     pub unity_entries: u64,
     pub unreadable_unity_entries: u64,
+    pub unity_shader_objects: u64,
+    pub unreadable_unity_shader_objects: u64,
     pub zlib: u64,
     pub gzip: u64,
     pub zstd: u64,
@@ -82,6 +84,8 @@ impl ScanStats {
         self.apk_entries += o.apk_entries;
         self.unity_entries += o.unity_entries;
         self.unreadable_unity_entries += o.unreadable_unity_entries;
+        self.unity_shader_objects += o.unity_shader_objects;
+        self.unreadable_unity_shader_objects += o.unreadable_unity_shader_objects;
         self.zlib += o.zlib;
         self.gzip += o.gzip;
         self.zstd += o.zstd;
@@ -427,6 +431,10 @@ impl Found {
 
     fn search_glsl(&mut self, data: &[u8]) {
         if memchr::memmem::find(data, b"glShaderSource").is_none() { return; }
+        self.search_glsl_source(data);
+    }
+
+    fn search_glsl_source(&mut self, data: &[u8]) {
         for at in memchr::memmem::find_iter(data, b"#version ") {
             let rest = &data[at..data.len().min(at.saturating_add(64 << 10))];
             let Some(end) = memchr::memchr(0, rest) else { continue };
@@ -739,18 +747,28 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
     f.stats.unreal_libraries_unreadable += pak.unreadable_libraries;
     let apk = map.starts_with(b"ENDILTLE") && f.search_apk(&map);
     let unity = if [b"UnityFS\0".as_slice(), b"UnityWeb\0", b"UnityRaw\0"].iter().any(|s| map.starts_with(s)) {
-        crate::unity::scan_bundle(&map, |bytes| {
+        crate::unity::scan_bundle(&map, |bytes, shader_data| {
             f.record_spirv(bytes);
+            if shader_data { f.search_glsl_source(bytes); }
             f.search(bytes, 0);
         })
     } else {
         None
     };
-    if let Some((entries, unreadable)) = unity {
+    if let Some((entries, unreadable, shaders, failed)) = unity {
         f.stats.unity_entries += entries;
         f.stats.unreadable_unity_entries += unreadable;
+        f.stats.unity_shader_objects += shaders;
+        f.stats.unreadable_unity_shader_objects += failed;
+    } else if let Some((shaders, failed)) = crate::unity::scan_serialized_slice(&map, |bytes, _| {
+        f.record_spirv(bytes);
+        f.search_glsl_source(bytes);
+        f.search(bytes, 0);
+    }) {
+        f.stats.unity_shader_objects += shaders;
+        f.stats.unreadable_unity_shader_objects += failed;
     }
-    if (!pak.opened || pak.unreadable > 0) && !apk && !unity.is_some_and(|(_, unreadable)| unreadable == 0) {
+    if (!pak.opened || pak.unreadable > 0) && !apk && !unity.is_some_and(|(_, unreadable, _, _)| unreadable == 0) {
         f.search(&map, 0);
     }
     if map.starts_with(b"PK\x03\x04") {
@@ -863,7 +881,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 10 {:016x}", key.finish())
+    format!("tessera-scan 11 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -919,6 +937,8 @@ pub struct ScanRecord {
     pub glsl: Option<u64>,
     pub spirv: Option<u64>,
     pub dxil: Option<u64>,
+    pub unity_shader_objects: Option<u64>,
+    pub unreadable_unity_shader_objects: Option<u64>,
     pub unreal_libraries_unreadable: Option<u64>,
     pub unreal_shaders_expected: Option<u64>,
     pub unreal_shaders_decoded: Option<u64>,
@@ -938,6 +958,8 @@ pub fn record_at(base: &Path) -> Option<ScanRecord> {
         locked_unreal_paks: value("locked_unreal_paks "),
         auto_key_archives: value("auto_key_archives "),
         glsl: value("glsl "), spirv: value("spirv "), dxil: value("dxil "),
+        unity_shader_objects: value("unity_shader_objects "),
+        unreadable_unity_shader_objects: value("unreadable_unity_shader_objects "),
         unreal_libraries_unreadable: value("unreal_libraries_unreadable "),
         unreal_shaders_expected: value("unreal_shaders_expected "),
         unreal_shaders_decoded: value("unreal_shaders_decoded "),
@@ -972,10 +994,11 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     shaders.retain(|s| !stored.contains(&s.hash));
     crate::shaders::write_base(&base, &shaders)?;
     fs::write(key_path(&base), format!(
-        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\nspirv {}\ndxil {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\nunity_entries {}\nunreadable_unity_entries {}\nunreal_libraries_unreadable {}\nunreal_shaders_expected {}\nunreal_shaders_decoded {}\nunreal_shaders_dxbc {}\nunreal_shaders_dxil {}\nunreal_shaders_spirv {}\n",
+        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\nspirv {}\ndxil {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\nunity_entries {}\nunreadable_unity_entries {}\nunity_shader_objects {}\nunreadable_unity_shader_objects {}\nunreal_libraries_unreadable {}\nunreal_shaders_expected {}\nunreal_shaders_decoded {}\nunreal_shaders_dxbc {}\nunreal_shaders_dxil {}\nunreal_shaders_spirv {}\n",
         stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks,
         detected.count(), stats.glsl, stats.spirv, stats.dxil, stats.cpk_entries, stats.dcx_entries, stats.zip_entries, stats.apk_entries,
         stats.unity_entries, stats.unreadable_unity_entries,
+        stats.unity_shader_objects, stats.unreadable_unity_shader_objects,
         stats.unreal_libraries_unreadable, stats.unreal_shaders_expected, stats.unreal_shaders_decoded,
         stats.unreal_shaders_dxbc, stats.unreal_shaders_dxil, stats.unreal_shaders_spirv
     ))?;
@@ -1080,6 +1103,58 @@ mod tests {
 
         let (shaders, stats) = scan_dir(dir.path());
         assert_eq!((stats.unity_entries, stats.unreadable_unity_entries), (3, 0));
+        assert_eq!(stats.dxil, 1);
+        assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
+    }
+
+    #[test]
+    fn extracts_compiled_unity_shader_objects_without_type_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let dxbc = signed(0x0000_0050);
+        let mut dxil = signed(0x0000_0060);
+        dxil[36..40].copy_from_slice(b"DXIL");
+        let stored = [lz4_flex::block::compress(&dxbc), lz4_flex::block::compress(&dxil)];
+        let stored_len = stored[0].len() as u32;
+        let mut shader = vec![0; 12]; // Empty name and part of the ShaderLab data.
+        for word in [1, 4, 1, 2, 0, stored_len, 1, 2, stored_len, stored[1].len() as u32,
+                     1, 2, dxbc.len() as u32, dxil.len() as u32,
+                     stored_len + stored[1].len() as u32] {
+            shader.extend_from_slice(&word.to_le_bytes());
+        }
+        for segment in stored { shader.extend_from_slice(&segment); }
+        shader.resize(shader.len().next_multiple_of(4), 0);
+        for word in [1u32, 1, 0, 0, 1] { shader.extend_from_slice(&word.to_le_bytes()); }
+        shader.extend_from_slice(&[1; 16]); // Asset GUID.
+
+        let mut metadata = b"6000.0.65f1\0".to_vec();
+        metadata.extend_from_slice(&19u32.to_le_bytes());
+        metadata.push(0); // Type tree stripped.
+        metadata.extend_from_slice(&1u32.to_le_bytes());
+        metadata.extend_from_slice(&48u32.to_le_bytes());
+        metadata.extend_from_slice(&[0; 19]);
+        metadata.extend_from_slice(&2u32.to_le_bytes());
+        metadata.resize(metadata.len().next_multiple_of(4), 0);
+        for (id, offset, size) in [(1u64, 0u64, shader.len() as u32), (2, shader.len() as u64, 4)] {
+            metadata.extend_from_slice(&id.to_le_bytes());
+            metadata.extend_from_slice(&offset.to_le_bytes());
+            metadata.extend_from_slice(&size.to_le_bytes());
+            metadata.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let data_offset = (48 + metadata.len()).next_multiple_of(16);
+        let file_size = (data_offset + shader.len() + 4) as u64;
+        let mut serialized = vec![0; 48];
+        serialized[8..12].copy_from_slice(&22u32.to_be_bytes());
+        serialized[20..24].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+        serialized[24..32].copy_from_slice(&file_size.to_be_bytes());
+        serialized[32..40].copy_from_slice(&(data_offset as u64).to_be_bytes());
+        serialized.extend_from_slice(&metadata);
+        serialized.resize(data_offset, 0);
+        serialized.extend_from_slice(&shader);
+        serialized.extend_from_slice(&[255; 4]); // Malformed Shader object.
+        fs::write(dir.path().join("globalgamemanagers.assets"), serialized).unwrap();
+
+        let (shaders, stats) = scan_dir(dir.path());
+        assert_eq!((stats.unity_shader_objects, stats.unreadable_unity_shader_objects), (2, 1));
         assert_eq!(stats.dxil, 1);
         assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
     }
