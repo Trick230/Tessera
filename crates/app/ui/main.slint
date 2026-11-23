@@ -1092,19 +1092,19 @@ export component MainWindow inherits Window {
                 Btn { flat: true; icon: "\u{E8F4}"; text: "Add game"; enabled: !root.busy; clicked => { root.add-folder(); } }
                 Btn { flat: true; icon: "\u{E72C}"; text: "Refresh"; enabled: !root.busy; clicked => { root.refresh(); } }
                 ToolSep { }
-                Btn {
-                    flat: !(root.has-sel && !root.cur.installed && root.cur.can-install);
-                    primary: root.has-sel && !root.cur.installed && root.cur.can-install;
-                    icon: root.has-sel && root.cur.installed ? "\u{E72C}" : "\u{E896}";
-                    text: root.has-sel && root.cur.installed ? "Reinstall layer" : "Install layer";
+                if !root.has-sel || !root.cur.installed: Btn {
+                    flat: !(root.has-sel && root.cur.can-install);
+                    primary: root.has-sel && root.cur.can-install;
+                    icon: "\u{E896}";
+                    text: "Install layer";
                     enabled: root.has-sel && root.cur.can-install && !root.cur.blocked && !root.busy;
                     clicked => { root.install(root.selected); }
                 }
-                Btn {
+                if root.has-sel && root.cur.installed: Btn {
                     flat: true;
                     icon: "\u{E74D}";
                     text: "Uninstall";
-                    enabled: root.has-sel && root.cur.installed && !root.busy;
+                    enabled: !root.busy;
                     clicked => { root.uninstall(root.selected); }
                 }
                 Btn {
