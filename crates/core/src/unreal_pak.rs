@@ -11,7 +11,9 @@ use sha1::{Digest, Sha1};
 use crate::oodle::Oodle;
 
 const MAX_INDEX: usize = 64 << 20;
-const MAX_PACKAGE: usize = 64 << 20;
+const REUSABLE_PACKAGE: usize = 64 << 20;
+const MAX_PACKAGE: usize = 256 << 20;
+static LARGE_PACKAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const FOOTER: usize = 45;
 
 pub(crate) struct PakKey(aes::Aes256);
@@ -122,7 +124,7 @@ fn package(pak: &[u8], e: Entry<'_>, key: Option<&PakKey>, oodle: Option<Oodle>,
     for mut block in e.blocks.chunks_exact(16) {
         let start = offset(&mut block)?;
         let len = offset(&mut block)?.checked_sub(start)?;
-        if len > MAX_PACKAGE { return None; }
+        if len > REUSABLE_PACKAGE { return None; }
         let bytes = stored(pak, start, len, e.encrypted, key, scratch)?;
         let raw = e.block_size.min(e.size - out.len());
         let begin = out.len();
@@ -183,12 +185,34 @@ pub(crate) fn scan(pak: &[u8], key: Option<&PakKey>, oodle: Option<Oodle>,
     result.locked = false;
     let (mut out, mut scratch) = (Vec::new(), Vec::new());
     for e in packages {
-        if package(&pak[..start], e, key, oodle, &mut out, &mut scratch).is_some() {
+        let large = e.size > REUSABLE_PACKAGE;
+        // Large packages are rare and should not expand every scan worker's buffer.
+        let _guard = large.then(|| LARGE_PACKAGE.lock().unwrap());
+        let mut large_out = Vec::new();
+        let output = if large { &mut large_out } else { &mut out };
+        if package(&pak[..start], e, key, oodle, output, &mut scratch).is_some() {
             result.packages += 1;
-            found(&out);
+            found(output);
         } else {
             result.unreadable += 1;
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_packages_above_the_reusable_buffer_limit() {
+        let size = REUSABLE_PACKAGE + 1;
+        let mut pak = vec![0; size];
+        pak[size - 1] = 42;
+        let entry = Entry { start: 0, compressed: size, size, method: 0, block_size: 0, encrypted: false, blocks: &[] };
+        let mut out = Vec::new();
+        assert!(package(&pak, entry, None, None, &mut out, &mut Vec::new()).is_some());
+        assert_eq!(out.len(), size);
+        assert_eq!(out.last(), Some(&42));
+    }
 }
