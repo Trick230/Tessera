@@ -881,7 +881,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 11 {:016x}", key.finish())
+    format!("tessera-scan 12 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -1391,6 +1391,31 @@ mod tests {
         let f = scan_file(&package_path, None, Some(&key), |_, _| None);
         assert_eq!((f.stats.unreal_packages, f.stats.locked_unreal_paks, f.stats.unreadable_unreal_packages), (1, 0, 0));
         assert_eq!(f.shaders[&hash_of(&shader)].code, shader);
+    }
+
+    #[test]
+    fn extracts_unreal_version_one_shader_library() {
+        use std::io::Write;
+
+        let shader = signed(0x0000_0050);
+        let mut writer = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        writer.write_all(&shader).unwrap();
+        let code = writer.finish().unwrap();
+        let mut library = Vec::new();
+        library.extend_from_slice(&1u32.to_le_bytes());
+        library.extend_from_slice(&1u32.to_le_bytes());
+        library.extend_from_slice(&[0x42; 20]);
+        library.extend_from_slice(&0u64.to_le_bytes());
+        library.extend_from_slice(&(code.len() as u32).to_le_bytes());
+        library.extend_from_slice(&(shader.len() as u32).to_le_bytes());
+        library.push(1); // Shader frequency.
+        library.extend_from_slice(&code);
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("ShaderArchive-test-PCD3D_SM5.ushaderbytecode"), library).unwrap();
+        let (shaders, stats) = scan_dir(dir.path());
+        assert_eq!((stats.unreal_shaders_expected, stats.unreal_shaders_decoded), (1, 1));
+        assert_eq!(shaders[0].code, shader);
     }
 
     #[test]

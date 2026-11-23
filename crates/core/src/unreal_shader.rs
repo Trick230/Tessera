@@ -36,19 +36,16 @@ fn decompress<'a>(code: &'a [u8], raw: usize, oodle: Option<Oodle>, out: &'a mut
 
 pub(crate) fn scan_file(mut data: &[u8], oodle: Option<Oodle>,
                         mut shader: impl FnMut(&[u8])) -> Option<u64> {
-    if number(&mut data)? != 2 { return None; }
-    let map_hashes = array(&mut data, 20)?;
-    let shader_hashes = array(&mut data, 20)?;
-    let maps = array(&mut data, 16)?;
-    let entries = array(&mut data, 17)?;
-    array(&mut data, 16)?; // Preload ranges.
-    array(&mut data, 4)?; // Shader-map indices.
-    if map_hashes.len() / 20 != maps.len() / 16 || shader_hashes.len() / 20 != entries.len() / 17 {
-        return None;
-    }
+    let (entries, stride, hash_size) = match number(&mut data)? {
+        // Early UE4 libraries serialized a map from SHA-1 to code entry.
+        1 => (array(&mut data, 37)?, 37, 20),
+        2 => (serialized_entries(&mut data)?, 17, 0),
+        _ => return None,
+    };
     let mut out = Vec::new();
-    for mut entry in entries.chunks_exact(17) {
+    for entry in entries.chunks_exact(stride) {
         let code = (|| {
+            let mut entry = &entry[hash_size..];
             let start = offset(&mut entry)?;
             let size = number(&mut entry)? as usize;
             let raw = number(&mut entry)? as usize;
@@ -58,7 +55,18 @@ pub(crate) fn scan_file(mut data: &[u8], oodle: Option<Oodle>,
             shader(code);
         }
     }
-    Some((entries.len() / 17) as u64)
+    Some((entries.len() / stride) as u64)
+}
+
+fn serialized_entries<'a>(data: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let map_hashes = array(data, 20)?;
+    let shader_hashes = array(data, 20)?;
+    let maps = array(data, 16)?;
+    let entries = array(data, 17)?;
+    array(data, 16)?; // Preload ranges.
+    array(data, 4)?; // Shader-map indices.
+    (map_hashes.len() / 20 == maps.len() / 16 && shader_hashes.len() / 20 == entries.len() / 17)
+        .then_some(entries)
 }
 
 pub(crate) struct Groups<'a> {
