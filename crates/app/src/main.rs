@@ -247,7 +247,7 @@ fn shader_text(exe: &Path, sum: Option<&session::Summary>) -> String {
     }
     let store = tessera_core::warm::stored(exe);
     if store.shaders > 0 {
-        parts.push(format!("{} stored ({})", store.shaders, size(store.bytes)));
+        parts.push(format!("{} bytecode entries ({})", store.shaders, size(store.bytes)));
     }
     let w = tessera_core::warm::stats(exe);
     if w.ok + w.failed > 0 {
@@ -485,15 +485,6 @@ fn shader_state(
         rows.push(line("Unreal PAK key", value.to_string(), vec![detail.to_string()], tone));
     }
 
-    let (value, detail) = match disk_cache {
-        Some(cache) if cache.files > 0 => (
-            "Found".to_string(),
-            format!("{} across {} matching NVIDIA cache file(s).", size(cache.bytes), cache.files),
-        ),
-        _ => ("No matching files".to_string(), "No NVIDIA cache files were found for this executable.".to_string()),
-    };
-    rows.push(line("Driver cache on disk", value, vec![detail], NEUTRAL));
-
     if scan_gl {
         let (value, detail) = if c.scan_outdated.is_some() {
             (c.glsl.to_string(), "Embedded GLSL sources recorded by the last scan.")
@@ -503,24 +494,29 @@ fn shader_state(
         rows.push(line("OpenGL shaders", value, vec![detail.to_string()], NEUTRAL));
     }
 
-    // Warm-up results written with the installed driver.
+    // Driver cache files and warm-up results report compiled shaders. The
+    // scan and layer stores supply bytecode for preparation.
     let mut d = Vec::new();
-    let warmable = c.stored - c.skipped;
-    let (value, tone) = if c.stored == 0 {
-        d.push(if can_prepare {
-            "No shaders stored yet. Prepare shaders searches the game files; playing with the layer on stores the rest."
-        } else {
-            "No shaders stored yet. The warm-up is for D3D11: play once on D3D11 with the layer on, then Prepare shaders compiles what it stored."
-        }.to_string());
-        ("Nothing stored".to_string(), NEUTRAL)
-    } else if warmable == 0 {
-        ("No supported shaders".to_string(), NEUTRAL)
+    let cache = disk_cache.filter(|cache| cache.files > 0);
+    let (value, tone) = if let Some(cache) = cache {
+        let files = if cache.files == 1 { "file" } else { "files" };
+        d.push(format!("{} across {} matching NVIDIA cache {files}.", size(cache.bytes), cache.files));
+        ("Stored".to_string(), NEUTRAL)
+    } else if c.compiled > 0 {
+        (format!("{} compiled", c.compiled), OK)
     } else {
-        d.push(format!("{} exercised in a test draw or dispatch.", c.compiled));
-        let created = c.compiled + c.created_only;
-        let v = format!("{created} of {warmable} created");
-        (v, if created == warmable { OK } else { WARN })
+        ("Unconfirmed".to_string(), NEUTRAL)
     };
+    if c.compiled > 0 {
+        d.push(format!("D3D11 warm-up confirmed {} with a test draw or dispatch on the current driver.", c.compiled));
+    }
+    if cache.is_none() && c.stored == 0 && (can_prepare || !scan_gl) {
+        d.push(if can_prepare {
+            "Prepare shaders searches the game files for bytecode, and the layer captures more during play."
+        } else {
+            "For D3D11 warm-up, play with the layer on to capture bytecode, then run Prepare shaders."
+        }.to_string());
+    }
     if c.skipped > 0 {
         d.push(format!("{} are D3D12 shaders (DXIL) the D3D11 warm-up cannot take.", c.skipped));
     }
@@ -542,16 +538,14 @@ fn shader_state(
     if c.unreadable_unreal_packages > 0 {
         d.push(format!("{} Unreal packages could not be decoded.", c.unreadable_unreal_packages));
     }
-    if can_prepare || !scan_gl {
-        rows.push(line("Shader preparation", value, d, tone));
-    }
+    rows.push(line("Compiled shaders", value, d, tone));
 
     // Newly captured shaders from the last recorded game session.
     let (value, tone, d) = match run {
         Some((n, new)) => {
             let mut d = vec![format!("{n} shader creations recorded during play.")];
             if new > 0 {
-                d.push("New shaders are saved for the next preparation.".to_string());
+                d.push("New bytecode was captured for the next preparation.".to_string());
             }
             (format!("{new} new"), if new == 0 { OK } else { WARN }, d)
         }
@@ -568,7 +562,7 @@ fn shader_state(
     // Damaged: bad store entries, driver refusals, bad containers in the install.
     let mut d = Vec::new();
     if c.damaged > 0 {
-        d.push(format!("{} stored entries are cut short or fail their checksum; they are left out.", c.damaged));
+        d.push(format!("{} bytecode entries are cut short or fail their checksum; they are left out.", c.damaged));
     }
     if c.failed > 0 {
         d.push(format!("The driver refused {} in the warm-up.", c.failed));
@@ -580,7 +574,7 @@ fn shader_state(
     let tone = if c.damaged > 0 { BAD } else if d.is_empty() { OK } else { WARN };
     let value = if d.is_empty() { "None".to_string() } else { (c.damaged + c.failed + bad_files).to_string() };
     if d.is_empty() {
-        d.push(if c.stored == 0 { "Nothing to check yet." } else { "Every stored shader is whole and matches its checksum." }.to_string());
+        d.push(if c.stored == 0 { "Nothing to check yet." } else { "All bytecode entries passed validation." }.to_string());
     }
     rows.push(line("Damaged", value, d, tone));
 
@@ -601,14 +595,18 @@ fn shader_state(
         "Game updated"
     };
     if tone == OK {
-        d.push(match (c.stored, c.scan_outdated) {
-            (0, _) => "Nothing to compare yet.",
-            (_, Some(_)) => "The search matches the game as installed, and the warm-up the installed driver.",
-            (_, None) => "The warm-up matches the installed driver. The game files were not searched yet.",
-        }.to_string());
+        if c.scan_outdated == Some(false) {
+            d.push("The search matches the game as installed.".to_string());
+        }
+        if c.compiled > 0 {
+            d.push("The warm-up matches the installed driver.".to_string());
+        }
+        if d.is_empty() {
+            d.push("Nothing to compare yet.".to_string());
+        }
     }
     if c.dropped > 0 {
-        d.push(format!("{} warm-up entries refer to shaders no longer stored (ignored).", c.dropped));
+        d.push(format!("{} warm-up entries have no matching bytecode (ignored).", c.dropped));
     }
     rows.push(line("Out of date", value.to_string(), d, tone));
 
