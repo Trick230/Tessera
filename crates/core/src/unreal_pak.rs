@@ -45,17 +45,17 @@ impl PakKey {
     }
 }
 
-fn take<'a>(data: &mut &'a [u8], size: usize) -> Option<&'a [u8]> {
+pub(crate) fn take<'a>(data: &mut &'a [u8], size: usize) -> Option<&'a [u8]> {
     let (value, remaining) = data.split_at_checked(size)?;
     *data = remaining;
     Some(value)
 }
 
-fn number(data: &mut &[u8]) -> Option<u32> {
+pub(crate) fn number(data: &mut &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes(take(data, 4)?.try_into().ok()?))
 }
 
-fn offset(data: &mut &[u8]) -> Option<usize> {
+pub(crate) fn offset(data: &mut &[u8]) -> Option<usize> {
     usize::try_from(u64::from_le_bytes(take(data, 8)?.try_into().ok()?)).ok()
 }
 
@@ -109,6 +109,32 @@ fn stored<'a>(pak: &'a [u8], start: usize, len: usize, encrypted: bool, key: Opt
     scratch.extend_from_slice(bytes);
     key?.decode(scratch)?;
     scratch.get(..len)
+}
+
+pub(crate) fn decode_block(method: &[u8], bytes: &[u8], raw: usize, oodle: Option<Oodle>,
+                           out: &mut Vec<u8>) -> Option<()> {
+    let begin = out.len();
+    if method.eq_ignore_ascii_case(b"None") {
+        if bytes.len() != raw { return None; }
+        out.extend_from_slice(bytes);
+    } else if method.eq_ignore_ascii_case(b"Zlib") {
+        flate2::read::ZlibDecoder::new(bytes).take(raw as u64 + 1).read_to_end(out).ok()?;
+    } else if method.eq_ignore_ascii_case(b"Gzip") {
+        flate2::read::GzDecoder::new(bytes).take(raw as u64 + 1).read_to_end(out).ok()?;
+    } else if method.eq_ignore_ascii_case(b"Oodle") {
+        if !oodle?.decode_exact(bytes, raw, out) { return None; }
+    } else if method.eq_ignore_ascii_case(b"LZ4") {
+        out.resize(begin.checked_add(raw)?, 0);
+        if lz4_flex::block::decompress_into(bytes, &mut out[begin..]).ok()? != raw {
+            return None;
+        }
+    } else if method.eq_ignore_ascii_case(b"Zstd") {
+        ruzstd::decoding::StreamingDecoder::new(bytes).ok()?
+            .take(raw as u64 + 1).read_to_end(out).ok()?;
+    } else {
+        return None;
+    }
+    (out.len() - begin == raw).then_some(())
 }
 
 fn package(pak: &[u8], e: Entry<'_>, key: Option<&PakKey>, oodle: Option<Oodle>,

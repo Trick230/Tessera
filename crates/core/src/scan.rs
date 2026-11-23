@@ -648,6 +648,8 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>) -> Found {
     f.stats.bytes = len;
     let pak = if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pak")) {
         unreal_pak::scan(&map, key, oodle, |bytes| f.search_unreal_package(bytes))
+    } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("utoc")) {
+        crate::unreal_io::scan(&map, path, key, oodle, |bytes| f.search_unreal_package(bytes))
     } else {
         unreal_pak::PakScan::default()
     };
@@ -764,7 +766,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 7 {:016x}", key.finish())
+    format!("tessera-scan 8 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
