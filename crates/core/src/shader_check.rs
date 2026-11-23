@@ -43,6 +43,13 @@ pub struct ShaderCheck {
     pub auto_key_archives: u64,
     pub glsl: u64,
     pub spirv: Option<u64>,
+    pub dxil: Option<u64>,
+    pub unreal_libraries_unreadable: u64,
+    pub unreal_shaders_expected: u64,
+    pub unreal_shaders_decoded: u64,
+    pub unreal_shaders_dxbc: u64,
+    pub unreal_shaders_dxil: u64,
+    pub unreal_shaders_spirv: u64,
     /// Whether the install changed since the last scan (None: never scanned
     /// or install folder unknown).
     pub scan_outdated: Option<bool>,
@@ -154,6 +161,13 @@ pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&
         c.auto_key_archives = r.auto_key_archives.unwrap_or(0);
         c.glsl = r.glsl.unwrap_or(0);
         c.spirv = r.spirv;
+        c.dxil = r.dxil;
+        c.unreal_libraries_unreadable = r.unreal_libraries_unreadable.unwrap_or(0);
+        c.unreal_shaders_expected = r.unreal_shaders_expected.unwrap_or(0);
+        c.unreal_shaders_decoded = r.unreal_shaders_decoded.unwrap_or(0);
+        c.unreal_shaders_dxbc = r.unreal_shaders_dxbc.unwrap_or(0);
+        c.unreal_shaders_dxil = r.unreal_shaders_dxil.unwrap_or(0);
+        c.unreal_shaders_spirv = r.unreal_shaders_spirv.unwrap_or(0);
         c.scan_outdated = install_key.map(|k| k != r.key);
     }
     c

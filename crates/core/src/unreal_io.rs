@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Indexed reads from standard Unreal IoStore containers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::oodle::Oodle;
 use crate::unreal_pak::{decode_block, take, PakKey, PakScan};
+use crate::unreal_shader::{Groups, Payload};
 
 const HEADER_SIZE: usize = 144;
 const MAX_CHUNK: usize = 256 << 20;
@@ -56,8 +57,8 @@ impl<'a> Toc<'a> {
         Some(Self {
             ids, ranges, blocks, methods, method_width, block_size: field(44),
             partition_count, partition_size, encrypted: header[80] & 2 != 0,
-            ue5: version >= 4 || ids.chunks_exact(12).any(|id| id[11] == 6)
-                && !ids.chunks_exact(12).any(|id| id[11] == 10),
+            ue5: version >= 5 || (ids.chunks_exact(12).any(|id| id[11] == 6)
+                && !ids.chunks_exact(12).any(|id| id[11] == 10)),
         })
     }
 
@@ -66,6 +67,10 @@ impl<'a> Toc<'a> {
         let start = (index - 1).checked_mul(self.method_width)?;
         let name = self.methods.get(start..start.checked_add(self.method_width)?)?;
         Some(name.split(|&b| b == 0).next()?)
+    }
+
+    fn shader_types(&self) -> (u8, u8) {
+        if self.ue5 { (8, 9) } else { (11, 12) }
     }
 }
 
@@ -85,6 +90,13 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
+    fn new<'a>(toc: Toc<'a>, path: &'a Path, key: Option<&'a PakKey>, oodle: Option<Oodle>) -> Reader<'a> {
+        Reader {
+            toc, path, key, oodle, files: HashMap::new(), compressed: Vec::new(), block: Vec::new(),
+            last_block: None,
+        }
+    }
+
     fn partition_path(&self, index: u32) -> Option<PathBuf> {
         if index == 0 { return Some(self.path.with_extension("ucas")); }
         let mut name = self.path.file_stem()?.to_os_string();
@@ -147,8 +159,52 @@ impl Reader<'_> {
     }
 }
 
+pub(crate) struct Catalog<'a> {
+    archives: Vec<(&'a Path, Option<&'a PakKey>, memmap2::Mmap)>,
+    groups: HashMap<[u8; 12], Vec<(usize, usize)>>,
+}
+
+impl<'a> Catalog<'a> {
+    pub(crate) fn new(paths: &'a [PathBuf], key: impl Fn(&Path) -> Option<&'a PakKey>) -> Self {
+        let mut catalog = Self { archives: Vec::new(), groups: HashMap::new() };
+        for path in paths {
+            if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("utoc")) { continue; }
+            let Ok(file) = File::open(path) else { continue };
+            // SAFETY: Read-only mapping of the table, independent of the partition files.
+            let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { continue };
+            let Some(toc) = Toc::parse(&map) else { continue };
+            let key = key(path);
+            if toc.encrypted && key.is_none() { continue; }
+            let index = catalog.archives.len();
+            let group_type = toc.shader_types().1;
+            for (chunk, id) in toc.ids.chunks_exact(12).enumerate() {
+                if id[11] == group_type {
+                    let id: [u8; 12] = id.try_into().unwrap();
+                    catalog.groups.entry(id).or_default().push((index, chunk));
+                }
+            }
+            catalog.archives.push((path, key, map));
+        }
+        catalog
+    }
+
+    pub(crate) fn read_group(&self, id: &[u8], from: &Path, oodle: Option<Oodle>,
+                             out: &mut Vec<u8>) -> Option<()> {
+        for &(archive, chunk) in self.groups.get(id)? {
+            let (path, key, map) = &self.archives[archive];
+            if *path == from { continue; }
+            let Some(toc) = Toc::parse(map) else { continue };
+            if Reader::new(toc, path, *key, oodle).read_chunk(chunk, out).is_some() {
+                return Some(());
+            }
+        }
+        None
+    }
+}
+
 pub(crate) fn scan(toc: &[u8], path: &Path, key: Option<&PakKey>, oodle: Option<Oodle>,
-                   mut found: impl FnMut(&[u8])) -> PakScan {
+                   mut read_external: impl FnMut(&[u8], &mut Vec<u8>) -> Option<()>,
+                   mut found: impl FnMut(Payload, &[u8])) -> PakScan {
     let mut result = PakScan::default();
     let Some(toc) = Toc::parse(toc) else { return result };
     if toc.encrypted && key.is_none() {
@@ -158,18 +214,43 @@ pub(crate) fn scan(toc: &[u8], path: &Path, key: Option<&PakKey>, oodle: Option<
     result.opened = true;
     let ids = toc.ids;
     let ue5 = toc.ue5;
-    let mut reader = Reader {
-        toc, path, key, oodle, files: HashMap::new(), compressed: Vec::new(), block: Vec::new(),
-        last_block: None,
-    };
+    let (library_type, group_type) = toc.shader_types();
+    let mut reader = Reader::new(toc, path, key, oodle);
     let mut out = Vec::new();
+    let groups_by_id: HashMap<_, _> = ids.chunks_exact(12).enumerate()
+        .filter(|(_, id)| id[11] == group_type).map(|(index, id)| (id, index)).collect();
+    let mut split_groups = HashSet::new();
+    let (mut packed, mut decoded) = (Vec::new(), Vec::new());
     for (index, id) in ids.chunks_exact(12).enumerate() {
-        if !matches!((ue5, id[11]), (true, 1 | 7..=9) | (false, 2)) {
+        if id[11] != library_type { continue; }
+        let Some(library) = reader.read_chunk(index, &mut out).and_then(|()| Groups::parse(&out)) else {
+            result.unreadable_libraries += 1;
+            continue;
+        };
+        result.packages += 1;
+        result.expected_shaders += library.expected();
+        for (group, id) in library.ids().enumerate() {
+            let mut emit = |code: &[u8]| found(Payload::Shader, code);
+            if let Some(&chunk) = groups_by_id.get(id) {
+                if reader.read_chunk(chunk, &mut packed).is_some() &&
+                    library.scan_group(group, &packed, oodle, &mut decoded, &mut emit).is_some() {
+                    split_groups.insert(chunk);
+                    continue;
+                }
+            }
+            if read_external(id, &mut packed).is_some() {
+                library.scan_group(group, &packed, oodle, &mut decoded, &mut emit);
+            }
+        }
+    }
+    for (index, id) in ids.chunks_exact(12).enumerate() {
+        if id[11] != group_type && !matches!((ue5, id[11]), (true, 1 | 7) | (false, 2)) {
             continue;
         }
+        if split_groups.contains(&index) { continue; }
         if reader.read_chunk(index, &mut out).is_some() {
             result.packages += 1;
-            found(&out);
+            found(Payload::Package, &out);
         } else {
             result.unreadable += 1;
         }
@@ -207,7 +288,7 @@ mod tests {
             toc.extend_from_slice(&(4u32 | (method << 24)).to_le_bytes());
         }
         toc.extend_from_slice(b"Zlib\0\0\0\0");
-        let result = scan(&toc, &path, None, None, |bytes| assert_eq!(bytes, b"cdefg"));
+        let result = scan(&toc, &path, None, None, |_, _| None, |_, bytes| assert_eq!(bytes, b"cdefg"));
         assert_eq!((result.packages, result.unreadable), (1, 0));
     }
 }

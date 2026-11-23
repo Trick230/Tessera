@@ -17,6 +17,7 @@ use rayon::prelude::*;
 
 use crate::oodle::{self, Oodle};
 use crate::unreal_pak::{self, PakKey};
+use crate::unreal_shader::{self, Payload};
 use crate::shaders::{Shader, FLAG_DXBC, FLAG_DXIL, STAGE_CS, STAGE_DS, STAGE_GS, STAGE_HS, STAGE_PS, STAGE_VS};
 
 /// Largest decompressed stream searched; bigger ones are cut (their start is still searched).
@@ -53,12 +54,19 @@ pub struct ScanStats {
     pub usable: u64,
     /// Unique containers it cannot (DXIL, SM 5.1+, libraries, mesh shaders).
     pub skipped: u64,
+    pub dxil: u64,
     /// D3D11 containers whose checksum does not match their contents: the
     /// runtime rejects them as they are, so the game never creates them so.
     pub invalid: u64,
     pub unreal_packages: u64,
     pub unreadable_unreal_packages: u64,
     pub locked_unreal_paks: u64,
+    pub unreal_libraries_unreadable: u64,
+    pub unreal_shaders_expected: u64,
+    pub unreal_shaders_decoded: u64,
+    pub unreal_shaders_dxbc: u64,
+    pub unreal_shaders_dxil: u64,
+    pub unreal_shaders_spirv: u64,
 }
 
 impl ScanStats {
@@ -79,6 +87,12 @@ impl ScanStats {
         self.unreal_packages += o.unreal_packages;
         self.unreadable_unreal_packages += o.unreadable_unreal_packages;
         self.locked_unreal_paks += o.locked_unreal_paks;
+        self.unreal_libraries_unreadable += o.unreal_libraries_unreadable;
+        self.unreal_shaders_expected += o.unreal_shaders_expected;
+        self.unreal_shaders_decoded += o.unreal_shaders_decoded;
+        self.unreal_shaders_dxbc += o.unreal_shaders_dxbc;
+        self.unreal_shaders_dxil += o.unreal_shaders_dxil;
+        self.unreal_shaders_spirv += o.unreal_shaders_spirv;
     }
 }
 
@@ -241,7 +255,7 @@ pub fn container_at(b: &[u8]) -> Option<Container> {
 #[derive(Default)]
 struct Found {
     shaders: HashMap<u64, Shader>,
-    skipped: HashMap<u64, ()>,
+    skipped: HashMap<u64, bool>,
     glsl: HashSet<u128>,
     spirv: HashSet<u128>,
     stats: ScanStats,
@@ -249,6 +263,46 @@ struct Found {
 }
 
 impl Found {
+    fn unreal_payload(&mut self, kind: Payload, data: &[u8]) {
+        if matches!(kind, Payload::Shader) {
+            self.record_unreal_shader(data);
+            return;
+        }
+        if matches!(kind, Payload::Library) || data.starts_with(&2u32.to_le_bytes()) {
+            let before = self.stats.unreal_shaders_decoded;
+            if let Some(expected) = unreal_shader::scan_file(data, self.oodle, |code| self.record_unreal_shader(code)) {
+                self.stats.unreal_shaders_expected += expected;
+                if self.stats.unreal_shaders_decoded - before < expected {
+                    self.search_unreal_package(data);
+                }
+                return;
+            }
+            self.stats.unreal_libraries_unreadable += u64::from(matches!(kind, Payload::Library));
+        }
+        self.record_spirv(data);
+        self.search_unreal_package(data);
+    }
+
+    fn record_unreal_shader(&mut self, data: &[u8]) {
+        self.stats.unreal_shaders_decoded += 1;
+        for start in memchr::memmem::find_iter(data, b"DXBC") {
+            let Some(c) = container_at(&data[start..]) else { continue };
+            let code = &data[start..start + c.len];
+            let valid = self.record(&c, code) || self.shaders.contains_key(&c.hash) || !c.d3d11();
+            if !valid { continue; }
+            if c.flags & FLAG_DXIL != 0 {
+                self.stats.unreal_shaders_dxil += 1;
+            } else {
+                self.stats.unreal_shaders_dxbc += 1;
+            }
+            return;
+        }
+        if let Some(hash) = unreal_spirv_hash(data) {
+            self.spirv.insert(hash);
+            self.stats.unreal_shaders_spirv += 1;
+        }
+    }
+
     // Legacy Unreal FShaderResource layout adapted from SCSKiller's
     // InlineShaders 'Z' reader (05205ef1f6c3914b1f1245d133ebc710e2d30b52):
     // the serialized length immediately before the zlib stream bounds it.
@@ -390,7 +444,7 @@ impl Found {
 
     fn record(&mut self, c: &Container, code: &[u8]) -> bool {
         if !c.d3d11() {
-            return self.skipped.insert(c.hash, ()).is_none();
+            return self.skipped.insert(c.hash, c.flags & FLAG_DXIL != 0).is_none();
         }
         if self.shaders.contains_key(&c.hash) {
             return false;
@@ -634,7 +688,24 @@ fn spirv_hash(bytes: &[u8]) -> Option<u128> {
     Some(hash.digest128())
 }
 
-fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>) -> Found {
+fn unreal_spirv_hash(bytes: &[u8]) -> Option<u128> {
+    if let Some(hash) = spirv_hash(bytes) { return Some(hash); }
+    for start in memchr::memmem::find_iter(bytes, b"\x03\x02\x23\x07") {
+        if start < 4 { continue; }
+        // Native Vulkan shader records can put a counted SPIR-V array after a header.
+        let count = u32_at(bytes, start - 4) as usize;
+        let code = &bytes[start..];
+        for size in [count, count.saturating_mul(4)] {
+            if let Some(hash) = code.get(..size).and_then(spirv_hash) {
+                return Some(hash);
+            }
+        }
+    }
+    None
+}
+
+fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
+             read_group: impl FnMut(&[u8], &mut Vec<u8>) -> Option<()>) -> Found {
     let mut f = Found { oodle, ..Found::default() };
     let Ok(file) = fs::File::open(path) else { return f };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -646,16 +717,22 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>) -> Found {
     let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { return f };
     f.stats.files = 1;
     f.stats.bytes = len;
-    let pak = if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pak")) {
-        unreal_pak::scan(&map, key, oodle, |bytes| f.search_unreal_package(bytes))
-    } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("utoc")) {
-        crate::unreal_io::scan(&map, path, key, oodle, |bytes| f.search_unreal_package(bytes))
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
+    let pak = if extension.eq_ignore_ascii_case("pak") {
+        unreal_pak::scan(&map, key, oodle, |kind, bytes| f.unreal_payload(kind, bytes))
+    } else if extension.eq_ignore_ascii_case("utoc") {
+        crate::unreal_io::scan(&map, path, key, oodle, read_group, |kind, bytes| f.unreal_payload(kind, bytes))
+    } else if extension.eq_ignore_ascii_case("ushaderbytecode") {
+        f.unreal_payload(Payload::Library, &map);
+        return f;
     } else {
         unreal_pak::PakScan::default()
     };
     f.stats.unreal_packages += pak.packages;
     f.stats.unreadable_unreal_packages += pak.unreadable;
     f.stats.locked_unreal_paks += u64::from(pak.locked);
+    f.stats.unreal_shaders_expected += pak.expected_shaders;
+    f.stats.unreal_libraries_unreadable += pak.unreadable_libraries;
     let apk = map.starts_with(b"ENDILTLE") && f.search_apk(&map);
     if (!pak.opened || pak.unreadable > 0) && !apk {
         f.search(&map, 0);
@@ -665,7 +742,6 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>) -> Found {
     } else if map.starts_with(b"CPK ") {
         f.search_cpk(&map);
     }
-    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
     if oodle.is_some() && (extension.eq_ignore_ascii_case("bdt") || extension.eq_ignore_ascii_case("dcx")) {
         f.search_dcx(&map);
     }
@@ -699,9 +775,13 @@ fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
     // Each thread may hold a few STREAM_CAP buffers (a stream and the streams
     // inside it), so the thread count bounds the scan's memory.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(SCAN_THREADS);
+    let catalog = std::sync::OnceLock::new();
+    let archive_key = |p: &Path| detected.and_then(|keys| keys.for_archive(p)).or(key);
     let scan = || paths.par_iter().map(|p| {
-        let key = detected.and_then(|keys| keys.for_archive(p)).or(key);
-        scan_file(p, oodle, key)
+        scan_file(p, oodle, archive_key(p), |id, out| {
+            catalog.get_or_init(|| crate::unreal_io::Catalog::new(paths, archive_key))
+                .read_group(id, p, oodle, out)
+        })
     }).reduce(Found::default, Found::merge);
     let found = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
         Ok(pool) => pool.install(scan),
@@ -712,6 +792,7 @@ fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
     shaders.sort_unstable_by_key(|s| s.hash);
     stats.usable = shaders.len() as u64;
     stats.skipped = found.skipped.len() as u64;
+    stats.dxil = found.skipped.values().filter(|&&dxil| dxil).count() as u64;
     stats.glsl = found.glsl.len() as u64;
     stats.spirv = found.spirv.len() as u64;
     (shaders, stats)
@@ -766,7 +847,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 8 {:016x}", key.finish())
+    format!("tessera-scan 9 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -821,6 +902,13 @@ pub struct ScanRecord {
     pub auto_key_archives: Option<u64>,
     pub glsl: Option<u64>,
     pub spirv: Option<u64>,
+    pub dxil: Option<u64>,
+    pub unreal_libraries_unreadable: Option<u64>,
+    pub unreal_shaders_expected: Option<u64>,
+    pub unreal_shaders_decoded: Option<u64>,
+    pub unreal_shaders_dxbc: Option<u64>,
+    pub unreal_shaders_dxil: Option<u64>,
+    pub unreal_shaders_spirv: Option<u64>,
 }
 
 pub fn record_at(base: &Path) -> Option<ScanRecord> {
@@ -833,7 +921,13 @@ pub fn record_at(base: &Path) -> Option<ScanRecord> {
         unreal_packages: value("unreal_packages "), unreadable_unreal_packages: value("unreadable_unreal_packages "),
         locked_unreal_paks: value("locked_unreal_paks "),
         auto_key_archives: value("auto_key_archives "),
-        glsl: value("glsl "), spirv: value("spirv "),
+        glsl: value("glsl "), spirv: value("spirv "), dxil: value("dxil "),
+        unreal_libraries_unreadable: value("unreal_libraries_unreadable "),
+        unreal_shaders_expected: value("unreal_shaders_expected "),
+        unreal_shaders_decoded: value("unreal_shaders_decoded "),
+        unreal_shaders_dxbc: value("unreal_shaders_dxbc "),
+        unreal_shaders_dxil: value("unreal_shaders_dxil "),
+        unreal_shaders_spirv: value("unreal_shaders_spirv "),
     })
 }
 
@@ -862,9 +956,11 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     shaders.retain(|s| !stored.contains(&s.hash));
     crate::shaders::write_base(&base, &shaders)?;
     fs::write(key_path(&base), format!(
-        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\nspirv {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\n",
+        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\nspirv {}\ndxil {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\nunreal_libraries_unreadable {}\nunreal_shaders_expected {}\nunreal_shaders_decoded {}\nunreal_shaders_dxbc {}\nunreal_shaders_dxil {}\nunreal_shaders_spirv {}\n",
         stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks,
-        detected.count(), stats.glsl, stats.spirv, stats.cpk_entries, stats.dcx_entries, stats.zip_entries, stats.apk_entries
+        detected.count(), stats.glsl, stats.spirv, stats.dxil, stats.cpk_entries, stats.dcx_entries, stats.zip_entries, stats.apk_entries,
+        stats.unreal_libraries_unreadable, stats.unreal_shaders_expected, stats.unreal_shaders_decoded,
+        stats.unreal_shaders_dxbc, stats.unreal_shaders_dxil, stats.unreal_shaders_spirv
     ))?;
     Ok(stats)
 }
@@ -1121,9 +1217,90 @@ mod tests {
         let key_path = dir.path().join("test.key");
         fs::write(&key_path, "07".repeat(32)).unwrap();
         let key = PakKey::from_file(&key_path).unwrap();
-        assert_eq!(scan_file(&package_path, None, None).stats.locked_unreal_paks, 1);
-        let f = scan_file(&package_path, None, Some(&key));
+        assert_eq!(scan_file(&package_path, None, None, |_, _| None).stats.locked_unreal_paks, 1);
+        let f = scan_file(&package_path, None, Some(&key), |_, _| None);
         assert_eq!((f.stats.unreal_packages, f.stats.locked_unreal_paks, f.stats.unreadable_unreal_packages), (1, 0, 0));
         assert_eq!(f.shaders[&hash_of(&shader)].code, shader);
+    }
+
+    #[test]
+    fn extracts_unreal_shader_libraries_and_resolves_shared_iostore_groups() {
+        fn number(out: &mut Vec<u8>, n: u32) { out.extend_from_slice(&n.to_le_bytes()); }
+        fn table(out: &mut Vec<u8>, size: u32, bytes: &[u8]) {
+            number(out, size);
+            out.extend_from_slice(bytes);
+        }
+        fn iostore(root: &Path, filename: &str, id: [u8; 12], data: &[u8]) {
+            let mut toc = vec![0u8; 144];
+            toc[..16].copy_from_slice(b"-==--==--==--==-");
+            toc[16] = 5;
+            for (at, value) in [(20, 144u32), (24, 1), (28, 1), (32, 12), (44, 4096), (52, 1)] {
+                toc[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            toc[88..96].copy_from_slice(&u64::MAX.to_le_bytes());
+            toc.extend_from_slice(&id);
+            toc.extend_from_slice(&[0; 5]);
+            toc.extend_from_slice(&(data.len() as u64).to_be_bytes()[3..]);
+            toc.extend_from_slice(&((data.len() as u64) << 40).to_le_bytes());
+            number(&mut toc, data.len() as u32);
+            fs::write(root.join(filename).with_extension("utoc"), toc).unwrap();
+            fs::write(root.join(filename).with_extension("ucas"), data).unwrap();
+        }
+        fn zlib(data: &[u8]) -> Vec<u8> {
+            use std::io::Write;
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(data).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let dxbc = signed(0x0000_0050);
+        let mut dxil = signed(0x0000_0060);
+        dxil[36..40].copy_from_slice(b"DXIL");
+        let mut group = dxbc.clone();
+        group.extend_from_slice(&dxil);
+        let compressed = zlib(&group);
+        let mut group_id = [0; 12];
+        group_id[11] = 9;
+        let mut library_id = [0; 12];
+        library_id[11] = 8;
+
+        let mut library = 1u32.to_le_bytes().to_vec();
+        table(&mut library, 0, &[]);
+        table(&mut library, 2, &[0; 40]);
+        table(&mut library, 1, &group_id);
+        table(&mut library, 0, &[]);
+        number(&mut library, 2);
+        library.extend_from_slice(&0u64.to_le_bytes());
+        library.extend_from_slice(&((dxbc.len() as u64) << 34).to_le_bytes());
+        number(&mut library, 1);
+        for n in [0, 2, group.len() as u32, compressed.len() as u32] { number(&mut library, n); }
+        number(&mut library, 2);
+        number(&mut library, 1);
+        number(&mut library, 0);
+        iostore(dir.path(), "library", library_id, &library);
+        iostore(dir.path(), "group", group_id, &compressed);
+
+        let mut standalone = 2u32.to_le_bytes().to_vec();
+        table(&mut standalone, 0, &[]);
+        table(&mut standalone, 1, &[0; 20]);
+        table(&mut standalone, 0, &[]);
+        number(&mut standalone, 1);
+        standalone.extend_from_slice(&0u64.to_le_bytes());
+        let compressed = lz4_flex::block::compress(&dxbc);
+        number(&mut standalone, compressed.len() as u32);
+        number(&mut standalone, dxbc.len() as u32);
+        standalone.push(0);
+        table(&mut standalone, 0, &[]);
+        table(&mut standalone, 0, &[]);
+        standalone.extend_from_slice(&compressed);
+        fs::write(dir.path().join("ShaderArchive-PCD3D_SM5.ushaderbytecode"), standalone).unwrap();
+
+        let (shaders, stats) = scan_dir(dir.path());
+        assert_eq!((stats.unreal_shaders_expected, stats.unreal_shaders_decoded), (3, 3));
+        assert_eq!((stats.unreal_shaders_dxbc, stats.unreal_shaders_dxil, stats.dxil), (2, 1, 1));
+        assert_eq!(stats.unreal_libraries_unreadable, 0);
+        assert_eq!(shaders.len(), 1);
+        assert_eq!(shaders[0].code, dxbc);
     }
 }

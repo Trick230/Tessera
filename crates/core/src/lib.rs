@@ -16,6 +16,7 @@ pub mod oodle;
 mod unreal_key;
 mod unreal_io;
 mod unreal_pak;
+mod unreal_shader;
 pub mod pe;
 pub mod paths;
 pub mod quality;

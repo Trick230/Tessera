@@ -9,6 +9,7 @@ use aes::cipher::{BlockDecrypt, KeyInit};
 use sha1::{Digest, Sha1};
 
 use crate::oodle::Oodle;
+use crate::unreal_shader::{is_library, Payload};
 
 const MAX_INDEX: usize = 64 << 20;
 const REUSABLE_PACKAGE: usize = 64 << 20;
@@ -85,6 +86,7 @@ struct Entry<'a> {
     blocks: &'a [u8],
     block_base: usize,
     deleted: bool,
+    payload: Payload,
 }
 
 fn entry<'a>(data: &mut &'a [u8], footer: &Footer<'_>, location: Option<usize>) -> Option<Entry<'a>> {
@@ -107,7 +109,7 @@ fn entry<'a>(data: &mut &'a [u8], footer: &Footer<'_>, location: Option<usize>) 
     let block_base = if footer.version >= 5 { start } else { 0 };
     let start = if method == 0 { start.checked_add(original - data.len())? } else { start };
     Some(Entry { start, compressed, size, method, block_size, encrypted: flags & 1 != 0,
-                 blocks, block_base, deleted: flags & 2 != 0 })
+                 blocks, block_base, deleted: flags & 2 != 0, payload: Payload::Package })
 }
 
 fn stored<'a>(pak: &'a [u8], start: usize, len: usize, encrypted: bool, key: Option<&PakKey>,
@@ -174,6 +176,8 @@ pub(crate) struct PakScan {
     pub locked: bool,
     pub packages: u64,
     pub unreadable: u64,
+    pub expected_shaders: u64,
+    pub unreadable_libraries: u64,
 }
 
 struct Footer<'a> {
@@ -251,13 +255,22 @@ fn shader_path(name: &str) -> bool {
         || (name.ends_with(".bin") && name.contains("globalshadercache"))
 }
 
+fn payload(name: &str) -> Payload {
+    if is_library(name) {
+        Payload::Library
+    } else {
+        Payload::Package
+    }
+}
+
 fn legacy_entries<'a>(mut data: &'a [u8], footer: &Footer<'_>, count: usize,
                       entries: &mut Vec<Entry<'a>>) -> Option<usize> {
     let original = data.len();
     for _ in 0..count {
         let name = path(&mut data)?;
-        let entry = entry(&mut data, footer, None)?;
+        let mut entry = entry(&mut data, footer, None)?;
         if !entry.deleted && shader_path(&name) {
+            entry.payload = payload(&name);
             entries.push(entry);
         }
     }
@@ -268,7 +281,7 @@ fn index_reference(data: &mut &[u8]) -> Option<Option<Index>> {
     if number(data)? == 0 { Some(None) } else { Some(Some(Index::parse(data)?)) }
 }
 
-fn directory_locations(mut data: &[u8], mut visit: impl FnMut(i32)) -> Option<()> {
+fn directory_locations(mut data: &[u8], mut visit: impl FnMut(i32, Payload)) -> Option<()> {
     let dirs = number(&mut data)? as usize;
     if dirs == 0x50464451 {
         let dirs = number(&mut data)? as usize;
@@ -291,7 +304,7 @@ fn directory_locations(mut data: &[u8], mut visit: impl FnMut(i32)) -> Option<()
             let end = number(&mut offsets)? as usize;
             let name = std::str::from_utf8(names.get(start..end)?).ok()?;
             let location = number(&mut locations)? as i32;
-            if shader_path(name) { visit(location); }
+            if shader_path(name) { visit(location, payload(name)); }
             start = end;
         }
         return Some(());
@@ -302,7 +315,7 @@ fn directory_locations(mut data: &[u8], mut visit: impl FnMut(i32)) -> Option<()
         for _ in 0..count {
             let name = path(&mut data)?;
             let location = number(&mut data)? as i32;
-            if shader_path(&name) { visit(location); }
+            if shader_path(&name) { visit(location, payload(&name)); }
         }
     }
     Some(())
@@ -323,7 +336,7 @@ fn modern_entries<'a>(mut data: &'a [u8], pak: &'a [u8], footer: &Footer<'_>, ke
     }
 
     let mut unreadable = 0;
-    let mut visit = |location: i32| {
+    let mut visit = |location: i32, payload: Payload| {
         if location == i32::MIN { return; }
         let item = if location >= 0 {
             (|| {
@@ -338,7 +351,10 @@ fn modern_entries<'a>(mut data: &'a [u8], pak: &'a [u8], footer: &Footer<'_>, ke
             full.get((-location - 1) as usize).copied()
         };
         match item {
-            Some(entry) if !entry.deleted => entries.push(entry),
+            Some(mut entry) if !entry.deleted => {
+                entry.payload = payload;
+                entries.push(entry);
+            }
             Some(_) => {}
             None => unreadable += 1,
         }
@@ -359,14 +375,14 @@ fn modern_entries<'a>(mut data: &'a [u8], pak: &'a [u8], footer: &Footer<'_>, ke
         let count = number(&mut index)?;
         for _ in 0..count {
             take(&mut index, 8)?;
-            visit(number(&mut index)? as i32);
+            visit(number(&mut index)? as i32, Payload::Package);
         }
     }
     Some(unreadable)
 }
 
 pub(crate) fn scan(pak: &[u8], key: Option<&PakKey>, oodle: Option<Oodle>,
-                   mut found: impl FnMut(&[u8])) -> PakScan {
+                   mut found: impl FnMut(Payload, &[u8])) -> PakScan {
     let mut result = PakScan::default();
     let Some(footer) = Footer::parse(pak) else { return result };
     result.locked = footer.encrypted;
@@ -398,7 +414,7 @@ pub(crate) fn scan(pak: &[u8], key: Option<&PakKey>, oodle: Option<Oodle>,
         let output = if large { &mut large_out } else { &mut out };
         if footer.method(e.method).and_then(|method| package(&pak[..start], e, method, key, oodle, output, &mut scratch)).is_some() {
             result.packages += 1;
-            found(output);
+            found(e.payload, output);
         } else {
             result.unreadable += 1;
         }
@@ -416,7 +432,8 @@ mod tests {
         let mut pak = vec![0; size];
         pak[size - 1] = 42;
         let entry = Entry { start: 0, compressed: size, size, method: 0, block_size: 0,
-                            encrypted: false, blocks: &[], block_base: 0, deleted: false };
+                            encrypted: false, blocks: &[], block_base: 0, deleted: false,
+                            payload: Payload::Package };
         let mut out = Vec::new();
         assert!(package(&pak, entry, b"None", None, None, &mut out, &mut Vec::new()).is_some());
         assert_eq!(out.len(), size);
@@ -493,7 +510,10 @@ mod tests {
         pak.resize(methods + 160, 0);
         pak[methods + 32..methods + 36].copy_from_slice(b"Zlib");
 
-        let result = scan(&pak, None, None, |bytes| assert_eq!(bytes, payload));
+        let result = scan(&pak, None, None, |kind, bytes| {
+            assert!(matches!(kind, Payload::Library));
+            assert_eq!(bytes, payload);
+        });
         assert_eq!((result.opened, result.packages, result.unreadable), (true, 1, 0));
     }
 }

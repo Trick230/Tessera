@@ -476,7 +476,8 @@ fn shader_state(
     let mut rows = Vec::new();
     let scan_gl = apis.has(tessera_core::pe::ApiSet::OPENGL);
     let scan_vulkan = apis.has(tessera_core::pe::ApiSet::VULKAN);
-    let scan_only = !can_prepare && (scan_gl || scan_vulkan);
+    let scan_dxil = apis.has(tessera_core::pe::ApiSet::D3D12);
+    let scan_only = !can_prepare && (scan_gl || scan_vulkan || scan_dxil);
 
     if c.auto_key_archives > 0 && c.scan_outdated == Some(false) {
         rows.push(line("Unreal archive keys", "Detected".to_string(), vec![
@@ -510,10 +511,17 @@ fn shader_state(
 
     if scan_vulkan {
         let (value, detail) = match c.spirv.filter(|_| c.scan_outdated == Some(false)) {
-            Some(n) => (format!("{} found", count(n)), "SPIR-V modules found in .spv files and ZIP archives."),
+            Some(n) => (format!("{} found", count(n)), "Distinct SPIR-V modules found in the game files."),
             None => ("Scan available".to_string(), "Search the game files for SPIR-V shader modules."),
         };
         rows.push(line("Vulkan shaders", value, vec![detail.to_string()], NEUTRAL));
+    }
+    if scan_dxil {
+        let (value, detail) = match c.dxil.filter(|_| c.scan_outdated == Some(false)) {
+            Some(n) => (format!("{} found", count(n)), "Distinct DXIL containers found in the game files."),
+            None => ("Scan available".to_string(), "Scan shaders checks the game files for DXIL bytecode."),
+        };
+        rows.push(line("D3D12 shaders", value, vec![detail.to_string()], NEUTRAL));
     }
 
     let mut d = Vec::new();
@@ -546,6 +554,23 @@ fn shader_state(
         d.push(format!("{} failed preparation.", count(c.failed)));
     }
     if c.scan_outdated == Some(false) {
+        if c.unreal_shaders_expected > 0 || c.unreal_libraries_unreadable > 0 {
+            let decoded = c.unreal_shaders_decoded;
+            let expected = c.unreal_shaders_expected;
+            let other = decoded.saturating_sub(c.unreal_shaders_dxbc + c.unreal_shaders_dxil + c.unreal_shaders_spirv);
+            let mut formats = Vec::new();
+            for (n, name) in [(c.unreal_shaders_dxbc, "DXBC"), (c.unreal_shaders_dxil, "DXIL"),
+                              (c.unreal_shaders_spirv, "SPIR-V"), (other, "unclassified")] {
+                if n > 0 { formats.push(format!("{} {name}", count(n))); }
+            }
+            let mut details = Vec::new();
+            if !formats.is_empty() { details.push(format!("Decoded {}.", formats.join(", "))); }
+            if c.unreal_libraries_unreadable > 0 {
+                details.push(format!("{} library headers could not be read.", count(c.unreal_libraries_unreadable)));
+            }
+            let tone = if decoded < expected || c.unreal_libraries_unreadable > 0 { WARN } else { OK };
+            rows.push(line("Unreal shader libraries", format!("{} of {} entries decoded", count(decoded), count(expected)), details, tone));
+        }
         if let Some(n) = c.unsupported_in_install.filter(|&n| n > 0) {
             d.push(format!("The file scan also found {n} containers outside D3D11 warm-up support."));
         }
@@ -553,7 +578,7 @@ fn shader_state(
             d.push(format!("Searched {} Unreal packages.", count(c.unreal_packages)));
         }
         if c.locked_unreal_paks > 0 {
-            d.push(format!("{} encrypted Unreal PAKs could not be opened.", c.locked_unreal_paks));
+            d.push(format!("{} encrypted Unreal archives could not be opened.", c.locked_unreal_paks));
         }
         if c.unreadable_unreal_packages > 0 {
             d.push(format!("{} Unreal packages could not be decoded.", c.unreadable_unreal_packages));
@@ -563,7 +588,7 @@ fn shader_state(
         let usage = if cache.bytes == 0 { "0 KB".to_string() } else { size(cache.bytes) };
         d.push(format!("NVIDIA shader cache uses {usage}."));
     }
-    if can_prepare || !scan_vulkan {
+    if !scan_only {
         rows.push(line("Shaders", value, d, tone));
     }
 
@@ -980,6 +1005,7 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
             let apis = g.graphics_apis();
             let prepare = match api.as_str() {
                 "D3D11" if can_prepare(g) => true,
+                "D3D12" if apis.has(ApiSet::D3D12) => false,
                 "Vulkan" if apis.has(ApiSet::VULKAN) => false,
                 "OpenGL" if apis.has(ApiSet::OPENGL) => false,
                 _ => return None,
