@@ -48,10 +48,19 @@ impl GameInfo {
 
 pub fn analyze(entry: GameEntry) -> GameInfo {
     let exe = find_main_exe(&entry.root, entry.exe_hint.as_deref());
+    let engine = engine::detect(&entry.root);
     let (mut scan, exe_hash) = match &exe {
         Some(p) => (pe::scan_exe(p).unwrap_or_default(), hash_file(p).ok()),
         None => (ExeScan::default(), None),
     };
+    // Unity launchers can leave all graphics API references in the player DLL.
+    if let (Engine::Unity, Some(p), Some(architecture)) = (engine, exe.as_deref(), scan.architecture) {
+        if let Some(player) = pe::scan_exe(&p.with_file_name("UnityPlayer.dll")).ok()
+            .filter(|player| player.architecture == Some(architecture))
+        {
+            scan.referenced.0 |= player.all().0;
+        }
+    }
     // FFVIII Remastered's bootstrap loads its locale-specific OpenGL renderer.
     if let Some(p) = exe.as_deref().filter(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("FFVIII.exe"))) {
         if ["FFVIII_EFIGS.dll", "FFVIII_JP.dll"].iter().any(|name| {
@@ -66,7 +75,7 @@ pub fn analyze(entry: GameEntry) -> GameInfo {
         .map(|d| install::state(d, install::PROXY_D3D11))
         .unwrap_or(InstallState::NotInstalled);
     GameInfo {
-        engine: engine::detect(&entry.root),
+        engine,
         anticheat: crate::anticheat::detect(&entry.root),
         entry,
         exe,
@@ -154,6 +163,33 @@ mod tests {
     fn touch(p: &Path, size: usize) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, vec![0u8; size]).unwrap();
+    }
+
+    #[test]
+    fn unity_detects_graphics_api_in_player_dll() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let mut pe = vec![0; 512];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        pe[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+        pe[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        std::fs::write(root.join("Game.exe"), &pe).unwrap();
+        pe.extend_from_slice(b"d3d11.dll\0");
+        std::fs::write(root.join("UnityPlayer.dll"), &pe).unwrap();
+
+        let game = analyze(GameEntry {
+            name: "Game".into(),
+            root: root.to_path_buf(),
+            store: crate::library::Store::Manual,
+            exe_hint: None,
+            steam_appid: None,
+        });
+        assert_eq!(game.engine, Engine::Unity);
+        assert_eq!(game.api_label(), "D3D11");
+        assert!(game.can_install());
     }
 
     #[test]
