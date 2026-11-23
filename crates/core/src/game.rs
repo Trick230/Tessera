@@ -6,7 +6,6 @@ use crate::engine::{self, Engine};
 use crate::install::{self, InstallState};
 use crate::library::{GameEntry, Store};
 use crate::pe::{self, ApiSet, ExeScan};
-use crate::recomp;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -29,17 +28,14 @@ impl GameInfo {
 
     /// Short API description for the UI, e.g. "D3D12, D3D11 (-dx11)".
     pub fn api_label(&self) -> String {
-        if let Some(backends) = recomp_backends(&self.entry, self.exe.as_deref()) {
-            return match backends.default_label {
-                Some(label) => label.into(),
-                None => backends.supported.names().join(", "),
-            };
-        }
         let all = self.scan.all();
         if all.is_empty() {
             return "Unknown API".into();
         }
         let names = all.names();
+        if self.entry.store == Store::Recomp && names.len() > 1 {
+            return format!("{} (detected)", names.join(", "));
+        }
         // Unreal ships D3D12 and D3D11 RHIs; D3D11 is picked with -dx11.
         if matches!(self.engine, Engine::Unreal { .. }) && all.has(ApiSet::D3D12) && all.has(ApiSet::D3D11) {
             return "D3D12, D3D11 (-dx11)".into();
@@ -53,23 +49,17 @@ impl GameInfo {
     }
 }
 
-fn recomp_backends(entry: &GameEntry, exe: Option<&Path>) -> Option<recomp::GraphicsBackends> {
-    if entry.store != Store::Recomp {
-        return None;
-    }
-    recomp::graphics_backends(exe?)
-}
-
 pub fn analyze(entry: GameEntry) -> GameInfo {
     let exe = find_main_exe(&entry.root, entry.exe_hint.as_deref());
     let engine = engine::detect(&entry.root);
+    let scan_exe = if entry.store == Store::Recomp { pe::scan_recomp } else { pe::scan_exe };
     let (mut scan, exe_hash) = match &exe {
-        Some(p) => (pe::scan_exe(p).unwrap_or_default(), hash_file(p).ok()),
+        Some(p) => (scan_exe(p).unwrap_or_default(), hash_file(p).ok()),
         None => (ExeScan::default(), None),
     };
     // Unity launchers can leave all graphics API references in the player DLL.
     if let (Engine::Unity, Some(p), Some(architecture)) = (engine, exe.as_deref(), scan.architecture) {
-        if let Some(player) = pe::scan_exe(&p.with_file_name("UnityPlayer.dll")).ok()
+        if let Some(player) = scan_exe(&p.with_file_name("UnityPlayer.dll")).ok()
             .filter(|player| player.architecture == Some(architecture))
         {
             scan.referenced.0 |= player.all().0;
@@ -82,10 +72,6 @@ pub fn analyze(entry: GameEntry) -> GameInfo {
         }) {
             scan.referenced.0 |= ApiSet::OPENGL;
         }
-    }
-    if let Some(backends) = recomp_backends(&entry, exe.as_deref()) {
-        scan.imported.0 &= backends.supported.0;
-        scan.referenced.0 &= backends.supported.0;
     }
     let install = exe
         .as_deref()
@@ -183,10 +169,7 @@ mod tests {
         std::fs::write(p, vec![0u8; size]).unwrap();
     }
 
-    #[test]
-    fn unity_detects_graphics_api_in_player_dll() {
-        let t = tempfile::tempdir().unwrap();
-        let root = t.path();
+    fn minimal_pe64() -> Vec<u8> {
         let mut pe = vec![0; 512];
         pe[..2].copy_from_slice(b"MZ");
         pe[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
@@ -194,6 +177,14 @@ mod tests {
         pe[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
         pe[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
         pe[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        pe
+    }
+
+    #[test]
+    fn unity_detects_graphics_api_in_player_dll() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let mut pe = minimal_pe64();
         std::fs::write(root.join("Game.exe"), &pe).unwrap();
         pe.extend_from_slice(b"d3d11.dll\0");
         std::fs::write(root.join("UnityPlayer.dll"), &pe).unwrap();
@@ -211,25 +202,41 @@ mod tests {
     }
 
     #[test]
-    fn known_recomps_show_documented_windows_backends() {
-        for (exe, contents, expected) in [
-            ("UnleashedRecomp.exe", &b"d3d11.dll\0d3d12.dll\0vulkan-1.dll\0opengl32.dll\0"[..], "D3D12 (default)"),
-            ("BanjoRecompiled.exe", &b"no DLL names"[..], "D3D12, Vulkan"),
-            ("UnknownRecompiled.exe", &b"vulkan-1.dll\0"[..], "Vulkan"),
-        ] {
-            let t = tempfile::tempdir().unwrap();
-            std::fs::write(t.path().join(exe), contents).unwrap();
-            let game = analyze(GameEntry {
-                name: exe.into(),
-                root: t.path().into(),
-                store: Store::Recomp,
-                exe_hint: Some(exe.into()),
-                steam_appid: None,
-            });
-            assert_eq!(game.api_label(), expected, "{exe}");
-            assert!(!game.scan.all().has(ApiSet::D3D11), "{exe}");
-            assert!(!game.scan.all().has(ApiSet::OPENGL), "{exe}");
-        }
+    fn recomp_detects_linked_renderer_without_guessing_from_dll_names() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let entry = GameEntry {
+            name: "Unleashed Recompiled".into(),
+            root: root.into(),
+            store: Store::Recomp,
+            exe_hint: Some("UnleashedRecomp.exe".into()),
+            steam_appid: None,
+        };
+        let mut executable = minimal_pe64();
+        executable.extend_from_slice(b"d3d11.dll\0opengl32.dll\0vkGetInstanceProcAddr\0");
+        let exe = root.join("UnleashedRecomp.exe");
+        std::fs::write(&exe, &executable).unwrap();
+        let mut renderer = minimal_pe64();
+        renderer.extend_from_slice(b"D3D12CreateDevice\0vkCreateGraphicsPipelines\0");
+        std::fs::write(root.join("Renderer.dll"), renderer).unwrap();
+        assert_eq!(analyze(entry.clone()).api_label(), "Unknown API");
+
+        // Add one .rdata section containing the executable's import table.
+        executable.resize(1024, 0);
+        executable[0x200..].fill(0);
+        executable[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        executable[0x104..0x108].copy_from_slice(&16u32.to_le_bytes());
+        executable[0x110..0x114].copy_from_slice(&0x1000u32.to_le_bytes());
+        executable[0x114..0x118].copy_from_slice(&40u32.to_le_bytes());
+        executable[0x188..0x190].copy_from_slice(b".rdata\0\0");
+        executable[0x190..0x194].copy_from_slice(&0x200u32.to_le_bytes());
+        executable[0x194..0x198].copy_from_slice(&0x1000u32.to_le_bytes());
+        executable[0x198..0x19c].copy_from_slice(&0x200u32.to_le_bytes());
+        executable[0x19c..0x1a0].copy_from_slice(&0x200u32.to_le_bytes());
+        executable[0x20c..0x210].copy_from_slice(&0x1030u32.to_le_bytes());
+        executable[0x230..0x23d].copy_from_slice(b"Renderer.dll\0");
+        std::fs::write(&exe, executable).unwrap();
+        assert_eq!(analyze(entry).api_label(), "D3D12, Vulkan (detected)");
     }
 
     #[test]

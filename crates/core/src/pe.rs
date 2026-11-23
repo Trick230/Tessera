@@ -2,9 +2,10 @@
 //! Graphics API detection from a PE executable: static and delay-load
 //! imports, plus DLL names referenced as strings (LoadLibrary paths).
 
-use memchr::memchr2;
+use memchr::{memchr2, memmem};
 use object::read::pe::{ImageNtHeaders, PeFile, PeFile32, PeFile64, ResourceDirectory, ResourceDirectoryTable};
 use object::{LittleEndian as LE, ReadRef};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -55,7 +56,7 @@ pub struct ExeScan {
     pub architecture: Option<Architecture>,
     /// APIs in the import or delay-load import tables.
     pub imported: ApiSet,
-    /// APIs whose DLL name appears as an ASCII or UTF-16 string.
+    /// APIs referenced through dynamic loading or game-local dependencies.
     pub referenced: ApiSet,
 }
 
@@ -66,10 +67,36 @@ impl ExeScan {
 }
 
 pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
+    Ok(scan_bytes(&map_binary(path)?))
+}
+
+fn map_binary(path: &Path) -> io::Result<memmap2::Mmap> {
     let file = File::open(path)?;
     // SAFETY: read-only mapping of a file we do not modify.
-    let map = unsafe { memmap2::Mmap::map(&file)? };
-    Ok(scan_bytes(&map))
+    unsafe { memmap2::Mmap::map(&file) }
+}
+
+/// Inspect the executable and its adjacent, architecture-matched PE dependencies.
+pub(crate) fn scan_recomp(path: &Path) -> io::Result<ExeScan> {
+    let (mut scan, mut pending) = scan_recomp_binary(&map_binary(path)?);
+    let mut seen = HashSet::new();
+    while let Some(name) = pending.pop() {
+        let dll = Path::new(&name);
+        if !dll.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+            || dll.file_name() != Some(dll.as_os_str())
+            || DLLS.iter().any(|(api, _, _)| name.eq_ignore_ascii_case(api))
+            || !seen.insert(name.to_ascii_lowercase())
+        {
+            continue;
+        }
+        let Ok(data) = map_binary(&path.with_file_name(dll)) else { continue };
+        let (dependency, imports) = scan_recomp_binary(&data);
+        if dependency.architecture == scan.architecture {
+            scan.referenced.0 |= dependency.all().0;
+            pending.extend(imports);
+        }
+    }
+    Ok(scan)
 }
 
 /// Returns the best image in the executable's first icon group as an ICO file.
@@ -123,6 +150,40 @@ fn pe_icon<'a, Pe: ImageNtHeaders>(pe: PeFile<'a, Pe>) -> Option<Vec<u8>> {
 }
 
 pub fn scan_bytes(data: &[u8]) -> ExeScan {
+    let (mut scan, _) = scan_imports(data);
+    for (dll, bit, _) in DLLS {
+        if contains_ascii_ci(data, dll.as_bytes()) || contains_utf16_ci(data, dll.as_bytes()) {
+            scan.referenced.0 |= bit;
+        }
+    }
+    scan
+}
+
+fn scan_recomp_binary(data: &[u8]) -> (ExeScan, Vec<String>) {
+    let (mut scan, imports) = scan_imports(data);
+    if scan.architecture.is_none() {
+        return (ExeScan::default(), Vec::new());
+    }
+    // A graphics entry point is stronger evidence than a DLL name in text.
+    // Vulkan loaders can also be present in windowing libraries without a Vulkan renderer.
+    for (symbol, bit) in [
+        (b"D3D12CreateDevice\0".as_slice(), ApiSet::D3D12),
+        (b"D3D11CreateDevice\0", ApiSet::D3D11),
+        (b"D3D11CreateDeviceAndSwapChain\0", ApiSet::D3D11),
+        (b"Direct3DCreate9\0", ApiSet::D3D9),
+        (b"Direct3DCreate9Ex\0", ApiSet::D3D9),
+        (b"Direct3DCreate8\0", ApiSet::D3D8),
+        (b"vkCreateGraphicsPipelines\0", ApiSet::VULKAN),
+        (b"glDrawElements\0", ApiSet::OPENGL),
+    ] {
+        if !scan.all().has(bit) && memmem::find(data, symbol).is_some() {
+            scan.referenced.0 |= bit;
+        }
+    }
+    (scan, imports)
+}
+
+fn scan_imports(data: &[u8]) -> (ExeScan, Vec<String>) {
     let mut scan = ExeScan::default();
     let imports = if let Ok(pe) = PeFile64::parse(data) {
         if pe.nt_headers().file_header().machine.get(LE) == object::pe::IMAGE_FILE_MACHINE_AMD64 {
@@ -144,12 +205,7 @@ pub fn scan_bytes(data: &[u8]) -> ExeScan {
             }
         }
     }
-    for (dll, bit, _) in DLLS {
-        if contains_ascii_ci(data, dll.as_bytes()) || contains_utf16_ci(data, dll.as_bytes()) {
-            scan.referenced.0 |= bit;
-        }
-    }
-    scan
+    (scan, imports)
 }
 
 fn imports<'d, Pe: ImageNtHeaders, R: ReadRef<'d>>(pe: &PeFile<'d, Pe, R>) -> Vec<String> {
