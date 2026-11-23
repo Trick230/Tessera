@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub enum Store {
     Steam,
     Epic,
+    Recomp,
     Manual,
 }
 
@@ -16,6 +17,7 @@ impl Store {
         match self {
             Store::Steam => "Steam",
             Store::Epic => "Epic Games",
+            Store::Recomp => "Recomp",
             Store::Manual => "Folder",
         }
     }
@@ -36,15 +38,38 @@ pub struct GameEntry {
 pub fn discover(manual: &[PathBuf]) -> Vec<GameEntry> {
     let mut out = steam_games();
     out.extend(epic_games());
+    out.extend(manual_games(manual));
+    let mut seen = HashSet::new();
+    let mut recomp_exes = HashSet::new();
+    out.retain(|g| {
+        seen.insert(install_key(&g.root)) && (g.store != Store::Recomp ||
+            g.exe_hint.as_ref().is_none_or(|exe| recomp_exes.insert(install_key(&g.root.join(exe)))))
+    });
+    out.sort_by_key(|g| g.name.to_lowercase());
+    out
+}
+
+fn manual_games(manual: &[PathBuf]) -> Vec<GameEntry> {
+    let mut out = Vec::new();
+    let mut collections = HashSet::new();
     for root in manual {
+        if let Some(collection) = crate::recomp::collection_for(root) {
+            if collections.insert(install_key(collection)) {
+                out.extend(crate::recomp::collection_games(collection));
+            }
+            if collection == root {
+                continue;
+            }
+        }
         if root.is_dir() {
+            if let Some(game) = crate::recomp::game(root) {
+                out.push(game);
+                continue;
+            }
             let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             out.push(GameEntry { name, root: root.clone(), store: Store::Manual, exe_hint: None, steam_appid: None });
         }
     }
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|g| seen.insert(install_key(&g.root)));
-    out.sort_by_key(|g| g.name.to_lowercase());
     out
 }
 

@@ -3,7 +3,7 @@
 //! imports, plus DLL names referenced as strings (LoadLibrary paths).
 
 use memchr::memchr2;
-use object::read::pe::{ImageNtHeaders, PeFile, PeFile32, PeFile64};
+use object::read::pe::{ImageNtHeaders, PeFile, PeFile32, PeFile64, ResourceDirectory, ResourceDirectoryTable};
 use object::{LittleEndian as LE, ReadRef};
 use std::fs::File;
 use std::io;
@@ -70,6 +70,56 @@ pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
     // SAFETY: read-only mapping of a file we do not modify.
     let map = unsafe { memmap2::Mmap::map(&file)? };
     Ok(scan_bytes(&map))
+}
+
+/// Returns the best image in the executable's first icon group as an ICO file.
+pub fn executable_icon(path: &Path) -> Option<Vec<u8>> {
+    let file = File::open(path).ok()?;
+    // SAFETY: the file is mapped read-only and only parsed as data.
+    let map = unsafe { memmap2::Mmap::map(&file).ok()? };
+    if let Ok(pe) = PeFile64::parse(&map[..]) {
+        return pe_icon(pe);
+    }
+    pe_icon(PeFile32::parse(&map[..]).ok()?)
+}
+
+fn resource_table<'a>(resources: ResourceDirectory<'a>, id: u16) -> Option<ResourceDirectoryTable<'a>> {
+    resources.root().ok()?.entries.iter().find(|entry| entry.name_or_id().id() == Some(id))?
+        .data(resources).ok()?.table()
+}
+
+fn pe_icon<'a, Pe: ImageNtHeaders>(pe: PeFile<'a, Pe>) -> Option<Vec<u8>> {
+    const ICON: u16 = 3;
+    const GROUP_ICON: u16 = 14;
+    let sections = pe.section_table();
+    let resources = pe.data_directories().resource_directory(pe.data(), &sections).ok()??;
+    let data = |entry: &object::pe::ImageResourceDirectoryEntry| {
+        let leaf = entry.data(resources).ok()?.table()?.entries.iter()
+            .find_map(|language| language.data(resources).ok()?.data())?;
+        let size = leaf.size.get(LE) as usize;
+        sections.pe_data_at(pe.data(), leaf.offset_to_data.get(LE))?.get(..size)
+    };
+    let groups = resource_table(resources, GROUP_ICON)?;
+    let group = groups.entries.iter().find_map(data)?;
+    if group.get(..4)? != [0, 0, 1, 0] {
+        return None;
+    }
+    let count = u16::from_le_bytes(group.get(4..6)?.try_into().ok()?) as usize;
+    let dimensions = |value: u8| if value == 0 { 256 } else { usize::from(value) };
+    let chosen = group.get(6..6 + count * 14)?.chunks_exact(14)
+        .max_by_key(|entry| (dimensions(entry[0]) * dimensions(entry[1]), entry[6]))?;
+    let id = u16::from_le_bytes([chosen[12], chosen[13]]);
+    let icon = resource_table(resources, ICON)?.entries.iter()
+        .find(|entry| entry.name_or_id().id() == Some(id)).and_then(data)?;
+    if icon.len() > 1 << 20 {
+        return None;
+    }
+    let mut ico = vec![0, 0, 1, 0, 1, 0];
+    ico.extend_from_slice(&chosen[..8]);
+    ico.extend_from_slice(&(icon.len() as u32).to_le_bytes());
+    ico.extend_from_slice(&22_u32.to_le_bytes());
+    ico.extend_from_slice(icon);
+    Some(ico)
 }
 
 pub fn scan_bytes(data: &[u8]) -> ExeScan {

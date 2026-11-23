@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod advanced;
+mod art;
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use tessera_core::install::{self, InstallState};
 use tessera_core::pe::Architecture;
 use tessera_core::shader_check::ShaderCheck;
-use tessera_core::{paths, session, GameInfo};
+use tessera_core::{paths, session, GameInfo, Store};
 
 slint::include_modules!();
 
@@ -29,6 +30,7 @@ struct State {
     view: Vec<usize>,
     filter: String,
     folders: Vec<PathBuf>,
+    recomp_icons: HashMap<PathBuf, art::Pixels>,
     shown_root: Option<PathBuf>,
     requested_root: Option<PathBuf>,
     hovered_root: Option<PathBuf>,
@@ -68,7 +70,7 @@ fn status_label(s: &InstallState) -> String {
     }
 }
 
-fn row(g: &GameInfo) -> GameRow {
+fn row(g: &GameInfo, icon: Option<&art::Pixels>) -> GameRow {
     let s = |v: String| SharedString::from(v);
     GameRow {
         name: s(g.entry.name.clone()),
@@ -85,13 +87,12 @@ fn row(g: &GameInfo) -> GameRow {
         can_install: g.can_install(),
         d3d11: can_prepare(g),
         scan_shaders: can_scan_gl(g),
-        icon: steam_image(g, false),
+        recomp: g.entry.store == Store::Recomp,
+        icon: icon.cloned().map(slint::Image::from_rgba8).unwrap_or_else(|| steam_image(g, false)),
         initial: s(g.entry.name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_default()),
     }
 }
 
-/// Steam's icon (`hero == false`) or key art for a game; empty when there is none.
-/// Decoded images are kept, so filtering the list does not decode them again.
 /// Whether Prepare shaders applies. S1/S5 only read the install and run
 /// outside the game: anti-cheat games too. A game that also has D3D12 gains
 /// nothing unless it runs on D3D11: offered once the layer has stored
@@ -109,6 +110,7 @@ fn can_scan_gl(g: &GameInfo) -> bool {
     g.exe.is_some() && g.scan.all().has(tessera_core::pe::ApiSet::OPENGL)
 }
 
+/// Cached Steam icon or hero so filtering does not decode it again.
 fn steam_image(g: &GameInfo, hero: bool) -> slint::Image {
     thread_local! {
         static CACHE: std::cell::RefCell<std::collections::HashMap<(u32, bool), slint::Image>> = Default::default();
@@ -634,6 +636,7 @@ fn game_settings(
 #[derive(Default)]
 struct GameView {
     session: SessionInfo,
+    hero: Option<art::Pixels>,
     budget: (u32, Option<u32>),
     run: Option<(u64, u64)>,
     facts: Option<advanced::Facts>,
@@ -659,6 +662,7 @@ impl GameView {
             .collect();
         Self {
             session, budget, run, facts,
+            hero: (game.entry.store == Store::Recomp).then(|| art::hero(game)).flatten(),
             shader_check: Some(tessera_core::shader_check::check(exe, root, &drivers)),
             pak_key: is_unreal(game).then(|| tessera_core::scan::unreal_key_status(exe)),
             disk_cache: tessera_core::driver::nvidia_game_cache(exe),
@@ -692,7 +696,7 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
     // Publish the models and selection together before the next frame.
     SESSION_GEN.fetch_add(1, Ordering::Relaxed);
     *SETTINGS.lock().unwrap() = lists;
-    ui.set_hero(steam_image(game, true));
+    ui.set_hero(view.hero.clone().map(slint::Image::from_rgba8).unwrap_or_else(|| steam_image(game, true)));
     ui.set_session(view.session.clone());
     ui.set_settings(settings);
     ui.set_shader_state(shaders);
@@ -793,7 +797,10 @@ fn invalidate_view(st: &mut State, root: &Path) {
 fn apply_view(ui: &MainWindow, st: &mut State) {
     let f = st.filter.to_lowercase();
     st.view = (0..st.games.len()).filter(|&i| f.is_empty() || st.games[i].entry.name.to_lowercase().contains(&f)).collect();
-    let rows: Vec<GameRow> = st.view.iter().map(|&i| row(&st.games[i])).collect();
+    let rows: Vec<GameRow> = st.view.iter().map(|&i| {
+        let game = &st.games[i];
+        row(game, st.recomp_icons.get(&game.entry.root))
+    }).collect();
     ui.set_games(ModelRc::new(VecModel::from(rows)));
     ui.set_selected(st.shown_root.as_deref().and_then(|root| visible_index(st, root)).unwrap_or(-1));
     if st.requested_root.as_deref().is_some_and(|root| visible_index(st, root).is_none()) {
@@ -810,11 +817,14 @@ fn refresh(ui: &MainWindow, state: &Shared, added: Option<String>) {
     std::thread::spawn(move || {
         let t = std::time::Instant::now();
         let games = tessera_core::analyze_all(tessera_core::discover(&folders));
+        let recomp_icons = games.iter().filter(|game| game.entry.store == Store::Recomp)
+            .filter_map(|game| Some((game.entry.root.clone(), art::icon(game)?))).collect();
         let ms = t.elapsed().as_millis();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             let mut st = state.lock().unwrap();
             let n = games.len();
             st.games = games;
+            st.recomp_icons = recomp_icons;
             st.ready_views.clear();
             st.view_epoch += 1;
             st.settings_sync = None;

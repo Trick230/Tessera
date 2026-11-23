@@ -21,9 +21,10 @@ export struct GameRow {
     can-install: bool,
     d3d11: bool,
     scan-shaders: bool,
+    recomp: bool,
     // First letter, shown when there is no icon.
     initial: string,
-    // Steam's 32x32 icon; empty for other stores.
+    // Library icon, empty when there is no image.
     icon: image,
 }
 
@@ -489,7 +490,9 @@ component GameItem inherits Rectangle {
                 background: Theme.fill-hover;
                 if root.game.icon.width > 0: Image {
                     source: root.game.icon;
-                    image-fit: cover;
+                    width: parent.width;
+                    height: parent.height;
+                    image-fit: contain;
                 }
                 if root.game.icon.width == 0: Text {
                     text: root.game.initial;
@@ -633,29 +636,42 @@ component Detail inherits Rectangle {
             root.entering-page = false;
         }
     }
-    // Steam's key art for the game; empty when there is none.
+    // The game's key art, if available.
     in property <image> hero;
     property <bool> has-hero: root.hero.width > 0;
+    property <bool> wide-hero: root.has-hero && (!root.game.recomp || root.hero.width > root.hero.height);
     callback reset-safe-mode();
     callback settings-changed(bool, bool, bool, bool, bool, int, int);
     callback advanced-changed(string, int);
     callback prepare-quality();
 
     VerticalLayout {
-        // The game and what Tessera knows about it at a glance, over its
-        // key art when Steam has some.
+        // The game and what Tessera knows about it at a glance.
         Rectangle {
-            height: root.has-hero ? 168px : head.preferred-height;
+            height: root.has-hero || root.game.recomp ? 168px : head.preferred-height;
             clip: true;
-            if root.has-hero: Image {
+            if root.game.recomp && !root.wide-hero: Rectangle {
+                background: @linear-gradient(105deg, #161616 0%, #20272a 65%, #35434a 100%);
+            }
+            if root.wide-hero: Image {
                 source: root.hero;
+                width: parent.width;
+                height: parent.height;
                 image-fit: cover;
             }
-            if root.has-hero: Rectangle {
+            if root.wide-hero: Rectangle {
                 background: @linear-gradient(90deg, #161616e6 0%, #16161699 45%, #16161626 100%);
             }
-            if root.has-hero: Rectangle {
+            if root.wide-hero: Rectangle {
                 background: @linear-gradient(180deg, #16161600 40%, #161616 100%);
+            }
+            if root.game.recomp && !root.wide-hero && (root.has-hero || root.game.icon.width > 0): Image {
+                width: 132px;
+                height: 132px;
+                x: parent.width - self.width - 20px;
+                y: (parent.height - self.height) / 2;
+                source: root.has-hero ? root.hero : root.game.icon;
+                image-fit: contain;
             }
         head := VerticalLayout {
             y: parent.height - self.preferred-height;

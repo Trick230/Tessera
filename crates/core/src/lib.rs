@@ -18,6 +18,7 @@ mod unreal_pak;
 pub mod pe;
 pub mod paths;
 pub mod quality;
+mod recomp;
 pub mod scan;
 pub mod session;
 pub mod shader_check;

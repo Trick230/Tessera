@@ -4818,6 +4818,7 @@ dependencies = [
 name = "tessera-app"
 version = "0.1.0"
 dependencies = [
+ "image",
  "rfd",
  "slint",
  "slint-build",
