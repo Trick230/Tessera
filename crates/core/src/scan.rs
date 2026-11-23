@@ -2,15 +2,16 @@
 //! S1: shader search over a game's install files. Finds DXBC
 //! containers stored raw (exe, DLLs, loose files, uncompressed archives) and
 //! inside zlib, zstd and LZ4-frame streams and Oodle blocks (with the game's
-//! own codec DLL, when it ships one), then keeps the ones the D3D11 warm-up
-//! can create. Read-only: never writes into the game folder.
+//! own codec DLL, when it ships one). Exports DXBC, DXIL and SPIR-V and
+//! supplies the D3D11 warm-up with its compatible subset.
 //!
 //! Recognised container layouts provide the compressed entry's exact bounds
 //! and decoded size. Loose streams still need a recognisable header.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Write};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -59,8 +60,7 @@ pub struct ScanStats {
     /// Unique containers it cannot (DXIL, SM 5.1+, libraries, mesh shaders).
     pub skipped: u64,
     pub dxil: u64,
-    /// D3D11 containers whose checksum does not match their contents: the
-    /// runtime rejects them as they are, so the game never creates them so.
+    /// Legacy DXBC containers whose checksum does not match their contents.
     pub invalid: u64,
     pub unreal_packages: u64,
     pub unreadable_unreal_packages: u64,
@@ -263,9 +263,9 @@ pub fn container_at(b: &[u8]) -> Option<Container> {
 #[derive(Default)]
 struct Found {
     shaders: HashMap<u64, Shader>,
-    skipped: HashMap<u64, bool>,
+    d3d12: HashMap<u64, Shader>,
     glsl: HashSet<u128>,
-    spirv: HashSet<u128>,
+    spirv: HashMap<u128, Vec<u8>>,
     stats: ScanStats,
     oodle: Option<Oodle>,
 }
@@ -296,7 +296,8 @@ impl Found {
         for start in memchr::memmem::find_iter(data, b"DXBC") {
             let Some(c) = container_at(&data[start..]) else { continue };
             let code = &data[start..start + c.len];
-            let valid = self.record(&c, code) || self.shaders.contains_key(&c.hash) || !c.d3d11();
+            let valid = self.record(&c, code)
+                || self.shaders.contains_key(&c.hash) || self.d3d12.contains_key(&c.hash);
             if !valid { continue; }
             if c.flags & FLAG_DXIL != 0 {
                 self.stats.unreal_shaders_dxil += 1;
@@ -305,8 +306,7 @@ impl Found {
             }
             return;
         }
-        if let Some(hash) = unreal_spirv_hash(data) {
-            self.spirv.insert(hash);
+        if self.record_spirv(data) || counted_spirv(data).any(|code| self.record_spirv(code)) {
             self.stats.unreal_shaders_spirv += 1;
         }
     }
@@ -335,7 +335,7 @@ impl Found {
         for (k, v) in o.shaders {
             self.shaders.entry(k).or_insert(v);
         }
-        self.skipped.extend(o.skipped);
+        self.d3d12.extend(o.d3d12);
         self.glsl.extend(o.glsl);
         self.spirv.extend(o.spirv);
         self
@@ -464,16 +464,25 @@ impl Found {
         }
     }
 
-    fn record_spirv(&mut self, bytes: &[u8]) {
-        if let Some(hash) = spirv_hash(bytes) {
-            self.spirv.insert(hash);
+    fn record_spirv(&mut self, bytes: &[u8]) -> bool {
+        let Some(big_endian) = spirv_byte_order(bytes) else { return false };
+        let mut code = std::borrow::Cow::Borrowed(bytes);
+        if big_endian {
+            for word in code.to_mut().chunks_exact_mut(4) {
+                word.reverse();
+            }
         }
+        let hash = xxhash_rust::xxh3::xxh3_128(&code);
+        self.spirv.entry(hash).or_insert_with(|| code.into_owned());
+        true
     }
 
     fn unity_payload(&mut self, bytes: &[u8], shader_data: bool) {
         self.record_spirv(bytes);
         if shader_data {
-            self.spirv.extend(counted_spirv(bytes));
+            for code in counted_spirv(bytes) {
+                self.record_spirv(code);
+            }
             self.search_glsl_source(bytes, true);
         }
         self.search(bytes, 0);
@@ -498,17 +507,17 @@ impl Found {
     }
 
     fn record(&mut self, c: &Container, code: &[u8]) -> bool {
-        if !c.d3d11() {
-            return self.skipped.insert(c.hash, c.flags & FLAG_DXIL != 0).is_none();
-        }
-        if self.shaders.contains_key(&c.hash) {
+        let entries = if c.d3d11() { &mut self.shaders } else { &mut self.d3d12 };
+        if entries.contains_key(&c.hash) {
             return false;
         }
-        let fresh = code[4..20].iter().all(|&b| b == 0) || checksum(code) == code[4..20];
+        // DXIL uses the DXC validator's signature, rather than the legacy DXBC checksum.
+        let fresh = c.flags & FLAG_DXIL != 0 || code[4..20].iter().all(|&b| b == 0)
+            || checksum(code) == code[4..20];
         if !fresh {
             self.stats.invalid += 1;
         } else {
-            self.shaders.insert(c.hash, Shader { hash: c.hash, stage: c.stage, flags: c.flags, code: code.to_vec() });
+            entries.insert(c.hash, Shader { hash: c.hash, stage: c.stage, flags: c.flags, code: code.to_vec() });
         }
         fresh
     }
@@ -699,7 +708,7 @@ fn unity_glsl_guard(prefix: &[u8]) -> Option<usize> {
 
 /// Recognises a complete shader module at a file or archive entry boundary.
 /// Checks the binary structure without validating device-specific capabilities.
-fn spirv_hash(bytes: &[u8]) -> Option<u128> {
+fn spirv_byte_order(bytes: &[u8]) -> Option<bool> {
     const MAGIC: u32 = 0x0723_0203;
     if bytes.len() < 20 || bytes.len() % 4 != 0 {
         return None;
@@ -739,28 +748,19 @@ fn spirv_hash(bytes: &[u8]) -> Option<u128> {
     if !(memory_model && entry_point && function_end) {
         return None;
     }
-    if u32_at(bytes, 0) == MAGIC {
-        return Some(xxhash_rust::xxh3::xxh3_128(bytes));
-    }
-    // Deduplicate equivalent modules encoded in the opposite byte order.
-    let mut hash = xxhash_rust::xxh3::Xxh3::new();
-    for offset in (0..bytes.len()).step_by(4) {
-        hash.update(&word(offset).to_le_bytes());
-    }
-    Some(hash.digest128())
+    Some(u32_at(bytes, 0) != MAGIC)
 }
 
-fn unreal_spirv_hash(bytes: &[u8]) -> Option<u128> {
-    spirv_hash(bytes).or_else(|| counted_spirv(bytes).next())
-}
-
-fn counted_spirv(bytes: &[u8]) -> impl Iterator<Item = u128> + '_ {
+fn counted_spirv(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     // Engine shader records can prefix a SPIR-V array with its byte or word count.
-    memchr::memmem::find_iter(bytes, b"\x03\x02\x23\x07").filter_map(|start| {
+    [b"\x03\x02\x23\x07", b"\x07\x23\x02\x03"].into_iter().flat_map(|magic| {
+        memchr::memmem::find_iter(bytes, magic)
+    }).filter_map(|start| {
         let count = u32_at(bytes, start.checked_sub(4)?) as usize;
         let code = &bytes[start..];
         [count, count.saturating_mul(4)].into_iter()
-            .find_map(|size| code.get(..size).and_then(spirv_hash))
+            .filter_map(|size| code.get(..size))
+            .find(|bytes| spirv_byte_order(bytes).is_some())
     })
 }
 
@@ -834,11 +834,14 @@ pub fn files(dir: &Path) -> Vec<PathBuf> {
 
 /// Scans `dir`; returns the D3D11-creatable shaders (sorted by hash) and stats.
 pub fn scan_dir(dir: &Path) -> (Vec<Shader>, ScanStats) {
-    scan_paths(dir, &files(dir), None, None)
+    let found = scan_paths(dir, &files(dir), None, None);
+    let mut shaders: Vec<_> = found.shaders.into_values().collect();
+    shaders.sort_unstable_by_key(|s| s.hash);
+    (shaders, found.stats)
 }
 
 fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
-              detected: Option<&crate::unreal_key::DetectedKeys>) -> (Vec<Shader>, ScanStats) {
+              detected: Option<&crate::unreal_key::DetectedKeys>) -> Found {
     let oodle = oodle::find(dir).and_then(|p| oodle::load(&p));
     // Each thread may hold a few STREAM_CAP buffers (a stream and the streams
     // inside it), so the thread count bounds the scan's memory.
@@ -851,19 +854,16 @@ fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
                 .read_group(id, p, oodle, out)
         })
     }).reduce(Found::default, Found::merge);
-    let found = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+    let mut found = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
         Ok(pool) => pool.install(scan),
         Err(_) => scan(),
     };
-    let mut stats = found.stats;
-    let mut shaders: Vec<Shader> = found.shaders.into_values().collect();
-    shaders.sort_unstable_by_key(|s| s.hash);
-    stats.usable = shaders.len() as u64;
-    stats.skipped = found.skipped.len() as u64;
-    stats.dxil = found.skipped.values().filter(|&&dxil| dxil).count() as u64;
-    stats.glsl = found.glsl.len() as u64;
-    stats.spirv = found.spirv.len() as u64;
-    (shaders, stats)
+    found.stats.usable = found.shaders.len() as u64;
+    found.stats.skipped = found.d3d12.len() as u64;
+    found.stats.dxil = found.d3d12.values().filter(|s| s.flags & FLAG_DXIL != 0).count() as u64;
+    found.stats.glsl = found.glsl.len() as u64;
+    found.stats.spirv = found.spirv.len() as u64;
+    found
 }
 
 /// `<data>\shaders\<exe>-<key>.scan`: the scan store's base path (.tshd/.tshi).
@@ -871,6 +871,37 @@ pub fn scan_base(exe: &Path) -> Option<PathBuf> {
     let mut s = crate::warm::store_base(exe)?.into_os_string();
     s.push(".scan");
     Some(PathBuf::from(s))
+}
+
+/// The extracted shader archive for an installation.
+pub fn export_path(exe: &Path) -> Option<PathBuf> {
+    scan_base(exe).map(|base| base.with_extension("scan.zip"))
+}
+
+fn write_export(file: fs::File, found: &Found) -> io::Result<()> {
+    let mut zip = zip::ZipWriter::new(io::BufWriter::new(file));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    let mut entries: Vec<_> = found.shaders.values().chain(found.d3d12.values()).collect();
+    entries.sort_unstable_by_key(|s| s.hash);
+    for shader in entries {
+        let (folder, extension) = if shader.flags & FLAG_DXIL != 0 {
+            ("d3d12", "dxil")
+        } else if found.shaders.contains_key(&shader.hash) {
+            ("d3d11", "dxbc")
+        } else {
+            ("d3d12", "dxbc")
+        };
+        zip.start_file(format!("{folder}/{:016x}.{extension}", shader.hash), options)?;
+        zip.write_all(&shader.code)?;
+    }
+    let mut modules: Vec<_> = found.spirv.iter().collect();
+    modules.sort_unstable_by_key(|(&hash, _)| hash);
+    for (hash, code) in modules {
+        zip.start_file(format!("vulkan/{hash:032x}.spv"), options)?;
+        zip.write_all(code)?;
+    }
+    zip.finish()?.flush()
 }
 
 /// Files that change without the game changing: Tessera's own (settings,
@@ -915,7 +946,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 17 {:016x}", key.finish())
+    format!("tessera-scan 18 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -1005,6 +1036,7 @@ pub fn record_at(base: &Path) -> Option<ScanRecord> {
 
 /// True when the scan store matches the install as it is now.
 pub fn up_to_date(exe: &Path, root: &Path, require_spirv: bool) -> bool {
+    export_path(exe).is_some_and(|path| path.is_file()) &&
     scan_base(exe).and_then(|b| record_at(&b)).is_some_and(|r| {
         (!require_spirv || r.spirv.is_some()) && r.key == install_key(exe, root)
     })
@@ -1015,19 +1047,35 @@ pub fn current_key(exe: &Path, root: &Path) -> String {
     install_key(exe, root)
 }
 
-/// Scans the install folder of `exe` (`root`) and writes what the layer has
-/// not stored yet to the scan store, which the warm-up compiles too.
+/// Scans the install and exports the bytecode. The D3D11 warm-up store only
+/// needs entries the layer has yet to capture.
 pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     let base = scan_base(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
+    let export = base.with_extension("scan.zip");
+    fs::create_dir_all(base.parent().unwrap())?;
+    // Serialize scans of the same game, including scans launched from another app instance.
+    let _lock = fs::OpenOptions::new().write(true).create(true).truncate(false)
+        .share_mode(0).open(base.with_extension("scan.lock"))?;
     let key = install_key(exe, root);
     let pak_key = unreal_key_file(exe).and_then(|(p, _)| PakKey::from_file(&p));
     let paths = files(root);
     let detected = crate::unreal_key::detect(exe, &paths);
-    let (mut shaders, stats) = scan_paths(root, &paths, pak_key.as_ref(), Some(&detected));
-    let stored: std::collections::HashSet<u64> = crate::shaders::read(exe).iter().map(|s| s.hash).collect();
+    let found = scan_paths(root, &paths, pak_key.as_ref(), Some(&detected));
+    let export_temp = base.with_extension("scan.zip.tmp");
+    write_export(fs::File::create(&export_temp)?, &found)?;
+    let stats = found.stats;
+    let mut shaders: Vec<_> = found.shaders.into_values().collect();
+    let stored: HashSet<u64> = crate::shaders::store_paths(exe).map(|(store, index)| {
+        crate::shaders::with_entries_at(&store, &index, |entries| {
+            entries.iter().map(|entry| entry.hash).collect()
+        })
+    }).unwrap_or_default();
     shaders.retain(|s| !stored.contains(&s.hash));
+    shaders.sort_unstable_by_key(|s| s.hash);
     crate::shaders::write_base(&base, &shaders)?;
-    fs::write(key_path(&base), format!(
+    fs::rename(export_temp, export)?;
+    let key_temp = base.with_extension("scan.key.tmp");
+    fs::write(&key_temp, format!(
         "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\nspirv {}\ndxil {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\nunity_entries {}\nunreadable_unity_entries {}\nunity_shader_objects {}\nunreadable_unity_shader_objects {}\nunreal_libraries_unreadable {}\nunreal_shaders_expected {}\nunreal_shaders_decoded {}\nunreal_shaders_dxbc {}\nunreal_shaders_dxil {}\nunreal_shaders_spirv {}\n",
         stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks,
         detected.count(), stats.glsl, stats.spirv, stats.dxil, stats.cpk_entries, stats.dcx_entries, stats.zip_entries, stats.apk_entries,
@@ -1036,12 +1084,27 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
         stats.unreal_libraries_unreadable, stats.unreal_shaders_expected, stats.unreal_shaders_decoded,
         stats.unreal_shaders_dxbc, stats.unreal_shaders_dxil, stats.unreal_shaders_spirv
     ))?;
+    fs::rename(key_temp, key_path(&base))?;
     Ok(stats)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exported(dir: &Path) -> (Found, HashMap<String, Vec<u8>>) {
+        let found = scan_paths(dir, &files(dir), None, None);
+        let file = tempfile::tempfile().unwrap();
+        write_export(file.try_clone().unwrap(), &found).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let entries = (0..zip.len()).map(|i| {
+            let mut entry = zip.by_index(i).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            (entry.name().to_owned(), bytes)
+        }).collect();
+        (found, entries)
+    }
 
     #[test]
     fn finds_deflated_dxbc_and_deduplicates_embedded_glsl() {
@@ -1229,12 +1292,17 @@ mod tests {
         serialized.extend_from_slice(&compute);
         fs::write(dir.path().join("globalgamemanagers.assets"), serialized).unwrap();
 
-        let (shaders, stats) = scan_dir(dir.path());
+        let (found, entries) = exported(dir.path());
+        let stats = found.stats;
         assert_eq!((stats.unity_shader_objects, stats.unreadable_unity_shader_objects), (3, 1));
         assert_eq!(stats.dxil, 1);
         // One module appears in both compressed and inline representations.
         assert_eq!(stats.spirv, 2);
-        assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[&format!("d3d11/{:016x}.dxbc", hash_of(&dxbc))], dxbc);
+        assert_eq!(entries[&format!("d3d12/{:016x}.dxil", hash_of(&dxil))], dxil);
+        let spv: Vec<_> = spirv_compute_fixture().into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(entries[&format!("vulkan/{:032x}.spv", xxhash_rust::xxh3::xxh3_128(&spv))], spv);
     }
 
     fn spirv_compute_fixture() -> [u32; 35] {
@@ -1261,9 +1329,9 @@ mod tests {
         let module = spirv_compute_fixture();
         let bytes: Vec<_> = module.into_iter().flat_map(u32::to_le_bytes).collect();
         let swapped: Vec<_> = module.into_iter().flat_map(u32::to_be_bytes).collect();
-        assert!(spirv_hash(&bytes).is_some());
-        assert_eq!(spirv_hash(&bytes), spirv_hash(&swapped));
-        assert!(spirv_hash(&bytes[..bytes.len() - 8]).is_none());
+        assert_eq!(spirv_byte_order(&bytes), Some(false));
+        assert_eq!(spirv_byte_order(&swapped), Some(true));
+        assert!(spirv_byte_order(&bytes[..bytes.len() - 8]).is_none());
         fs::write(dir.path().join("loose.SPV"), &bytes).unwrap();
         fs::write(dir.path().join("partial.spv"), &bytes[..bytes.len() - 8]).unwrap();
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -1279,9 +1347,12 @@ mod tests {
         archive.start_file("shader/copy.spv", zip::write::SimpleFileOptions::default()).unwrap();
         archive.write_all(&swapped).unwrap();
         fs::write(dir.path().join("shaders.zip"), archive.finish().unwrap().into_inner()).unwrap();
-        let (shaders, stats) = scan_dir(dir.path());
-        assert!(shaders.is_empty());
-        assert_eq!(stats.spirv, 3);
+        let (found, entries) = exported(dir.path());
+        assert!(found.shaders.is_empty());
+        assert_eq!(found.stats.spirv, 3);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[&format!("vulkan/{:032x}.spv", xxhash_rust::xxh3::xxh3_128(&bytes))], bytes);
+        assert!(entries.values().all(|code| spirv_byte_order(code) == Some(false)));
     }
 
     /// A minimal container: one SHEX part with the given version token.
@@ -1540,8 +1611,11 @@ mod tests {
         let dxbc = signed(0x0000_0050);
         let mut dxil = signed(0x0000_0060);
         dxil[36..40].copy_from_slice(b"DXIL");
+        let spv: Vec<_> = spirv_compute_fixture().into_iter().flat_map(u32::to_le_bytes).collect();
         let mut group = dxbc.clone();
         group.extend_from_slice(&dxil);
+        group.extend_from_slice(&(spv.len() as u32).to_le_bytes());
+        group.extend_from_slice(&spv);
         let compressed = zlib(&group);
         let mut group_id = [0; 12];
         group_id[11] = 9;
@@ -1550,17 +1624,19 @@ mod tests {
 
         let mut library = 1u32.to_le_bytes().to_vec();
         table(&mut library, 0, &[]);
-        table(&mut library, 2, &vec![0; 2 * hash_size]);
+        table(&mut library, 3, &vec![0; 3 * hash_size]);
         table(&mut library, 1, &group_id);
         table(&mut library, 0, &[]);
-        number(&mut library, 2);
+        number(&mut library, 3);
         library.extend_from_slice(&0u64.to_le_bytes());
         library.extend_from_slice(&((dxbc.len() as u64) << 34).to_le_bytes());
+        library.extend_from_slice(&(((dxbc.len() + dxil.len()) as u64) << 34).to_le_bytes());
         number(&mut library, 1);
-        for n in [0, 2, group.len() as u32, compressed.len() as u32] { number(&mut library, n); }
-        number(&mut library, 2);
+        for n in [0, 3, group.len() as u32, compressed.len() as u32] { number(&mut library, n); }
+        number(&mut library, 3);
         number(&mut library, 1);
         number(&mut library, 0);
+        number(&mut library, 2);
         iostore(dir.path(), "library", library_id, &library);
         iostore(dir.path(), "group", group_id, &compressed);
 
@@ -1579,11 +1655,15 @@ mod tests {
         standalone.extend_from_slice(&compressed);
         fs::write(dir.path().join("ShaderArchive-PCD3D_SM5.ushaderbytecode"), standalone).unwrap();
 
-        let (shaders, stats) = scan_dir(dir.path());
-        assert_eq!((stats.unreal_shaders_expected, stats.unreal_shaders_decoded), (3, 3));
+        let (found, entries) = exported(dir.path());
+        let stats = found.stats;
+        assert_eq!((stats.unreal_shaders_expected, stats.unreal_shaders_decoded), (4, 4));
         assert_eq!((stats.unreal_shaders_dxbc, stats.unreal_shaders_dxil, stats.dxil), (2, 1, 1));
+        assert_eq!((stats.unreal_shaders_spirv, stats.spirv), (1, 1));
         assert_eq!(stats.unreal_libraries_unreadable, 0);
-        assert_eq!(shaders.len(), 1);
-        assert_eq!(shaders[0].code, dxbc);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[&format!("d3d11/{:016x}.dxbc", hash_of(&dxbc))], dxbc);
+        assert_eq!(entries[&format!("d3d12/{:016x}.dxil", hash_of(&dxil))], dxil);
+        assert_eq!(entries[&format!("vulkan/{:032x}.spv", xxhash_rust::xxh3::xxh3_128(&spv))], spv);
     }
 }

@@ -64,6 +64,11 @@ Quality is never traded silently. Any lossy step, such as recompressing a textur
 - **D3D11 call diagnostics:** opt in under Advanced to record game calls to `Map`, `GetData`, `Flush[1]` and `UpdateSubresource[1]` taking at least 1 ms. Session details show the counts, maximum times and overlap with slow CPU frames. Use `cargo run -p tessera-core --example layer -- calls <session.tsess>` to export slow context calls and resource creates as CSV. Match the process ID and QPC intervals with a PresentMon capture using `--v1_metrics --qpc_time` to investigate displayed frames.
 - **Memory:** VRAM budget reporting and an optional cap, also through NVAPI and before the game creates its device; working-set meter; mip residency with tiled textures and pop-in-free restore (needs tiled resources tier 2, off by default); render target reuse (off by default).
 - **Shaders:** scans the whole install for shader bytecode (including Oodle, zlib, zstd and LZ4 archives) and warms the driver cache in a separate process before you play; records new shaders during play for the next preparation; a coverage meter in the app.
+
+The **Shaders** tab writes a `*.scan.zip` export under `%LOCALAPPDATA%\Tessera\shaders`
+when you scan or prepare a game. The archive contains D3D11-compatible DXBC under
+`d3d11/`, DXIL and Shader Model 5.1 DXBC under `d3d12/`, and SPIR-V under
+`vulkan/`. You can also run `tessera.exe --scan <game-exe> <install-folder>`.
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 
 **Being measured:** Unreal variants (dynamic resolution off, render targets that only grow, pool limits, shader creation on load, level streaming time limits) in Final Fantasy VII Remake.

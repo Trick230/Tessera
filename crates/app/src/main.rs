@@ -509,17 +509,17 @@ fn shader_state(
         rows.push(line("OpenGL shaders", value, vec![detail.to_string()], NEUTRAL));
     }
 
-    if scan_vulkan {
+    if scan_vulkan || c.spirv.is_some_and(|n| n > 0) {
         let (value, detail) = match c.spirv.filter(|_| c.scan_outdated == Some(false)) {
-            Some(n) => (format!("{} found", count(n)), "Distinct SPIR-V modules found in the game files."),
+            Some(n) => (format!("{} extracted", count(n)), "Distinct SPIR-V modules in the shader export."),
             None => ("Scan available".to_string(), "Search the game files for SPIR-V shader modules."),
         };
         rows.push(line("Vulkan shaders", value, vec![detail.to_string()], NEUTRAL));
     }
-    if scan_dxil {
-        let (value, detail) = match c.dxil.filter(|_| c.scan_outdated == Some(false)) {
-            Some(n) => (format!("{} found", count(n)), "Distinct DXIL containers found in the game files."),
-            None => ("Scan available".to_string(), "Scan shaders checks the game files for DXIL bytecode."),
+    if scan_dxil || c.unsupported_in_install.is_some_and(|n| n > 0) {
+        let (value, detail) = match c.unsupported_in_install.filter(|_| c.scan_outdated == Some(false)) {
+            Some(n) => (format!("{} extracted", count(n)), "DXIL and Shader Model 5.1 bytecode in the shader export."),
+            None => ("Scan available".to_string(), "Scan shaders searches for D3D12 bytecode."),
         };
         rows.push(line("D3D12 shaders", value, vec![detail.to_string()], NEUTRAL));
     }
@@ -1047,7 +1047,11 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
         let msg = if !prepare {
             if running { "Close the game before scanning shaders.".to_string() }
             else if let Some(e) = scan_error { format!("{api} shader scan failed ({e}).") }
-            else { format!("{api} shader scan complete.") }
+            else if let Some(path) = tessera_core::scan::export_path(&exe) {
+                format!("{api} shader scan complete. Export saved to {}.", path.display())
+            } else {
+                format!("{api} shader scan complete.")
+            }
         } else {
             let scan_status = scan_error.map(|e| format!("search failed ({e}), ")).unwrap_or_default();
             status("Warming shaders (outside the game)…");
@@ -1242,11 +1246,11 @@ fn scan_isolated(exe: &Path, root: &Path) -> Result<u64, String> {
 }
 
 /// `tessera.exe --scan <game exe> <install folder>`: the child side of
-/// scan_isolated. Prints the total of D3D11 bytecode, GLSL sources and SPIR-V modules found.
+/// scan_isolated. Prints the total of extracted bytecode and detected GLSL sources.
 fn scan_child(args: &[String]) -> i32 {
     match tessera_core::scan::scan_game(Path::new(&args[0]), Path::new(&args[1])) {
         Ok(st) => {
-            println!("{}", st.usable + st.glsl + st.spirv);
+            println!("{}", st.usable + st.skipped + st.glsl + st.spirv);
             0
         }
         Err(e) => {

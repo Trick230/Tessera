@@ -100,7 +100,12 @@ pub fn check(exe: &Path, root: Option<&Path>, drivers: &[u64]) -> ShaderCheck {
         (Some(b), Some(r)) if crate::scan::record_at(b).is_some() => Some(crate::scan::current_key(exe, r)),
         _ => None,
     };
-    check_at(layer.as_deref(), scan.as_deref(), key.as_deref(), drivers)
+    let mut coverage = check_at(layer.as_deref(), scan.as_deref(), key.as_deref(), drivers);
+    if coverage.scan_outdated == Some(false)
+        && !crate::scan::export_path(exe).is_some_and(|path| path.is_file()) {
+        coverage.scan_outdated = Some(true);
+    }
+    coverage
 }
 
 /// `check` on explicit store bases and the install key as it is now.
