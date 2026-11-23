@@ -156,6 +156,7 @@ fn row(g: &GameInfo, icon: Option<&art::Pixels>) -> GameRow {
         } else {
             g.engine.label().into()
         },
+        unreal: is_unreal(g),
         api: s(g.api_label()),
         exe: s(g.exe.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "not found".into())),
         root: s(g.entry.root.display().to_string()),

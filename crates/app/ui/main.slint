@@ -10,6 +10,7 @@ export struct GameRow {
     name: string,
     store: string,
     engine: string,
+    unreal: bool,
     api: string,
     exe: string,
     root: string,
@@ -943,7 +944,7 @@ component Detail inherits Rectangle {
                             width: 170px;
                             model: root.settings.fps-options;
                             current-index: root.settings.fps-index;
-                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
+                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -953,7 +954,7 @@ component Detail inherits Rectangle {
                             width: 170px;
                             model: root.settings.vram-options;
                             current-index: root.settings.vram-index;
-                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
+                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -964,7 +965,7 @@ component Detail inherits Rectangle {
                         residency := Toggle {
                             checked: root.settings.residency;
                             enabled: !root.settings.priority-blocked || root.settings.residency;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -972,7 +973,7 @@ component Detail inherits Rectangle {
                         help: "High-resolution timer and moderate priority, game process only.";
                         process := Toggle {
                             checked: root.settings.process;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -980,7 +981,7 @@ component Detail inherits Rectangle {
                         help: "Experimental. Lower latency and G-Sync/FreeSync in borderless windows. Turn off if the screen flickers.";
                         flip := Toggle {
                             checked: root.settings.flip-model;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
                         }
                     }
                     PropRow {
@@ -988,10 +989,10 @@ component Detail inherits Rectangle {
                         help: "Hands big render targets the game drops back on its next matching create. Cuts hitches in games that recreate them.";
                         recycle := Toggle {
                             checked: root.settings.rt-recycle;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
                         }
                     }
-                    PropRow {
+                    if root.game.unreal: PropRow {
                         label: "Unreal texture streaming";
                         help: "Unreal Engine games. Sets the engine's streaming pool to fit this card and streams fewer textures per frame, as players do by hand. Experimental.";
                         ue := Toggle {
