@@ -265,6 +265,8 @@ mod tests {
 
     #[test]
     fn reads_chunk_across_compressed_partitions() {
+        use aes::cipher::{BlockEncrypt, KeyInit};
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.utoc");
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -290,5 +292,27 @@ mod tests {
         toc.extend_from_slice(b"Zlib\0\0\0\0");
         let result = scan(&toc, &path, None, None, |_, _| None, |_, bytes| assert_eq!(bytes, b"cdefg"));
         assert_eq!((result.packages, result.unreadable), (1, 0));
+
+        // Encryption pads each stored block independently, including blocks in
+        // the second partition. A reader without the key reports the container as locked.
+        toc[80] = 2;
+        let locked = scan(&toc, &path, None, None, |_, _| None, |_, _| panic!("locked archive emitted bytes"));
+        assert!(locked.locked);
+        let key_file = dir.path().join("fixture.key");
+        std::fs::write(&key_file, "07".repeat(32)).unwrap();
+        let key = PakKey::from_file(&key_file).unwrap();
+        let cipher = aes::Aes256::new((&[7u8; 32]).into());
+        for (partition, bytes) in [(path.with_extension("ucas"), b"abcd".as_slice()),
+                                   (dir.path().join("test_s1.ucas"), compressed.as_slice())] {
+            let mut encrypted = bytes.to_vec();
+            encrypted.resize(encrypted.len().next_multiple_of(16), 0);
+            for block in encrypted.chunks_exact_mut(16) {
+                cipher.encrypt_block(aes::cipher::Block::<aes::Aes256>::from_mut_slice(block));
+            }
+            std::fs::write(partition, encrypted).unwrap();
+        }
+        let result = scan(&toc, &path, Some(&key), None, |_, _| None,
+                          |_, bytes| assert_eq!(bytes, b"cdefg"));
+        assert_eq!((result.packages, result.unreadable, result.locked), (1, 0, false));
     }
 }
