@@ -86,6 +86,7 @@ struct Entry<'a> {
     blocks: &'a [u8],
     block_base: usize,
     deleted: bool,
+    whole_stream: bool,
     payload: Payload,
 }
 
@@ -99,17 +100,22 @@ fn entry<'a>(data: &mut &'a [u8], footer: &Footer<'_>, location: Option<usize>) 
     } else {
         number(data)?
     };
-    take(data, 20)?; // data hash
-    let blocks = if method == 0 { &[] } else {
+    if footer.version == 1 { take(data, 8)?; } // Timestamp.
+    take(data, 20)?; // Data hash.
+    let whole_stream = footer.version < 3;
+    let blocks = if method == 0 || whole_stream { &[] } else {
         let count = number(data)? as usize;
         take(data, count.checked_mul(16)?)?
     };
-    let flags = take(data, 1)?[0];
-    let block_size = number(data)? as usize;
+    let (flags, block_size) = if whole_stream { (0, 0) } else {
+        (take(data, 1)?[0], number(data)? as usize)
+    };
     let block_base = if footer.version >= 5 { start } else { 0 };
-    let start = if method == 0 { start.checked_add(original - data.len())? } else { start };
+    let start = if method == 0 || whole_stream {
+        start.checked_add(original - data.len())?
+    } else { start };
     Some(Entry { start, compressed, size, method, block_size, encrypted: flags & 1 != 0,
-                 blocks, block_base, deleted: flags & 2 != 0, payload: Payload::Package })
+                 blocks, block_base, deleted: flags & 2 != 0, whole_stream, payload: Payload::Package })
 }
 
 fn stored<'a>(pak: &'a [u8], start: usize, len: usize, encrypted: bool, key: Option<&PakKey>,
@@ -158,6 +164,10 @@ fn package(pak: &[u8], e: Entry<'_>, method: &[u8], key: Option<&PakKey>, oodle:
         out.extend_from_slice(stored(pak, e.start, e.size, e.encrypted, key, scratch)?);
         return Some(());
     }
+    if e.whole_stream {
+        let bytes = stored(pak, e.start, e.compressed, false, None, scratch)?;
+        return decode_block(method, bytes, e.size, oodle, out);
+    }
     if e.block_size == 0 || e.blocks.len() / 16 != e.size.div_ceil(e.block_size) { return None; }
     for mut block in e.blocks.chunks_exact(16) {
         let start = offset(&mut block)?;
@@ -183,6 +193,7 @@ pub(crate) struct PakScan {
 struct Footer<'a> {
     version: u32,
     encrypted: bool,
+    frozen: bool,
     index: Index,
     end: usize,
     methods: &'a [u8],
@@ -214,6 +225,17 @@ impl Index {
 
 impl<'a> Footer<'a> {
     fn parse(pak: &'a [u8]) -> Option<Self> {
+        if let Some(end) = pak.len().checked_sub(FOOTER - 1) {
+            let mut bytes = &pak[end..];
+            let magic = number(&mut bytes)?;
+            let version = number(&mut bytes)?;
+            if magic == MAGIC && (1..=3).contains(&version) {
+                let index = Index::parse(&mut bytes)?;
+                if index.start.checked_add(index.size)? <= end {
+                    return Some(Self { version, encrypted: false, frozen: false, index, end, methods: &[] });
+                }
+            }
+        }
         for suffix in [0, 128, 160, 161, 164] {
             let end = pak.len().checked_sub(FOOTER + suffix)?;
             let mut bytes = &pak[end..];
@@ -223,13 +245,14 @@ impl<'a> Footer<'a> {
             let methods = match (version, suffix) {
                 (4..=7, 0) => &[][..],
                 (8, 128 | 160) | (10..=14, 160) | (14, 164) => &bytes[36..36 + suffix.min(160)],
-                (9, 161) if bytes[36] == 0 => &bytes[37..],
+                (9, 161) if bytes[36] <= 1 => &bytes[37..],
                 _ => continue,
             };
+            let frozen = version == 9 && bytes[36] == 1;
             let end = end.checked_sub(if version >= 7 { 16 } else { 0 })?;
             let index = Index::parse(&mut bytes)?;
             if index.start.checked_add(index.size)? > end { continue; }
-            return Some(Self { version, encrypted: flag == 1, index, end, methods });
+            return Some(Self { version, encrypted: flag == 1, frozen, index, end, methods });
         }
         None
     }
@@ -247,6 +270,35 @@ impl<'a> Footer<'a> {
         let start = (method as usize - 1).checked_mul(32)?;
         self.methods.get(start..start.checked_add(32)?)?.split(|&b| b == 0).next()
     }
+}
+
+fn frozen_entries<'a>(index: &[u8], pak: &'a [u8], footer: &Footer<'_>,
+                      entries: &mut Vec<Entry<'a>>) -> Option<u64> {
+    // The frozen mount point occupies a 16-byte FString. The following array
+    // has a relative pointer, count and capacity, followed elsewhere by the
+    // 8-byte-aligned FPakEntry records. Read the complete entry data from the
+    // header next to each payload, as with encoded modern entries.
+    const ARRAY: usize = 16;
+    const STRIDE: usize = 80;
+    let mut header = index.get(ARRAY..)?;
+    let pointer = u64::from_le_bytes(take(&mut header, 8)?.try_into().ok()?);
+    let count = number(&mut header)? as usize;
+    if number(&mut header)? as usize != count { return None; }
+    if count == 0 { return Some(0); }
+    if pointer & 1 == 0 { return None; }
+    let relative = usize::try_from((pointer as i64) >> 1).ok()?;
+    let begin = ARRAY.checked_add(relative)?;
+    let size = count.checked_mul(STRIDE)?;
+    let table = index.get(begin..begin.checked_add(size)?)?;
+    let mut unreadable = 0;
+    for record in table.chunks_exact(STRIDE) {
+        if record[72] & 2 != 0 { continue; } // Deleted.
+        let item = offset(&mut &record[..8]).and_then(|start| {
+            entry(&mut pak.get(start..footer.index.start)?, footer, Some(start))
+        });
+        if let Some(item) = item { entries.push(item); } else { unreadable += 1; }
+    }
+    Some(unreadable)
 }
 
 fn shader_path(name: &str) -> bool {
@@ -388,20 +440,27 @@ pub(crate) fn scan(pak: &[u8], key: Option<&PakKey>, oodle: Option<Oodle>,
     result.locked = footer.encrypted;
     let mut index_scratch = Vec::new();
     let Some(index) = footer.index.read(pak, footer.encrypted, key, &mut index_scratch) else { return result };
-    let mut data = index;
-    if path(&mut data).is_none() { return result; }
-    let Some(count) = number(&mut data) else { return result };
     let start = footer.index.start;
     let valid_hash = footer.index.matches(index) || footer.index.matches(&pak[start..start + footer.index.size]);
     let mut packages = Vec::new();
-    if footer.version >= 10 {
+    if footer.frozen {
         if !valid_hash { return result; }
         result.locked = false;
-        let Some(unreadable) = modern_entries(data, pak, &footer, key, &mut packages) else { return result };
+        let Some(unreadable) = frozen_entries(index, pak, &footer, &mut packages) else { return result };
         result.unreadable += unreadable;
     } else {
-        let Some(consumed) = legacy_entries(data, &footer, count as usize, &mut packages) else { return result };
-        if !valid_hash && !footer.index.matches(&index[..index.len() - data.len() + consumed]) { return result; }
+        let mut data = index;
+        if path(&mut data).is_none() { return result; }
+        let Some(count) = number(&mut data) else { return result };
+        if footer.version >= 10 {
+            if !valid_hash { return result; }
+            result.locked = false;
+            let Some(unreadable) = modern_entries(data, pak, &footer, key, &mut packages) else { return result };
+            result.unreadable += unreadable;
+        } else {
+            let Some(consumed) = legacy_entries(data, &footer, count as usize, &mut packages) else { return result };
+            if !valid_hash && !footer.index.matches(&index[..index.len() - data.len() + consumed]) { return result; }
+        }
     }
     result.opened = true;
     result.locked = false;
@@ -433,11 +492,63 @@ mod tests {
         pak[size - 1] = 42;
         let entry = Entry { start: 0, compressed: size, size, method: 0, block_size: 0,
                             encrypted: false, blocks: &[], block_base: 0, deleted: false,
-                            payload: Payload::Package };
+                            whole_stream: false, payload: Payload::Package };
         let mut out = Vec::new();
         assert!(package(&pak, entry, b"None", None, None, &mut out, &mut Vec::new()).is_some());
         assert_eq!(out.len(), size);
         assert_eq!(out.last(), Some(&42));
+    }
+
+    #[test]
+    fn reads_pre_block_and_frozen_pak_indexes() {
+        use std::io::Write;
+
+        let payload = b"shader payload";
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        zlib.write_all(payload).unwrap();
+        let compressed = zlib.finish().unwrap();
+        for version in [1u32, 2, 9] {
+            let frozen = version == 9;
+            let stored = if frozen { payload.as_slice() } else { &compressed };
+            let mut header = vec![0; 8]; // Payload offset.
+            header.extend_from_slice(&(stored.len() as u64).to_le_bytes());
+            header.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            header.extend_from_slice(&u32::from(!frozen).to_le_bytes());
+            if version == 1 { header.extend_from_slice(&[0; 8]); }
+            header.extend_from_slice(&Sha1::digest(payload));
+            if frozen { header.extend_from_slice(&[0; 5]); }
+            let mut pak = header.clone();
+            pak.extend_from_slice(stored);
+            let index_start = pak.len() as u64;
+            let mut index = if frozen {
+                let mut index = vec![0; 112];
+                index[16..24].copy_from_slice(&33u64.to_le_bytes()); // Relative 16, frozen flag.
+                index[24..28].copy_from_slice(&1u32.to_le_bytes());
+                index[28..32].copy_from_slice(&1u32.to_le_bytes());
+                index
+            } else {
+                let mut index = vec![0; 4]; // Empty mount point.
+                index.extend_from_slice(&1u32.to_le_bytes());
+                index.extend_from_slice(&10u32.to_le_bytes());
+                index.extend_from_slice(b"test.uexp\0");
+                index.extend_from_slice(&header);
+                index
+            };
+            if frozen { index[32 + 8..32 + 16].copy_from_slice(&(stored.len() as u64).to_le_bytes()); }
+            pak.extend_from_slice(&index);
+            if frozen { pak.extend_from_slice(&[0; 17]); }
+            pak.extend_from_slice(&MAGIC.to_le_bytes());
+            pak.extend_from_slice(&version.to_le_bytes());
+            pak.extend_from_slice(&index_start.to_le_bytes());
+            pak.extend_from_slice(&(index.len() as u64).to_le_bytes());
+            pak.extend_from_slice(&Sha1::digest(&index));
+            if frozen {
+                pak.push(1);
+                pak.extend_from_slice(&[0; 160]);
+            }
+            let result = scan(&pak, None, None, |_, code| assert_eq!(code, payload));
+            assert_eq!((result.opened, result.packages, result.unreadable), (true, 1, 0), "v{version}");
+        }
     }
 
     #[test]
