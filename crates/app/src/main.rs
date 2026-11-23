@@ -411,15 +411,14 @@ fn shader_state(
 
     let (value, detail) = match disk_cache {
         Some(cache) if cache.files > 0 => (
-            size(cache.bytes),
-            format!("{} NVIDIA cache file(s) name this executable. Individual shader matches are unavailable.", cache.files),
+            "Found".to_string(),
+            format!("{} across {} matching NVIDIA cache file(s).", size(cache.bytes), cache.files),
         ),
-        Some(_) => ("No matching files".to_string(), "No readable NVIDIA cache file names this executable.".to_string()),
-        None => ("Unavailable".to_string(), "Tessera could not verify this game's driver cache on disk.".to_string()),
+        _ => ("No matching files".to_string(), "No NVIDIA cache files were found for this executable.".to_string()),
     };
     rows.push(line("Driver cache on disk", value, vec![detail], NEUTRAL));
 
-    if scan_gl || c.glsl > 0 {
+    if scan_gl {
         let value = if c.scan_outdated.is_none() { "Scan available".to_string() } else { c.glsl.to_string() };
         rows.push(line("OpenGL shaders", value, vec![
             "Embedded GLSL sources found in the game files.".to_string(),

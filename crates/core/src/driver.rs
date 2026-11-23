@@ -176,8 +176,7 @@ pub struct NvidiaGameCache {
     pub bytes: u64,
 }
 
-/// Reads only the headers of NVIDIA's current DXCache files. A matching
-/// header identifies an executable name, not individual shader bytecode.
+/// Reads supported NVIDIA DXCache headers and totals those naming the executable.
 pub fn nvidia_game_cache(exe: &Path) -> Option<NvidiaGameCache> {
     let local = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
     nvidia_game_cache_at(&local.join("NVIDIA/DXCache"), exe.file_name()?.to_str()?)
@@ -187,38 +186,30 @@ fn nvidia_game_cache_at(dir: &Path, exe_name: &str) -> Option<NvidiaGameCache> {
     use std::io::Read;
 
     let mut cache = NvidiaGameCache::default();
-    let mut incomplete = false;
-    let mut understood = false;
-    for entry in std::fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
         if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nvph")) {
             continue;
         }
         let Ok(file) = std::fs::File::open(&path) else {
-            incomplete = true;
             continue;
         };
         let mut header = Vec::with_capacity(0x111);
         let Ok(metadata) = file.metadata() else {
-            incomplete = true;
             continue;
         };
         if (&file).take(0x111).read_to_end(&mut header).is_err() {
-            incomplete = true;
             continue;
         }
         let Some((name, bytes)) = nvidia_cache_header(&header, metadata.len()) else {
-            incomplete = true;
             continue;
         };
-        understood = true;
         if name.eq_ignore_ascii_case(exe_name.as_bytes()) {
             cache.files += 1;
             cache.bytes += bytes;
         }
     }
-    (cache.files > 0 || (understood && !incomplete)).then_some(cache)
+    Some(cache)
 }
 
 fn nvidia_cache_header(header: &[u8], file_len: u64) -> Option<(&[u8], u64)> {
@@ -514,6 +505,7 @@ mod tests {
         );
         assert_eq!(nvidia_game_cache_at(dir.path(), "other.exe"), Some(NvidiaGameCache::default()));
         write_cache("c.nvph", b"other.exe", 129);
-        assert_eq!(nvidia_game_cache_at(dir.path(), "other.exe"), None);
+        assert_eq!(nvidia_game_cache_at(dir.path(), "other.exe"), Some(NvidiaGameCache::default()));
+        assert_eq!(nvidia_game_cache_at(dir.path(), "ff7remake_.exe"), Some(NvidiaGameCache { files: 1, bytes: 80 }));
     }
 }
