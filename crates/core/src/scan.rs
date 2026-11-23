@@ -454,6 +454,15 @@ impl Found {
         }
     }
 
+    fn unity_payload(&mut self, bytes: &[u8], shader_data: bool) {
+        self.record_spirv(bytes);
+        if shader_data {
+            self.spirv.extend(counted_spirv(bytes));
+            self.search_glsl_source(bytes);
+        }
+        self.search(bytes, 0);
+    }
+
     fn record(&mut self, c: &Container, code: &[u8]) -> bool {
         if !c.d3d11() {
             return self.skipped.insert(c.hash, c.flags & FLAG_DXIL != 0).is_none();
@@ -701,19 +710,17 @@ fn spirv_hash(bytes: &[u8]) -> Option<u128> {
 }
 
 fn unreal_spirv_hash(bytes: &[u8]) -> Option<u128> {
-    if let Some(hash) = spirv_hash(bytes) { return Some(hash); }
-    for start in memchr::memmem::find_iter(bytes, b"\x03\x02\x23\x07") {
-        if start < 4 { continue; }
-        // Native Vulkan shader records can put a counted SPIR-V array after a header.
-        let count = u32_at(bytes, start - 4) as usize;
+    spirv_hash(bytes).or_else(|| counted_spirv(bytes).next())
+}
+
+fn counted_spirv(bytes: &[u8]) -> impl Iterator<Item = u128> + '_ {
+    // Engine shader records can prefix a SPIR-V array with its byte or word count.
+    memchr::memmem::find_iter(bytes, b"\x03\x02\x23\x07").filter_map(|start| {
+        let count = u32_at(bytes, start.checked_sub(4)?) as usize;
         let code = &bytes[start..];
-        for size in [count, count.saturating_mul(4)] {
-            if let Some(hash) = code.get(..size).and_then(spirv_hash) {
-                return Some(hash);
-            }
-        }
-    }
-    None
+        [count, count.saturating_mul(4)].into_iter()
+            .find_map(|size| code.get(..size).and_then(spirv_hash))
+    })
 }
 
 fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
@@ -747,11 +754,7 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
     f.stats.unreal_libraries_unreadable += pak.unreadable_libraries;
     let apk = map.starts_with(b"ENDILTLE") && f.search_apk(&map);
     let unity = if [b"UnityFS\0".as_slice(), b"UnityWeb\0", b"UnityRaw\0"].iter().any(|s| map.starts_with(s)) {
-        crate::unity::scan_bundle(&map, |bytes, shader_data| {
-            f.record_spirv(bytes);
-            if shader_data { f.search_glsl_source(bytes); }
-            f.search(bytes, 0);
-        })
+        crate::unity::scan_bundle(&map, |bytes, shader_data| f.unity_payload(bytes, shader_data))
     } else {
         None
     };
@@ -760,10 +763,8 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
         f.stats.unreadable_unity_entries += unreadable;
         f.stats.unity_shader_objects += shaders;
         f.stats.unreadable_unity_shader_objects += failed;
-    } else if let Some((shaders, failed)) = crate::unity::scan_serialized_slice(&map, |bytes, _| {
-        f.record_spirv(bytes);
-        f.search_glsl_source(bytes);
-        f.search(bytes, 0);
+    } else if let Some((shaders, failed)) = crate::unity::scan_serialized_slice(&map, |bytes, shader_data| {
+        f.unity_payload(bytes, shader_data)
     }) {
         f.stats.unity_shader_objects += shaders;
         f.stats.unreadable_unity_shader_objects += failed;
@@ -881,7 +882,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 15 {:016x}", key.finish())
+    format!("tessera-scan 16 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -1135,22 +1136,35 @@ mod tests {
         for word in [1u32, 1, 0, 0, 1] { shader.extend_from_slice(&word.to_le_bytes()); }
         shader.extend_from_slice(&[1; 16]); // Asset GUID.
 
+        let mut compute = vec![0; 28]; // Name and kernel metadata.
+        for generator in [0, 1] {
+            let mut module = spirv_compute_fixture();
+            module[2] = generator;
+            compute.extend_from_slice(&(size_of_val(&module) as u32).to_le_bytes());
+            compute.extend(module.into_iter().flat_map(u32::to_le_bytes));
+        }
+        compute.extend_from_slice(&[0; 8]); // Following serialized fields.
+
         let mut metadata = b"6000.0.65f1\0".to_vec();
         metadata.extend_from_slice(&19u32.to_le_bytes());
         metadata.push(0); // Type tree stripped.
-        metadata.extend_from_slice(&1u32.to_le_bytes());
-        metadata.extend_from_slice(&48u32.to_le_bytes());
-        metadata.extend_from_slice(&[0; 19]);
         metadata.extend_from_slice(&2u32.to_le_bytes());
+        for class in [48u32, 72] {
+            metadata.extend_from_slice(&class.to_le_bytes());
+            metadata.extend_from_slice(&[0; 19]);
+        }
+        metadata.extend_from_slice(&3u32.to_le_bytes());
         metadata.resize(metadata.len().next_multiple_of(4), 0);
-        for (id, offset, size) in [(1u64, 0u64, shader.len() as u32), (2, shader.len() as u64, 4)] {
+        let objects = [(0, shader.len(), 0u32), (shader.len(), 4, 0), (shader.len() + 4, compute.len(), 1)];
+        for (id, (offset, size, class)) in objects.into_iter().enumerate() {
+            let id = id as u64 + 1;
             metadata.extend_from_slice(&id.to_le_bytes());
-            metadata.extend_from_slice(&offset.to_le_bytes());
-            metadata.extend_from_slice(&size.to_le_bytes());
-            metadata.extend_from_slice(&0u32.to_le_bytes());
+            metadata.extend_from_slice(&(offset as u64).to_le_bytes());
+            metadata.extend_from_slice(&(size as u32).to_le_bytes());
+            metadata.extend_from_slice(&class.to_le_bytes());
         }
         let data_offset = (48 + metadata.len()).next_multiple_of(16);
-        let file_size = (data_offset + shader.len() + 4) as u64;
+        let file_size = (data_offset + shader.len() + 4 + compute.len()) as u64;
         let mut serialized = vec![0; 48];
         serialized[8..12].copy_from_slice(&22u32.to_be_bytes());
         serialized[20..24].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
@@ -1160,21 +1174,19 @@ mod tests {
         serialized.resize(data_offset, 0);
         serialized.extend_from_slice(&shader);
         serialized.extend_from_slice(&[255; 4]); // Malformed Shader object.
+        serialized.extend_from_slice(&compute);
         fs::write(dir.path().join("globalgamemanagers.assets"), serialized).unwrap();
 
         let (shaders, stats) = scan_dir(dir.path());
-        assert_eq!((stats.unity_shader_objects, stats.unreadable_unity_shader_objects), (2, 1));
+        assert_eq!((stats.unity_shader_objects, stats.unreadable_unity_shader_objects), (3, 1));
         assert_eq!(stats.dxil, 1);
-        assert_eq!(stats.spirv, 1);
+        // One module appears in both compressed and inline representations.
+        assert_eq!(stats.spirv, 2);
         assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
     }
 
-    #[test]
-    fn counts_complete_spirv_modules_in_files_and_zip_entries() {
-        use std::io::Write;
-
-        let dir = tempfile::tempdir().unwrap();
-        let module: [u32; 35] = [
+    fn spirv_compute_fixture() -> [u32; 35] {
+        [
             0x0723_0203, 0x0001_0000, 0, 5, 0,
             0x0002_0011, 1, // OpCapability Shader
             0x0003_000e, 0, 1, // OpMemoryModel Logical GLSL450
@@ -1186,7 +1198,15 @@ mod tests {
             0x0002_00f8, 4, // OpLabel
             0x0001_00fd, // OpReturn
             0x0001_0038, // OpFunctionEnd
-        ];
+        ]
+    }
+
+    #[test]
+    fn counts_complete_spirv_modules_in_files_and_zip_entries() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let module = spirv_compute_fixture();
         let bytes: Vec<_> = module.into_iter().flat_map(u32::to_le_bytes).collect();
         let swapped: Vec<_> = module.into_iter().flat_map(u32::to_be_bytes).collect();
         assert!(spirv_hash(&bytes).is_some());

@@ -301,17 +301,28 @@ fn scan_serialized(
     let found = objects.len() as u64;
     let mut failed = 0;
     let mut spirv = Vec::new();
-    for (offset, size) in objects {
+    for object in objects {
+        if object.offset.checked_add(object.size as u64).is_none_or(|end| end > length) {
+            failed += 1;
+            continue;
+        }
         let mut complete = false;
-        read(offset, size, &mut |bytes| {
-            complete = layout.scan(bytes, decoded, |code| {
+        read(object.offset, object.size, &mut |bytes| {
+            let mut program = |code: &[u8]| {
                 visit(code, true);
                 for start in memchr::memmem::find_iter(code, smolv::MAGIC) {
                     if smolv::decode(&code[start..], layout.legacy_smolv(), &mut spirv).is_some() {
                         visit(&spirv, true);
                     }
                 }
-            }).is_some();
+            };
+            complete = if object.has_shader_blob {
+                layout.scan(bytes, decoded, &mut program).is_some()
+            } else {
+                // Compute and ray-tracing objects use inline program arrays.
+                program(bytes);
+                true
+            };
         });
         failed += u64::from(!complete);
     }

@@ -9,13 +9,18 @@ pub(super) struct SerializedFile {
     pub(super) header_size: usize,
     pub(super) metadata_size: usize,
     data_offset: u64,
-    file_size: u64,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct ShaderLayout {
     version: (u32, u32),
     be: bool,
+}
+
+pub(super) struct ShaderObject {
+    pub(super) offset: u64,
+    pub(super) size: usize,
+    pub(super) has_shader_blob: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -93,11 +98,10 @@ impl SerializedFile {
             header_size,
             metadata_size,
             data_offset,
-            file_size,
         })
     }
 
-    pub(super) fn shaders(&self, metadata: &[u8]) -> Option<(ShaderLayout, Vec<(u64, usize)>)> {
+    pub(super) fn shaders(&self, metadata: &[u8]) -> Option<(ShaderLayout, Vec<ShaderObject>)> {
         let mut reader = Reader {
             data: metadata,
             be: self.be,
@@ -165,15 +169,17 @@ impl SerializedFile {
             if matches!(self.format, 15 | 16) {
                 reader.take(1)?;
             } // Stripped.
-            if class == 48 {
+            if matches!(class, 48 | 72 | 825902497) {
+                // Shader, ComputeShader, RayTracingShader.
                 let start = self.data_offset.checked_add(offset)?;
-                if start.checked_add(size as u64)? > self.file_size {
-                    return None;
-                }
-                shaders.push((start, size));
+                shaders.push(ShaderObject {
+                    offset: start,
+                    size,
+                    has_shader_blob: class == 48,
+                });
             }
         }
-        shaders.sort_unstable_by_key(|&(start, _)| start);
+        shaders.sort_unstable_by_key(|object| object.offset);
         Some((
             ShaderLayout {
                 version,
