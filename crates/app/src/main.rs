@@ -43,14 +43,45 @@ struct State {
 
 type Shared = Arc<Mutex<State>>;
 
-const GAME_FOLDERS_FILE: &str = "game-folders.txt";
-const LIBRARY_FOLDERS_FILE: &str = "library-folders.txt";
+impl FolderSource {
+    fn file(self) -> &'static str {
+        match self {
+            Self::Game => "game-folders.txt",
+            Self::Library => "library-folders.txt",
+            Self::Legacy => "folders.txt",
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct ManualFolders {
     legacy: Vec<PathBuf>,
     games: Vec<PathBuf>,
     libraries: Vec<PathBuf>,
+}
+
+impl ManualFolders {
+    fn paths_mut(&mut self, source: FolderSource) -> &mut Vec<PathBuf> {
+        match source {
+            FolderSource::Game => &mut self.games,
+            FolderSource::Library => &mut self.libraries,
+            FolderSource::Legacy => &mut self.legacy,
+        }
+    }
+
+    fn rows(&self) -> Vec<FolderRow> {
+        [
+            (FolderSource::Game, &self.games),
+            (FolderSource::Library, &self.libraries),
+            (FolderSource::Legacy, &self.legacy),
+        ].into_iter().flat_map(|(source, paths)| {
+            paths.iter().enumerate().map(move |(index, path)| FolderRow {
+                source,
+                index: index as i32,
+                path: path.to_string_lossy().as_ref().into(),
+            })
+        }).collect()
+    }
 }
 
 fn load_folders(file: &str) -> Vec<PathBuf> {
@@ -69,10 +100,10 @@ fn save_folders(file: &str, folders: &[PathBuf]) -> std::io::Result<()> {
 }
 
 fn add_folder(ui: &MainWindow, state: &Shared, library: bool) {
-    let (title, file) = if library {
-        ("Select a folder containing game folders", LIBRARY_FOLDERS_FILE)
+    let (title, source) = if library {
+        ("Select a folder containing game folders", FolderSource::Library)
     } else {
-        ("Select the game's installation folder", GAME_FOLDERS_FILE)
+        ("Select the game's installation folder", FolderSource::Game)
     };
     let Some(dir) = rfd::FileDialog::new().set_title(title).pick_folder() else { return };
     let key = tessera_core::library::install_key(&dir);
@@ -84,19 +115,40 @@ fn add_folder(ui: &MainWindow, state: &Shared, library: bool) {
             ui.set_status_text("This game folder is already in the library.".into());
             return;
         }
-        let folders = if library { &mut st.folders.libraries } else { &mut st.folders.games };
+        let folders = st.folders.paths_mut(source);
         if folders.iter().any(|folder| matches(folder)) {
             ui.set_status_text("This folder has already been added.".into());
             return;
         }
         folders.push(dir);
-        if let Err(e) = save_folders(file, folders) {
+        if let Err(e) = save_folders(source.file(), folders) {
             folders.pop();
             ui.set_status_text(format!("Could not save the folder: {e}").into());
             return;
         }
     }
     refresh(ui, state, (!library).then_some(key));
+}
+
+fn remove_folder(ui: &MainWindow, state: &Shared, source: FolderSource, index: i32) {
+    if ui.get_busy() {
+        return;
+    }
+    {
+        let mut st = state.lock().unwrap();
+        let folders = st.folders.paths_mut(source);
+        let index = index as usize;
+        if index >= folders.len() {
+            return;
+        }
+        let path = folders.remove(index);
+        if let Err(e) = save_folders(source.file(), folders) {
+            folders.insert(index, path);
+            ui.set_status_text(format!("Could not remove the folder: {e}").into());
+            return;
+        }
+    }
+    refresh(ui, state, None);
 }
 
 fn status_label(s: &InstallState) -> String {
@@ -856,6 +908,7 @@ fn refresh(ui: &MainWindow, state: &Shared, added: Option<String>) {
     let weak = ui.as_weak();
     let state = state.clone();
     let folders = state.lock().unwrap().folders.clone();
+    ui.set_manual_folders(ModelRc::new(VecModel::from(folders.rows())));
     std::thread::spawn(move || {
         let t = std::time::Instant::now();
         let games = tessera_core::analyze_all(tessera_core::library::discover_with_folders(
@@ -1221,9 +1274,9 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     let state: Shared = Arc::new(Mutex::new(State {
         folders: ManualFolders {
-            legacy: load_folders("folders.txt"),
-            games: load_folders(GAME_FOLDERS_FILE),
-            libraries: load_folders(LIBRARY_FOLDERS_FILE),
+            legacy: load_folders(FolderSource::Legacy.file()),
+            games: load_folders(FolderSource::Game.file()),
+            libraries: load_folders(FolderSource::Library.file()),
         },
         ..Default::default()
     }));
@@ -1243,6 +1296,10 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_add_folder(move |library| add_folder(&w.unwrap(), &s, library));
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_remove_folder(move |source, index| remove_folder(&w.unwrap(), &s, source, index));
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());
