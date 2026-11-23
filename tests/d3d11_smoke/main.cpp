@@ -10,6 +10,7 @@
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
+#include <inspectable.h>
 #include <windows.h>
 
 #include <algorithm>
@@ -110,7 +111,7 @@ void* import_slot(HMODULE m, const char* name) {
 // NVAPI (NVIDIA only): resolved through our import, the memory it reports
 // must be capped as well. 0 ok or no NVAPI; else the failure's exit code.
 int nvapi_capped(unsigned long long cap, const char* when) {
-    HMODULE nv = LoadLibraryW(L"nvapi64.dll");
+    HMODULE nv = LoadLibraryW(sizeof(void*) == 4 ? L"nvapi.dll" : L"nvapi64.dll");
     if (!nv) return 0;
     using Qi = void*(__cdecl*)(unsigned);
     const auto qi = reinterpret_cast<Qi>(GetProcAddress(nv, "nvapi_QueryInterface"));
@@ -1200,7 +1201,7 @@ int nvapi_mode() {
     using Probe = void*(*)();
     const auto probe_qi = reinterpret_cast<Probe>(GetProcAddress(probe, "probe_qi"));
     void* const from_dll = probe_qi ? probe_qi() : nullptr;
-    HMODULE nv = GetModuleHandleW(L"nvapi64.dll");
+    HMODULE nv = GetModuleHandleW(sizeof(void*) == 4 ? L"nvapi.dll" : L"nvapi64.dll");
     if (!nv) {
         std::printf("no NVAPI, skipped\n");
         return 4;
@@ -1440,7 +1441,31 @@ int uecvars_mode(bool stale) {
 
 int upload_flight_probe();
 
+static int exports_mode() {
+    HMODULE proxy = GetModuleHandleW(L"d3d11.dll");
+    auto address = GetProcAddress(proxy, "CreateDirect3D11DeviceFromDXGIDevice");
+    if (!address || address != GetProcAddress(proxy, MAKEINTRESOURCEA(16))) return 1;
+    using CreateInteropDevice = HRESULT(WINAPI*)(IDXGIDevice*, IInspectable**);
+    auto create_interop = reinterpret_cast<CreateInteropDevice>(address);
+    ID3D11Device* device = nullptr;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                 nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr))) return 2;
+    IDXGIDevice* dxgi = nullptr;
+    const HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&dxgi));
+    device->Release();
+    if (FAILED(hr)) return 3;
+    bool ok = true;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        IInspectable* interop = nullptr;
+        if (FAILED(create_interop(dxgi, &interop)) || !interop) ok = false;
+        if (interop) interop->Release();
+    }
+    dxgi->Release();
+    return ok ? 0 : 4;
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 2 && wcscmp(argv[1], L"--exports") == 0) return exports_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--upload-flight") == 0) return upload_flight_probe();
     if (argc >= 2 && wcscmp(argv[1], L"--uecvars") == 0) return uecvars_mode(argc >= 3 && wcscmp(argv[2], L"stale") == 0);
     if (argc >= 2 && wcscmp(argv[1], L"--bench") == 0)

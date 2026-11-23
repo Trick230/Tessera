@@ -19,7 +19,15 @@
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 extern "C" void* tessera_real[];
 
+#ifdef _M_IX86
+// An unknown export's stack cleanup cannot be emulated by a common stub.
+extern "C" __declspec(noreturn) void tessera_fail_stub() {
+    RaiseFailFastException(nullptr, nullptr, 0);
+    __assume(0);
+}
+#else
 extern "C" HRESULT tessera_fail_stub() { return E_NOTIMPL; }
+#endif
 void* resolve_export(unsigned idx);
 
 namespace {
@@ -114,18 +122,21 @@ void* resolve_export(unsigned idx) {
         if (g_next) p = reinterpret_cast<void*>(GetProcAddress(g_next, name));
         if (!p && g_system) p = reinterpret_cast<void*>(GetProcAddress(g_system, name));
     }
-    if (!p) p = reinterpret_cast<void*>(&tessera_fail_stub);
-    InterlockedExchangePointer(&tessera_real[idx], p);
+    if (p) InterlockedExchangePointer(&tessera_real[idx], p);
     return p;
 }
 
-extern "C" void* tessera_resolve(unsigned idx) { return resolve_export(idx); }
+extern "C" void* tessera_resolve(unsigned idx) {
+    void* p = resolve_export(idx);
+    return p ? p : reinterpret_cast<void*>(&tessera_fail_stub);
+}
 
 extern "C" HRESULT WINAPI Tessera_D3D11CreateDevice(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, HMODULE software,
                                                     UINT flags, const D3D_FEATURE_LEVEL* levels, UINT nlevels,
                                                     UINT sdk, ID3D11Device** dev, D3D_FEATURE_LEVEL* level,
                                                     ID3D11DeviceContext** ctx) {
     auto fn = reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(real(tessera::exports::kD3D11CreateDevice));
+    if (!fn) return E_NOTIMPL;
     const bool trial = prefer_11_1(_ReturnAddress(), adapter, type, levels, nlevels, dev);
     HRESULT trial_hr = E_FAIL;
     if (trial) {
@@ -147,6 +158,7 @@ extern "C" HRESULT WINAPI Tessera_D3D11CreateDeviceAndSwapChain(
     void* const ret = _ReturnAddress();
     auto fn = reinterpret_cast<PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN>(
         real(tessera::exports::kD3D11CreateDeviceAndSwapChain));
+    if (!fn) return E_NOTIMPL;
     // P2: a qualifying blit swapchain is created as flip model from the start.
     DXGI_SWAP_CHAIN_DESC flip;
     bool tearing = false;

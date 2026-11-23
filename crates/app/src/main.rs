@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tessera_core::install::{self, InstallState};
+use tessera_core::pe::Architecture;
 use tessera_core::shader_check::ShaderCheck;
 use tessera_core::{paths, session, GameInfo};
 
@@ -19,6 +20,7 @@ slint::include_modules!();
 
 /// Built layer shipped next to tessera.exe; installed under the proxy name.
 const PAYLOAD_D3D11: &str = "tessera_d3d11.dll";
+const PAYLOAD_D3D11_X86: &str = "tessera_d3d11_x86.dll";
 
 #[derive(Default)]
 struct State {
@@ -98,7 +100,7 @@ fn can_prepare(g: &GameInfo) -> bool {
     g.exe.as_ref().is_some_and(|e| {
         let all = g.scan.all();
         let ff7_dx11 = e.file_name().is_some_and(|n| n.eq_ignore_ascii_case("ff7remake_.exe"));
-        all.has(tessera_core::pe::ApiSet::D3D11)
+        g.scan.architecture.is_some() && all.has(tessera_core::pe::ApiSet::D3D11)
             && (!all.has(tessera_core::pe::ApiSet::D3D12) || ff7_dx11 || tessera_core::shaders::stats(e).shaders > 0)
     })
 }
@@ -677,7 +679,8 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
     let game = &st.games[st.view[index as usize]];
     let (settings, lists) = match (view.facts, game.exe_dir()) {
         (Some(facts), Some(dir)) => {
-            let (settings, lists) = game_settings(dir, game.exe.clone().filter(|_| is_unreal(game)), view.budget, facts);
+            let ue_exe = game.exe.clone().filter(|_| is_unreal(game) && game.scan.architecture == Some(Architecture::X64));
+            let (settings, lists) = game_settings(dir, ue_exe, view.budget, facts);
             (settings, Some(lists))
         }
         _ => (GameSettings::default(), None),
@@ -755,7 +758,7 @@ fn start_view_worker(ui: &MainWindow, state: &Shared, st: &mut State) {
                     if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
                         let _ = install::note_external_limit(dir, name);
                     }
-                    if is_unreal(&game) {
+                    if is_unreal(&game) && game.scan.architecture == Some(Architecture::X64) {
                         let _ = install::apply_ue_cvars(dir, exe, ue_vram_mb(budget));
                     }
                 }
@@ -849,19 +852,22 @@ fn app_dir() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default()
 }
 
-fn payload_path() -> PathBuf {
-    app_dir().join(PAYLOAD_D3D11)
+fn payload_path(architecture: Architecture) -> PathBuf {
+    app_dir().join(match architecture {
+        Architecture::X86 => PAYLOAD_D3D11_X86,
+        Architecture::X64 => PAYLOAD_D3D11,
+    })
 }
 
 /// S1 + S5: finds shader bytecode in the install files (again only when the
 /// install changed), then compiles everything stored in the driver, off the
 /// UI thread.
 fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
-    let Some((exe, root, prepare)) = ({
+    let Some((exe, root, prepare, architecture)) = ({
         let st = state.lock().unwrap();
         st.view.get(view_idx as usize).and_then(|&gi| {
             let g = &st.games[gi];
-            g.exe.clone().map(|e| (e, g.entry.root.clone(), can_prepare(g)))
+            g.exe.clone().map(|e| (e, g.entry.root.clone(), can_prepare(g), g.scan.architecture))
         })
     }) else {
         return;
@@ -892,7 +898,12 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
             else { format!("Shaders: {}", found.trim_end_matches(", ")) }
         } else {
             status("Warming shaders (outside the game)…");
-            match tessera_core::warm::run(&exe, &app_dir().join(tessera_core::warm::WARM_EXE), &stall) {
+            let helper = if architecture == Some(Architecture::X86) {
+                tessera_core::warm::WARM_EXE_X86
+            } else {
+                tessera_core::warm::WARM_EXE
+            };
+            match tessera_core::warm::run(&exe, &app_dir().join(helper), &stall) {
                 Ok(_) => {
                     let drivers: Vec<_> = tessera_core::driver::gpus()
                         .iter()
@@ -939,7 +950,8 @@ fn layer_action(ui: &MainWindow, state: &Shared, view_idx: i32, do_install: bool
         return;
     }
     let result = if do_install {
-        install::install(&dir, &payload_path(), install::PROXY_D3D11)
+        let Some(architecture) = g.scan.architecture else { return };
+        install::install(&dir, &payload_path(architecture), install::PROXY_D3D11)
     } else {
         install::uninstall(&dir)
     };

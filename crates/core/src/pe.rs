@@ -18,6 +18,7 @@ impl ApiSet {
     pub const D3D12: u8 = 1 << 2;
     pub const VULKAN: u8 = 1 << 3;
     pub const OPENGL: u8 = 1 << 4;
+    pub const D3D8: u8 = 1 << 5;
 
     pub fn has(self, bit: u8) -> bool {
         self.0 & bit != 0
@@ -34,17 +35,24 @@ impl ApiSet {
 }
 
 /// (dll name, bit, display name)
-const DLLS: [(&str, u8, &str); 5] = [
+const DLLS: [(&str, u8, &str); 6] = [
     ("d3d12.dll", ApiSet::D3D12, "D3D12"),
     ("d3d11.dll", ApiSet::D3D11, "D3D11"),
     ("d3d9.dll", ApiSet::D3D9, "D3D9"),
+    ("d3d8.dll", ApiSet::D3D8, "D3D8"),
     ("vulkan-1.dll", ApiSet::VULKAN, "Vulkan"),
     ("opengl32.dll", ApiSet::OPENGL, "OpenGL"),
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Architecture {
+    X86,
+    X64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ExeScan {
-    pub is_64bit: bool,
+    pub architecture: Option<Architecture>,
     /// APIs in the import or delay-load import tables.
     pub imported: ApiSet,
     /// APIs whose DLL name appears as an ASCII or UTF-16 string.
@@ -67,9 +75,14 @@ pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
 pub fn scan_bytes(data: &[u8]) -> ExeScan {
     let mut scan = ExeScan::default();
     let imports = if let Ok(pe) = PeFile64::parse(data) {
-        scan.is_64bit = true;
+        if pe.nt_headers().file_header().machine.get(LE) == object::pe::IMAGE_FILE_MACHINE_AMD64 {
+            scan.architecture = Some(Architecture::X64);
+        }
         imports(&pe)
     } else if let Ok(pe) = PeFile32::parse(data) {
+        if pe.nt_headers().file_header().machine.get(LE) == object::pe::IMAGE_FILE_MACHINE_I386 {
+            scan.architecture = Some(Architecture::X86);
+        }
         imports(&pe)
     } else {
         Vec::new()
@@ -178,7 +191,7 @@ mod tests {
     fn own_test_binary_parses_as_pe64() {
         let exe = std::env::current_exe().unwrap();
         let s = scan_exe(&exe).unwrap();
-        assert!(s.is_64bit);
+        assert_eq!(s.architecture, Some(Architecture::X64));
         assert!(s.imported.is_empty());
     }
 }

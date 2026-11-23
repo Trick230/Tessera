@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Builds everything: Rust app (target\release\tessera.exe) and the C++ layer,
-# copied next to the app as tessera_d3d11.dll (the payload the app installs).
+# copied next to the app in x64 and x86 variants.
 #   powershell -File build.ps1 [-Test] [-Quality]
 param([switch]$Test, [switch]$Quality)
 $ErrorActionPreference = "Stop"
@@ -21,6 +21,14 @@ try {
     if ($LASTEXITCODE) { throw "cmake build failed" }
     Copy-Item build\src\dll\Release\tessera_d3d11.dll target\release\tessera_d3d11.dll -Force
     Copy-Item build\src\warm\Release\tessera_warm.exe target\release\tessera_warm.exe -Force
+    if (-not (Test-Path build\win32\CMakeCache.txt)) {
+        & $cmake -S . -B build/win32 -G "Visual Studio 17 2022" -A Win32
+        if ($LASTEXITCODE) { throw "Win32 cmake configure failed" }
+    }
+    & $cmake --build build/win32 --config Release
+    if ($LASTEXITCODE) { throw "Win32 cmake build failed" }
+    Copy-Item build\win32\src\dll\Release\tessera_d3d11.dll target\release\tessera_d3d11_x86.dll -Force
+    Copy-Item build\win32\src\warm\Release\tessera_warm.exe target\release\tessera_warm_x86.exe -Force
     if ($Quality) {
         & $cmake -S . -B build/quality -G "Visual Studio 17 2022" -A x64 -DTESSERA_BUILD_QUALITY=ON
         if ($LASTEXITCODE) { throw "quality configure failed" }
@@ -37,6 +45,8 @@ try {
         if ($LASTEXITCODE) { throw "layer example build failed" }
         powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_smoke.ps1
         if ($LASTEXITCODE) { throw "smoke test failed" }
+        powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_smoke.ps1 -X86
+        if ($LASTEXITCODE) { throw "Win32 smoke test failed" }
     }
-    "built: target\release\tessera.exe + tessera_d3d11.dll"
+    "built: target\release\tessera.exe + x64 and x86 D3D11 payloads"
 } finally { Pop-Location }

@@ -58,7 +58,11 @@ extern "C" __declspec(dllexport) void* __cdecl nvapi_QueryInterface(unsigned id)
     return id == 0xAC1CA9E0 ? reinterpret_cast<void*>(&set_sleep_mode) : nullptr;
 }
 
+#ifdef _M_IX86
+#pragma comment(linker, "/export:D3D11CreateDevice=_probe_d3d11_create_device@40")
+#else
 #pragma comment(linker, "/export:D3D11CreateDevice=probe_d3d11_create_device")
+#endif
 extern "C" HRESULT WINAPI probe_d3d11_create_device(
     IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, HMODULE software, UINT flags, const D3D_FEATURE_LEVEL* levels,
     UINT count, UINT sdk, ID3D11Device** dev, D3D_FEATURE_LEVEL* level, ID3D11DeviceContext** ctx) {

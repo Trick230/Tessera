@@ -806,7 +806,7 @@ component Detail inherits Rectangle {
                         ? "No session recorded yet. Play once with the layer on and the results show up here."
                         : root.game.can-install
                         ? "Install the layer and play once. Tessera then shows how the game ran and what can be improved."
-                        : "The layer works with 64-bit D3D11 games only, so it cannot be installed here.";
+                        : "The layer needs a D3D11 game with an x86 or x64 executable.";
                 }
 
                 // Shaders: compiled, covered, damaged, out of date.
@@ -1001,7 +1001,7 @@ component Detail inherits Rectangle {
                         ? "Settings need the layer, which is never installed in anti-cheat games."
                         : root.game.can-install
                         ? "Install the layer to change these settings."
-                        : "The layer works with 64-bit D3D11 games only, so there is nothing to set here.";
+                        : "Settings need a D3D11 game with an x86 or x64 executable.";
                 }
 
                 // Files and identity.

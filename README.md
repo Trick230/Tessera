@@ -95,10 +95,10 @@ Requirements:
 
 ```powershell
 powershell -File build.ps1          # app + layer -> target\release\
-powershell -File build.ps1 -Test    # also runs the unit tests and the D3D11 smoke test
+powershell -File build.ps1 -Test    # also runs the unit tests and both D3D11 smoke tests
 ```
 
-This produces `target\release\tessera.exe` and `target\release\tessera_d3d11.dll`. The app installs the layer into a game folder as `d3d11.dll`.
+This produces `target\release\tessera.exe` with D3D11 layer and shader warm-up binaries for x64 and x86 games. The app picks the game's architecture and installs the matching layer as `d3d11.dll`. Unreal console variable overrides require an x64 game.
 
 ## Repository layout
 

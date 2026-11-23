@@ -5,7 +5,7 @@
 #include <dxgi.h>
 
 extern "C" __declspec(dllexport) void* probe_qi() {
-    HMODULE nv = LoadLibraryW(L"nvapi64.dll");
+    HMODULE nv = LoadLibraryW(sizeof(void*) == 4 ? L"nvapi.dll" : L"nvapi64.dll");
     return nv ? reinterpret_cast<void*>(GetProcAddress(nv, "nvapi_QueryInterface")) : nullptr;
 }
 

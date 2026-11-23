@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Layer smoke test: clean run + session check, then safe mode after two crashes.
-#   powershell -File tests/run_smoke.ps1 [-Config Release] [-PacingOnly] [-D3D11CallsOnly]
-param([string]$Config = "Release", [switch]$PacingOnly, [switch]$D3D11CallsOnly)
+#   powershell -File tests/run_smoke.ps1 [-Config Release] [-X86] [-PacingOnly] [-D3D11CallsOnly]
+param([string]$Config = "Release", [switch]$X86, [switch]$PacingOnly, [switch]$D3D11CallsOnly)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
-$exe = Join-Path $root "build\tests\d3d11_smoke\$Config\d3d11_smoke.exe"
+$native = if ($X86) { "build\win32" } else { "build" }
+$exe = Join-Path $root "$native\tests\d3d11_smoke\$Config\d3d11_smoke.exe"
 $layer = Join-Path $root "target\release\examples\layer.exe"
 $fails = 0
 function Check($name, $ok) {
@@ -78,9 +79,16 @@ if ($PacingOnly -or $D3D11CallsOnly) {
     exit 0
 }
 
-$data = Join-Path $root "build\smoke-data"
-if (Test-Path $data) { Remove-Item -Recurse -Force $data }
+$run = Join-Path $root "build\smoke-data\$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $run -Force | Out-Null
+$bin = Split-Path $exe
+Copy-Item -LiteralPath $exe, "$bin\d3d11.dll", "$bin\load_probe.dll", "$bin\nvapi_probe.dll" -Destination $run
+$exe = Join-Path $run "d3d11_smoke.exe"
+$data = Join-Path $run "data"
 $env:TESSERA_DATA_DIR = $data
+
+& $exe --exports | Write-Host
+Check "proxy exports work by name and ordinal on cold and cached calls" ($LASTEXITCODE -eq 0)
 
 # M2 is off by default; the session check expects its priority flags.
 $ini = Join-Path (Split-Path $exe) "tessera.ini"
@@ -123,7 +131,7 @@ try {
     $idx = Get-ChildItem "$data\shaders\d3d11_smoke.exe-*.tshi"
     Check "shader store has 2 shaders" ($idx.Count -eq 1 -and $idx[0].Length -eq 56)
     # S5: the warm-up compiles both, then a second run finds nothing left to do.
-    $warm = Join-Path $root "build\src\warm\$Config\tessera_warm.exe"
+    $warm = Join-Path $root "$native\src\warm\$Config\tessera_warm.exe"
     $base = $idx[0].FullName -replace '\.tshi$', ''
     $w1 = & $warm $base
     Check "warm-up compiles 2 shaders" ($LASTEXITCODE -eq 0 -and "$w1" -match "compiled now 2, failed now 0")
@@ -145,16 +153,18 @@ try {
     Check "released render target reused, held ones and initial data left alone (R1)" ($LASTEXITCODE -eq 0)
 } finally { Remove-Item $ini }
 
-# U1: Unreal console variables from cvar.* lines (the mode writes tessera.ini with its own RVAs).
-try {
-    & $exe --uecvars | Write-Host
-    Check "console variables set, checked and restored (U1)" ($LASTEXITCODE -eq 0)
-    Check "bad console variable slots logged" ((Select-String -Path $log -Pattern "r.Test.Bad: object at" -Quiet) -and
-        (Select-String -Path $log -Pattern "r.Test.ReadOnly: slot" -Quiet) -and (Select-String -Path $log -Pattern "r.Test.Garbage: bad value" -Quiet) -and (Select-String -Path $log -Pattern "r.Test.Float moved" -Quiet))
-    & $exe --uecvars stale | Write-Host
-    Check "console variables left alone on another build (U1)" ($LASTEXITCODE -eq 0 -and
-        (Select-String -Path $log -Pattern "not the scanned build" -Quiet))
-} finally { if (Test-Path $ini) { Remove-Item $ini } }
+# U1 recognizes PE64 Unreal executable layouts.
+if (-not $X86) {
+    try {
+        & $exe --uecvars | Write-Host
+        Check "console variables set, checked and restored (U1)" ($LASTEXITCODE -eq 0)
+        Check "bad console variable slots logged" ((Select-String -Path $log -Pattern "r.Test.Bad: object at" -Quiet) -and
+            (Select-String -Path $log -Pattern "r.Test.ReadOnly: slot" -Quiet) -and (Select-String -Path $log -Pattern "r.Test.Garbage: bad value" -Quiet) -and (Select-String -Path $log -Pattern "r.Test.Float moved" -Quiet))
+        & $exe --uecvars stale | Write-Host
+        Check "console variables left alone on another build (U1)" ($LASTEXITCODE -eq 0 -and
+            (Select-String -Path $log -Pattern "not the scanned build" -Quiet))
+    } finally { if (Test-Path $ini) { Remove-Item $ini } }
+}
 
 # M3-M5: managed textures lose their top mip while unbound and get it back before any read.
 Set-Content -Path $ini -Value "[tessera]`nmip_residency=1`nmip_force_evict=1" -Encoding ascii

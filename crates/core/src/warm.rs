@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const WARM_EXE: &str = "tessera_warm.exe";
+pub const WARM_EXE_X86: &str = "tessera_warm_x86.exe";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Crashes or device removals tolerated in one warm-up; each relaunch skips
 /// the shader that was being compiled.
