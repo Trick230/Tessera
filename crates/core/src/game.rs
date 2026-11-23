@@ -15,6 +15,7 @@ pub struct GameInfo {
     pub exe: Option<PathBuf>,
     pub scan: ExeScan,
     pub engine: Engine,
+    unity_last_api: Option<&'static str>,
     pub anticheat: Vec<String>,
     /// xxh3-128 of the main executable; keys every cache of this game.
     pub exe_hash: Option<u128>,
@@ -28,6 +29,10 @@ impl GameInfo {
 
     /// Short API description for the UI, e.g. "D3D12, D3D11 (-dx11)".
     pub fn api_label(&self) -> String {
+        if self.engine == Engine::Unity {
+            return self.unity_last_api
+                .map_or_else(|| "Unknown API".into(), |name| format!("{name} (last run)"));
+        }
         let all = self.scan.all();
         if all.is_empty() {
             return "Unknown API".into();
@@ -79,6 +84,7 @@ pub fn analyze(entry: GameEntry) -> GameInfo {
         .unwrap_or(InstallState::NotInstalled);
     GameInfo {
         engine,
+        unity_last_api: if engine == Engine::Unity { exe.as_deref().and_then(engine::unity_last_api) } else { None },
         anticheat: crate::anticheat::detect(&entry.root),
         entry,
         exe,
@@ -224,7 +230,7 @@ mod tests {
         let root = t.path();
         let mut pe = minimal_pe64();
         std::fs::write(root.join("Game.exe"), &pe).unwrap();
-        pe.extend_from_slice(b"D3D11CreateDevice\0");
+        pe.extend_from_slice(b"D3D11CreateDevice\0D3D12CreateDevice\0vkCreateGraphicsPipelines\0");
         std::fs::write(root.join("UnityPlayer.dll"), &pe).unwrap();
 
         let game = analyze(GameEntry {
@@ -235,7 +241,8 @@ mod tests {
             steam_appid: None,
         });
         assert_eq!(game.engine, Engine::Unity);
-        assert_eq!(game.api_label(), "D3D11");
+        assert_eq!(game.api_label(), "Unknown API");
+        assert!(game.scan.all().has(ApiSet::D3D11));
         assert!(game.can_install());
     }
 
