@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Graphics APIs configured in a Unity player's serialized BuildSettings.
+//! UnityFS bundle access and graphics APIs from serialized BuildSettings.
 
 use crate::pe::ApiSet;
 use std::fs::File;
@@ -22,6 +22,8 @@ pub(crate) fn graphics_apis(exe: &Path) -> Option<ApiSet> {
 }
 
 const MAX_METADATA: usize = 16 * 1024 * 1024;
+const MAX_BLOCK: usize = 64 * 1024 * 1024;
+const LEGACY_WEB: u32 = 0x1_0000;
 
 fn be_u32(data: &mut &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(take(data, 4)?.try_into().ok()?))
@@ -36,83 +38,224 @@ fn c_string<'a>(data: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(&take(data, len + 1)?[..len])
 }
 
-fn read_block(file: &mut impl Read, stored: usize, size: usize, flags: u32) -> Option<Vec<u8>> {
-    if stored > MAX_METADATA || size > MAX_METADATA {
+fn read_block(file: &mut impl Read, stored: usize, size: usize, flags: u32,
+              limit: usize, compressed: &mut Vec<u8>, out: &mut Vec<u8>) -> Option<()> {
+    if stored > limit || size > limit {
         return None;
     }
-    let mut data = vec![0; stored];
-    file.read_exact(&mut data).ok()?;
     match flags & 0x3f {
-        0 if stored == size => Some(data),
+        0 if stored == size => {
+            out.resize(size, 0);
+            file.read_exact(out).ok()
+        }
+        1 => {
+            compressed.resize(stored, 0);
+            file.read_exact(compressed).ok()?;
+            out.clear();
+            let unpacked_size = if flags & LEGACY_WEB != 0 {
+                lzma_rs::decompress::UnpackedSize::ReadHeaderButUseProvided(Some(size as u64))
+            } else {
+                lzma_rs::decompress::UnpackedSize::UseProvided(Some(size as u64))
+            };
+            let options = lzma_rs::decompress::Options {
+                unpacked_size,
+                memlimit: Some(MAX_BLOCK),
+                ..Default::default()
+            };
+            lzma_rs::lzma_decompress_with_options(&mut compressed.as_slice(), out, &options).ok()?;
+            (out.len() == size).then_some(())
+        }
         2 | 3 => {
-            let decoded = lz4_flex::decompress(&data, size).ok()?;
-            (decoded.len() == size).then_some(decoded)
+            compressed.resize(stored, 0);
+            file.read_exact(compressed).ok()?;
+            out.resize(size, 0);
+            (lz4_flex::decompress_into(compressed, out).ok()? == size).then_some(())
         }
         _ => None,
     }
 }
 
-/// Read only the UnityFS directory and the blocks covering globalgamemanagers.
-fn bundle_managers(mut file: impl Read + Seek) -> Option<Vec<u8>> {
-    let mut header = [0; 128];
-    let len = file.read(&mut header).ok()?;
-    let mut fields = header[..len].strip_prefix(b"UnityFS\0")?;
-    let version = be_u32(&mut fields)?;
-    if !(6..=8).contains(&version) {
-        return None;
-    }
-    c_string(&mut fields)?;
-    c_string(&mut fields)?;
-    let bundle_size = be_u64(&mut fields)?;
-    let stored = be_u32(&mut fields)? as usize;
-    let size = be_u32(&mut fields)? as usize;
-    let flags = be_u32(&mut fields)?;
-    if flags & 0x40 == 0 {
-        return None;
-    }
-    let header_end = (len - fields.len()) as u64;
-    let header_end = if version >= 7 { header_end.next_multiple_of(16) } else { header_end };
-    let at_end = flags & 0x80 != 0;
-    let table_start = if at_end { bundle_size.checked_sub(stored as u64)? } else { header_end };
-    file.seek(SeekFrom::Start(table_start)).ok()?;
-    let table = read_block(&mut file, stored, size, flags)?;
-    let mut directory = table.get(16..)?; // Data hash.
-    let count = be_u32(&mut directory)? as usize;
-    let blocks = take(&mut directory, count.checked_mul(10)?)?;
-    let count = be_u32(&mut directory)?;
-    let mut data_start = if at_end { header_end } else { table_start + stored as u64 };
-    if flags & 0x200 != 0 {
-        data_start = data_start.next_multiple_of(16);
-    }
-    for _ in 0..count {
-        let offset = be_u64(&mut directory)?;
-        let size = be_u64(&mut directory)?;
-        take(&mut directory, 4)?; // Node flags.
-        if c_string(&mut directory)? == b"globalgamemanagers" {
-            let mut output = Vec::new();
-            let end = offset.checked_add(size.min(MAX_METADATA as u64))?;
-            let mut raw_start = 0u64;
-            for mut block in blocks.chunks_exact(10) {
-                let raw = be_u32(&mut block)?;
-                let stored = be_u32(&mut block)?;
-                let raw_end = raw_start + u64::from(raw);
-                if raw_end > offset && raw_start < end {
-                    file.seek(SeekFrom::Start(data_start)).ok()?;
-                    let flags = u16::from_be_bytes(block.try_into().ok()?) as u32;
-                    let data = read_block(&mut file, stored as usize, raw as usize, flags)?;
-                    output.extend_from_slice(data.get((offset.max(raw_start) - raw_start) as usize..
-                        (end.min(raw_end) - raw_start) as usize)?);
-                }
-                if raw_end >= end {
-                    return Some(output);
-                }
-                raw_start = raw_end;
-                data_start += u64::from(stored);
+struct Block {
+    stored_at: u64,
+    stored: usize,
+    raw_at: u64,
+    raw: usize,
+    flags: u32,
+}
+
+struct Node {
+    offset: u64,
+    size: u64,
+    name: Box<[u8]>,
+}
+
+struct Bundle<R> {
+    file: R,
+    blocks: Vec<Block>,
+    nodes: Vec<Node>,
+    compressed: Vec<u8>,
+    decoded: Vec<u8>,
+    current: Option<usize>,
+}
+
+impl<R: Read + Seek> Bundle<R> {
+    fn open(mut file: R) -> Option<Self> {
+        let length = file.seek(SeekFrom::End(0)).ok()?;
+        file.rewind().ok()?;
+        let mut header = Vec::new();
+        file.by_ref().take(512).read_to_end(&mut header).ok()?;
+        let mut fields = header.as_slice();
+        let signature = c_string(&mut fields)?;
+        let version = be_u32(&mut fields)?;
+        c_string(&mut fields)?;
+        c_string(&mut fields)?;
+        match signature {
+            b"UnityFS" if (6..=8).contains(&version) => {}
+            b"UnityWeb" | b"UnityRaw" if version == 6 => {}
+            b"UnityWeb" | b"UnityRaw" if (1..=5).contains(&version) => {
+                return Self::legacy(file, fields, length, version, signature == b"UnityWeb");
             }
+            _ => return None,
+        }
+        let bundle_size = be_u64(&mut fields)?;
+        let stored = be_u32(&mut fields)? as usize;
+        let size = be_u32(&mut fields)? as usize;
+        let flags = be_u32(&mut fields)?;
+        if signature != b"UnityFS" { take(&mut fields, 1)?; }
+        if flags & 0x40 == 0 || bundle_size > length { return None; }
+        let header_end = (header.len() - fields.len()) as u64;
+        let header_end = if version >= 7 { header_end.next_multiple_of(16) } else { header_end };
+        let at_end = flags & 0x80 != 0;
+        let table_start = if at_end { bundle_size.checked_sub(stored as u64)? } else { header_end };
+        if table_start < header_end || table_start.checked_add(stored as u64)? > bundle_size {
             return None;
         }
+        file.seek(SeekFrom::Start(table_start)).ok()?;
+        let (mut compressed, mut table) = (Vec::new(), Vec::new());
+        read_block(&mut file, stored, size, flags, MAX_METADATA, &mut compressed, &mut table)?;
+        let mut directory = table.get(16..)?;
+        let count = be_u32(&mut directory)? as usize;
+        let descriptors = take(&mut directory, count.checked_mul(10)?)?;
+        let mut blocks = Vec::new();
+        let mut stored_at = if at_end { header_end } else { table_start + stored as u64 };
+        if flags & 0x200 != 0 { stored_at = stored_at.next_multiple_of(16); }
+        let data_end = if at_end { table_start } else { bundle_size };
+        let mut raw_at = 0u64;
+        for mut descriptor in descriptors.chunks_exact(10) {
+            let raw = be_u32(&mut descriptor)? as usize;
+            let stored = be_u32(&mut descriptor)? as usize;
+            let flags = u16::from_be_bytes(descriptor.try_into().ok()?) as u32;
+            let next = stored_at.checked_add(stored as u64)?;
+            if next > data_end { return None; }
+            blocks.push(Block { stored_at, stored, raw_at, raw, flags });
+            stored_at = next;
+            raw_at = raw_at.checked_add(raw as u64)?;
+        }
+        let mut nodes = Vec::new();
+        for _ in 0..be_u32(&mut directory)? {
+            let offset = be_u64(&mut directory)?;
+            let size = be_u64(&mut directory)?;
+            take(&mut directory, 4)?; // Node flags.
+            let name = c_string(&mut directory)?.into();
+            if offset.checked_add(size)? > raw_at { return None; }
+            nodes.push(Node { offset, size, name });
+        }
+        Some(Self { file, blocks, nodes, compressed, decoded: Vec::new(), current: None })
     }
-    None
+
+    fn legacy(file: R, mut fields: &[u8], length: u64, version: u32, web: bool) -> Option<Self> {
+        if version >= 4 { take(&mut fields, 20)?; }
+        take(&mut fields, 4)?; // Minimum streamed bytes.
+        let stored_at = u64::from(be_u32(&mut fields)?);
+        take(&mut fields, 4)?; // Levels needed before streaming.
+        let levels = be_u32(&mut fields)? as usize;
+        let mut last = take(&mut fields, levels.checked_mul(8)?)?.rchunks_exact(8).next()?;
+        let stored = be_u32(&mut last)? as usize;
+        let raw = be_u32(&mut last)? as usize;
+        if stored_at.checked_add(stored as u64)? > length || (!web && stored != raw) { return None; }
+        let flags = if web { LEGACY_WEB | 1 } else { 0 };
+        let block = Block { stored_at, stored, raw_at: 0, raw, flags };
+        let mut bundle = Self {
+            file, blocks: vec![block], nodes: Vec::new(), compressed: Vec::new(),
+            decoded: Vec::new(), current: None,
+        };
+        let mut table = Vec::new();
+        bundle.read(0, raw.min(MAX_METADATA), &mut table)?;
+        let mut directory = table.as_slice();
+        for _ in 0..be_u32(&mut directory)? {
+            let name = c_string(&mut directory)?.into();
+            let offset = u64::from(be_u32(&mut directory)?);
+            let size = u64::from(be_u32(&mut directory)?);
+            if offset.checked_add(size)? > raw as u64 { return None; }
+            bundle.nodes.push(Node { offset, size, name });
+        }
+        Some(bundle)
+    }
+
+    fn read(&mut self, start: u64, size: usize, out: &mut Vec<u8>) -> Option<()> {
+        out.clear();
+        let end = start.checked_add(size as u64)?;
+        let first = self.blocks.partition_point(|block| block.raw_at + block.raw as u64 <= start);
+        for index in first..self.blocks.len() {
+            let block = &self.blocks[index];
+            if block.raw_at >= end { break; }
+            let from = start.saturating_sub(block.raw_at) as usize;
+            let to = (end - block.raw_at).min(block.raw as u64) as usize;
+            if block.flags & 0x3f == 0 && block.stored == block.raw {
+                self.file.seek(SeekFrom::Start(block.stored_at + from as u64)).ok()?;
+                let begin = out.len();
+                out.resize(begin + to - from, 0);
+                self.file.read_exact(&mut out[begin..]).ok()?;
+                continue;
+            }
+            if self.current != Some(index) {
+                self.current = None;
+                self.file.seek(SeekFrom::Start(block.stored_at)).ok()?;
+                read_block(&mut self.file, block.stored, block.raw, block.flags, MAX_BLOCK,
+                           &mut self.compressed, &mut self.decoded)?;
+                self.current = Some(index);
+            }
+            out.extend_from_slice(self.decoded.get(from..to)?);
+        }
+        (out.len() == size).then_some(())
+    }
+}
+
+/// Read only the UnityFS directory and the blocks covering globalgamemanagers.
+fn bundle_managers(file: impl Read + Seek) -> Option<Vec<u8>> {
+    let mut bundle = Bundle::open(file)?;
+    let node = bundle.nodes.iter().find(|node| node.name.as_ref() == b"globalgamemanagers")?;
+    let mut output = Vec::new();
+    bundle.read(node.offset, node.size.min(MAX_METADATA as u64) as usize, &mut output)?;
+    Some(output)
+}
+
+pub(crate) fn scan_bundle(data: &[u8], mut visit: impl FnMut(&[u8])) -> Option<(u64, u64)> {
+    let mut bundle = Bundle::open(std::io::Cursor::new(data))?;
+    bundle.nodes.sort_unstable_by_key(|node| node.offset);
+    let mut out = Vec::new();
+    let (mut read, mut unreadable) = (0, 0);
+    const WINDOW: u64 = 16 << 20;
+    const OVERLAP: u64 = 1 << 20;
+    for index in 0..bundle.nodes.len() {
+        let node = &bundle.nodes[index];
+        let end = node.offset + node.size;
+        let mut offset = node.offset;
+        let mut complete = true;
+        while offset < end {
+            let size = WINDOW.min(end - offset);
+            if bundle.read(offset, size as usize, &mut out).is_some() {
+                visit(&out);
+            } else {
+                complete = false;
+            }
+            if size == end - offset { break; }
+            offset += WINDOW - OVERLAP;
+        }
+        read += u64::from(complete);
+        unreadable += u64::from(!complete);
+    }
+    Some((read, unreadable))
 }
 
 fn take<'a>(data: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {

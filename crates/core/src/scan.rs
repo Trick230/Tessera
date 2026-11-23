@@ -45,6 +45,8 @@ pub struct ScanStats {
     pub dcx_entries: u64,
     pub zip_entries: u64,
     pub apk_entries: u64,
+    pub unity_entries: u64,
+    pub unreadable_unity_entries: u64,
     pub zlib: u64,
     pub gzip: u64,
     pub zstd: u64,
@@ -78,6 +80,8 @@ impl ScanStats {
         self.dcx_entries += o.dcx_entries;
         self.zip_entries += o.zip_entries;
         self.apk_entries += o.apk_entries;
+        self.unity_entries += o.unity_entries;
+        self.unreadable_unity_entries += o.unreadable_unity_entries;
         self.zlib += o.zlib;
         self.gzip += o.gzip;
         self.zstd += o.zstd;
@@ -734,7 +738,19 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
     f.stats.unreal_shaders_expected += pak.expected_shaders;
     f.stats.unreal_libraries_unreadable += pak.unreadable_libraries;
     let apk = map.starts_with(b"ENDILTLE") && f.search_apk(&map);
-    if (!pak.opened || pak.unreadable > 0) && !apk {
+    let unity = if [b"UnityFS\0".as_slice(), b"UnityWeb\0", b"UnityRaw\0"].iter().any(|s| map.starts_with(s)) {
+        crate::unity::scan_bundle(&map, |bytes| {
+            f.record_spirv(bytes);
+            f.search(bytes, 0);
+        })
+    } else {
+        None
+    };
+    if let Some((entries, unreadable)) = unity {
+        f.stats.unity_entries += entries;
+        f.stats.unreadable_unity_entries += unreadable;
+    }
+    if (!pak.opened || pak.unreadable > 0) && !apk && !unity.is_some_and(|(_, unreadable)| unreadable == 0) {
         f.search(&map, 0);
     }
     if map.starts_with(b"PK\x03\x04") {
@@ -847,7 +863,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 9 {:016x}", key.finish())
+    format!("tessera-scan 10 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -956,9 +972,10 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     shaders.retain(|s| !stored.contains(&s.hash));
     crate::shaders::write_base(&base, &shaders)?;
     fs::write(key_path(&base), format!(
-        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\nspirv {}\ndxil {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\nunreal_libraries_unreadable {}\nunreal_shaders_expected {}\nunreal_shaders_decoded {}\nunreal_shaders_dxbc {}\nunreal_shaders_dxil {}\nunreal_shaders_spirv {}\n",
+        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\nspirv {}\ndxil {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\nunity_entries {}\nunreadable_unity_entries {}\nunreal_libraries_unreadable {}\nunreal_shaders_expected {}\nunreal_shaders_decoded {}\nunreal_shaders_dxbc {}\nunreal_shaders_dxil {}\nunreal_shaders_spirv {}\n",
         stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks,
         detected.count(), stats.glsl, stats.spirv, stats.dxil, stats.cpk_entries, stats.dcx_entries, stats.zip_entries, stats.apk_entries,
+        stats.unity_entries, stats.unreadable_unity_entries,
         stats.unreal_libraries_unreadable, stats.unreal_shaders_expected, stats.unreal_shaders_decoded,
         stats.unreal_shaders_dxbc, stats.unreal_shaders_dxil, stats.unreal_shaders_spirv
     ))?;
@@ -987,6 +1004,84 @@ mod tests {
         assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
         assert_eq!(stats.zip_entries, 1);
         assert_eq!(stats.glsl, 1);
+    }
+
+    #[test]
+    fn extracts_dx_bytecode_across_unity_bundle_blocks() {
+        fn lzma(bytes: &[u8], unity_fs: bool) -> Vec<u8> {
+            let mut compressed = Vec::new();
+            lzma_rs::lzma_compress(&mut Cursor::new(bytes), &mut compressed).unwrap();
+            if unity_fs { compressed.drain(5..13); }
+            compressed
+        }
+        fn string(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(value);
+            out.push(0);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let dxbc = signed(0x0000_0050);
+        let mut dxil = signed(0x0000_0060);
+        dxil[36..40].copy_from_slice(b"DXIL");
+        let mut shaders = dxbc.clone();
+        shaders.extend_from_slice(&dxil);
+        let parts = [&shaders[..25], &shaders[25..]];
+        let stored = [lzma(parts[0], true), lz4_flex::block::compress(parts[1])];
+        let mut table = vec![0; 16];
+        table.extend_from_slice(&2u32.to_be_bytes());
+        for ((part, stored), compression) in parts.iter().zip(&stored).zip([1u16, 3]) {
+            table.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            table.extend_from_slice(&(stored.len() as u32).to_be_bytes());
+            table.extend_from_slice(&compression.to_be_bytes());
+        }
+        table.extend_from_slice(&1u32.to_be_bytes());
+        table.extend_from_slice(&0u64.to_be_bytes());
+        table.extend_from_slice(&(shaders.len() as u64).to_be_bytes());
+        table.extend_from_slice(&4u32.to_be_bytes());
+        string(&mut table, b"CAB-test");
+        let table_size = table.len() as u32;
+        let table = lz4_flex::block::compress(&table);
+        let mut bundle = b"UnityFS\0\0\0\0\x08".to_vec();
+        string(&mut bundle, b"5.x.x");
+        string(&mut bundle, b"6000.0.1f1");
+        let size_at = bundle.len();
+        bundle.extend_from_slice(&0u64.to_be_bytes());
+        bundle.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        bundle.extend_from_slice(&table_size.to_be_bytes());
+        bundle.extend_from_slice(&0x2c2u32.to_be_bytes());
+        bundle.resize(bundle.len().next_multiple_of(16), 0);
+        for bytes in stored { bundle.extend_from_slice(&bytes); }
+        bundle.extend_from_slice(&table);
+        let bundle_size = bundle.len() as u64;
+        bundle[size_at..size_at + 8].copy_from_slice(&bundle_size.to_be_bytes());
+        fs::write(dir.path().join("modern.bundle"), bundle).unwrap();
+
+        let mut assets = 1u32.to_be_bytes().to_vec();
+        string(&mut assets, b"legacy.assets");
+        let start = assets.len() as u32 + 8;
+        assets.extend_from_slice(&start.to_be_bytes());
+        assets.extend_from_slice(&(dxbc.len() as u32).to_be_bytes());
+        assets.extend_from_slice(&dxbc);
+        for (signature, web) in [(b"UnityRaw".as_slice(), false), (b"UnityWeb", true)] {
+            let stored = if web { lzma(&assets, false) } else { assets.clone() };
+            let mut bundle = Vec::new();
+            string(&mut bundle, signature);
+            bundle.extend_from_slice(&3u32.to_be_bytes());
+            string(&mut bundle, b"4.x.x");
+            string(&mut bundle, b"4.7.2f1");
+            let header_size = bundle.len() as u32 + 32;
+            for n in [0, header_size, 1, 1, stored.len() as u32, assets.len() as u32,
+                      header_size + stored.len() as u32, start] {
+                bundle.extend_from_slice(&n.to_be_bytes());
+            }
+            bundle.extend_from_slice(&stored);
+            fs::write(dir.path().join(if web { "legacy.web" } else { "legacy.raw" }), bundle).unwrap();
+        }
+
+        let (shaders, stats) = scan_dir(dir.path());
+        assert_eq!((stats.unity_entries, stats.unreadable_unity_entries), (3, 0));
+        assert_eq!(stats.dxil, 1);
+        assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
     }
 
     #[test]
