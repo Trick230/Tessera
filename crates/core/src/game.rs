@@ -26,14 +26,20 @@ impl GameInfo {
         self.exe.as_deref().and_then(Path::parent)
     }
 
-    /// Short API description for the UI, e.g. "D3D12, D3D11".
-    pub fn api_label(&self) -> String {
+    /// Graphics APIs identified for this game.
+    pub fn graphics_apis(&self) -> ApiSet {
         let mut all = self.scan.all();
-        if all.is_empty() {
-            return "Unknown API".into();
-        }
         if matches!(self.engine, Engine::Unreal { .. }) && all.has(ApiSet::D3D12) && all.has(ApiSet::D3D11) {
             all.0 &= ApiSet::D3D12 | ApiSet::D3D11;
+        }
+        all
+    }
+
+    /// Short API description for the UI, e.g. "D3D12, D3D11".
+    pub fn api_label(&self) -> String {
+        let all = self.graphics_apis();
+        if all.is_empty() {
+            return "Unknown API".into();
         }
         all.names().join(", ")
     }
@@ -233,6 +239,30 @@ mod tests {
 
         executable.extend_from_slice(b"D3D11CreateDevice\0");
         assert_eq!(pe::scan_bytes(&executable).all(), ApiSet(ApiSet::D3D12 | ApiSet::D3D11 | ApiSet::VULKAN));
+    }
+
+    #[test]
+    fn unreal_direct3d_games_exclude_opengl_from_graphics_apis() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir(t.path().join("Engine")).unwrap();
+        let exe = t.path().join("Game.exe");
+        let entry = GameEntry {
+            name: "Game".into(),
+            root: t.path().into(),
+            store: Store::Steam,
+            exe_hint: None,
+            steam_appid: None,
+        };
+        let mut executable = minimal_pe64();
+        executable.extend_from_slice(b"glDrawElements\0");
+        std::fs::write(&exe, &executable).unwrap();
+        assert!(analyze(entry.clone()).graphics_apis().has(ApiSet::OPENGL));
+
+        executable.extend_from_slice(b"D3D12CreateDevice\0D3D11CreateDevice\0");
+        std::fs::write(&exe, executable).unwrap();
+        let game = analyze(entry);
+        assert!(game.scan.all().has(ApiSet::OPENGL));
+        assert_eq!(game.graphics_apis(), ApiSet(ApiSet::D3D12 | ApiSet::D3D11));
     }
 
     #[test]

@@ -187,7 +187,7 @@ fn can_prepare(g: &GameInfo) -> bool {
 }
 
 fn can_scan_gl(g: &GameInfo) -> bool {
-    g.exe.is_some() && g.scan.all().has(tessera_core::pe::ApiSet::OPENGL)
+    g.exe.is_some() && g.graphics_apis().has(tessera_core::pe::ApiSet::OPENGL)
 }
 
 fn num(v: f64, decimals: usize) -> String {
@@ -495,10 +495,12 @@ fn shader_state(
     rows.push(line("Driver cache on disk", value, vec![detail], NEUTRAL));
 
     if scan_gl {
-        let value = if c.scan_outdated.is_none() { "Scan available".to_string() } else { c.glsl.to_string() };
-        rows.push(line("OpenGL shaders", value, vec![
-            "Embedded GLSL sources found in the game files.".to_string(),
-        ], NEUTRAL));
+        let (value, detail) = if c.scan_outdated.is_some() {
+            (c.glsl.to_string(), "Embedded GLSL sources recorded by the last scan.")
+        } else {
+            ("Scan available".to_string(), "Scan shaders checks the game files for embedded GLSL sources.")
+        };
+        rows.push(line("OpenGL shaders", value, vec![detail.to_string()], NEUTRAL));
     }
 
     // Warm-up results written with the installed driver.
