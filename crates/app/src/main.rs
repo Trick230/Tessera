@@ -73,6 +73,7 @@ fn row(g: &GameInfo) -> GameRow {
         blocked: !g.anticheat.is_empty(),
         can_install: g.can_install(),
         d3d11: can_prepare(g),
+        scan_shaders: can_scan_gl(g),
         icon: steam_image(g, false),
         initial: s(g.entry.name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_default()),
     }
@@ -91,6 +92,10 @@ fn can_prepare(g: &GameInfo) -> bool {
         all.has(tessera_core::pe::ApiSet::D3D11)
             && (!all.has(tessera_core::pe::ApiSet::D3D12) || ff7_dx11 || tessera_core::shaders::stats(e).shaders > 0)
     })
+}
+
+fn can_scan_gl(g: &GameInfo) -> bool {
+    g.exe.is_some() && g.scan.all().has(tessera_core::pe::ApiSet::OPENGL)
 }
 
 fn steam_image(g: &GameInfo, hero: bool) -> slint::Image {
@@ -363,6 +368,7 @@ fn shader_state(
     c: &ShaderCheck,
     run: Option<(u64, u64)>,
     can_prepare: bool,
+    scan_gl: bool,
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<tessera_core::driver::NvidiaGameCache>,
 ) -> ShaderState {
@@ -410,6 +416,13 @@ fn shader_state(
     };
     rows.push(line("Driver cache on disk", value, vec![detail], NEUTRAL));
 
+    if scan_gl || c.glsl > 0 {
+        let value = if c.scan_outdated.is_none() { "Scan available".to_string() } else { c.glsl.to_string() };
+        rows.push(line("OpenGL shaders", value, vec![
+            "Embedded GLSL sources found in the game files.".to_string(),
+        ], NEUTRAL));
+    }
+
     // Warm-up results written with the installed driver.
     let mut d = Vec::new();
     let warmable = c.stored - c.skipped;
@@ -449,7 +462,9 @@ fn shader_state(
     if c.unreadable_unreal_packages > 0 {
         d.push(format!("{} Unreal packages could not be decoded.", c.unreadable_unreal_packages));
     }
-    rows.push(line("Shader preparation", value, d, tone));
+    if can_prepare || !scan_gl {
+        rows.push(line("Shader preparation", value, d, tone));
+    }
 
     // Newly captured shaders from the last recorded game session.
     let (value, tone, d) = match run {
@@ -466,7 +481,9 @@ fn shader_state(
             vec!["Play once with the D3D11 layer on to capture shaders created during play.".to_string()],
         ),
     };
-    rows.push(line("Last game session", value, d, tone));
+    if can_prepare || !scan_gl {
+        rows.push(line("Last game session", value, d, tone));
+    }
 
     // Damaged: bad store entries, driver refusals, bad containers in the install.
     let mut d = Vec::new();
@@ -621,6 +638,7 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
     let Some(exe) = exe else { return };
     let root = game.map(|g| g.entry.root.clone());
     let prepare = game.is_some_and(can_prepare);
+    let scan_gl = game.is_some_and(can_scan_gl);
     let is_unreal = game.is_some_and(|g| matches!(g.engine, tessera_core::engine::Engine::Unreal { .. }));
     let ue_exe = is_unreal.then(|| exe.clone());
     let weak = ui.as_weak();
@@ -657,7 +675,7 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
         let disk_cache = tessera_core::driver::nvidia_game_cache(&exe);
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if SESSION_GEN.load(Ordering::Relaxed) == gen {
-                ui.set_shader_state(shader_state(&check, run, prepare, pak_key, disk_cache));
+                ui.set_shader_state(shader_state(&check, run, prepare, scan_gl, pak_key, disk_cache));
             }
         });
     });
@@ -723,11 +741,11 @@ fn payload_path() -> PathBuf {
 /// install changed), then compiles everything stored in the driver, off the
 /// UI thread.
 fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
-    let Some((exe, root)) = ({
+    let Some((exe, root, prepare)) = ({
         let st = state.lock().unwrap();
         st.view.get(view_idx as usize).and_then(|&gi| {
             let g = &st.games[gi];
-            g.exe.clone().map(|e| (e, g.entry.root.clone()))
+            g.exe.clone().map(|e| (e, g.entry.root.clone(), can_prepare(g)))
         })
     }) else {
         return;
@@ -742,36 +760,40 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         };
         let mut found = String::new();
         let running = tessera_core::warm::is_running(&exe);
-        if !running && !tessera_core::scan::up_to_date(&exe, &root) {
+        if !running && (!prepare || !tessera_core::scan::up_to_date(&exe, &root)) {
             status("Searching the game files for shaders (read only)…");
             match scan_isolated(&exe, &root) {
                 Ok(n) => found = format!("{n} found in the files, "),
                 Err(e) => found = format!("search failed ({e}), "),
             }
         }
-        status("Warming shaders (outside the game)…");
         let stall = |s: u64| {
             let m = format!("Warming shaders: the driver has been on one shader for {s} s (left running, it may finish)…");
             let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
         };
-        let result = tessera_core::warm::run(&exe, &app_dir().join(tessera_core::warm::WARM_EXE), &stall);
-        let msg = match result {
-            Ok(_) => {
-                let drivers: Vec<_> = tessera_core::driver::gpus()
-                    .iter()
-                    .filter_map(|gpu| tessera_core::driver::umd_version(&gpu.driver_version))
-                    .collect();
-                let w = tessera_core::shader_check::check(&exe, None, &drivers);
-                format!(
-                    "Shaders: {found}{} exercised, {} created only, {} pending, {} failed ({:.1} s)",
-                    w.compiled,
-                    w.created_only,
-                    w.pending,
-                    w.failed,
-                    t0.elapsed().as_secs_f64()
-                )
+        let msg = if !prepare {
+            if running { "Close the game before scanning shaders.".to_string() }
+            else { format!("Shaders: {}", found.trim_end_matches(", ")) }
+        } else {
+            status("Warming shaders (outside the game)…");
+            match tessera_core::warm::run(&exe, &app_dir().join(tessera_core::warm::WARM_EXE), &stall) {
+                Ok(_) => {
+                    let drivers: Vec<_> = tessera_core::driver::gpus()
+                        .iter()
+                        .filter_map(|gpu| tessera_core::driver::umd_version(&gpu.driver_version))
+                        .collect();
+                    let w = tessera_core::shader_check::check(&exe, None, &drivers);
+                    format!(
+                        "Shaders: {found}{} exercised, {} created only, {} pending, {} failed ({:.1} s)",
+                        w.compiled,
+                        w.created_only,
+                        w.pending,
+                        w.failed,
+                        t0.elapsed().as_secs_f64()
+                    )
+                }
+                Err(e) => format!("Shaders: {found}{e}"),
             }
-            Err(e) => format!("Shaders: {found}{e}"),
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_busy(false);
@@ -873,11 +895,11 @@ fn scan_isolated(exe: &Path, root: &Path) -> Result<u64, String> {
 }
 
 /// `tessera.exe --scan <game exe> <install folder>`: the child side of
-/// scan_isolated. Prints the usable shader count.
+/// scan_isolated. Prints the total of D3D11 bytecode and GLSL sources found.
 fn scan_child(args: &[String]) -> i32 {
     match tessera_core::scan::scan_game(Path::new(&args[0]), Path::new(&args[1])) {
         Ok(st) => {
-            println!("{}", st.usable);
+            println!("{}", st.usable + st.glsl);
             0
         }
         Err(e) => {

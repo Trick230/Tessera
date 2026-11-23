@@ -49,10 +49,18 @@ impl GameInfo {
 
 pub fn analyze(entry: GameEntry) -> GameInfo {
     let exe = find_main_exe(&entry.root, entry.exe_hint.as_deref());
-    let (scan, exe_hash) = match &exe {
+    let (mut scan, exe_hash) = match &exe {
         Some(p) => (pe::scan_exe(p).unwrap_or_default(), hash_file(p).ok()),
         None => (ExeScan::default(), None),
     };
+    // FFVIII Remastered's bootstrap loads its locale-specific OpenGL renderer.
+    if let Some(p) = exe.as_deref().filter(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("FFVIII.exe"))) {
+        if ["FFVIII_EFIGS.dll", "FFVIII_JP.dll"].iter().any(|name| {
+            pe::scan_exe(&p.with_file_name(name)).is_ok_and(|renderer| renderer.all().has(ApiSet::OPENGL))
+        }) {
+            scan.referenced.0 |= ApiSet::OPENGL;
+        }
+    }
     let install = exe
         .as_deref()
         .and_then(Path::parent)

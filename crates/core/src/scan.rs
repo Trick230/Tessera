@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! S1: exhaustive bytecode search over a game's install files. Finds DXBC
+//! S1: shader search over a game's install files. Finds DXBC
 //! containers stored raw (exe, DLLs, loose files, uncompressed archives) and
 //! inside zlib, zstd and LZ4-frame streams and Oodle blocks (with the game's
 //! own codec DLL, when it ships one), then keeps the ones the D3D11 warm-up
 //! can create. Read-only: never writes into the game folder.
 //!
-//! Not covered yet: Brotli and raw LZ4 blocks (no magic to find them by),
-//! encrypted archives (need the key), an Oodle block shorter than the
-//! archive's block size (the last of an entry; its raw size is unknown), and
-//! the blocks after the first of one Oodle stream (they need its history).
+//! Recognised container layouts provide the compressed entry's exact bounds
+//! and decoded size. Loose streams still need a recognisable header.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -23,6 +21,9 @@ use crate::shaders::{Shader, FLAG_DXBC, FLAG_DXIL, STAGE_CS, STAGE_DS, STAGE_GS,
 
 /// Largest decompressed stream searched; bigger ones are cut (their start is still searched).
 const STREAM_CAP: u64 = 64 << 20;
+/// Sekiro's main shader bundle expands to more than 320 MiB.
+const DCX_CAP: usize = 512 << 20;
+static LARGE_DCX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Streams found inside decompressed streams are searched to this depth.
 const MAX_DEPTH: u32 = 2;
 const MIN_FILE: u64 = 32;
@@ -37,6 +38,11 @@ pub struct ScanStats {
     pub bytes: u64,
     /// Containers found (before dedupe), by where they were.
     pub raw: u64,
+    pub glsl: u64,
+    pub cpk_entries: u64,
+    pub dcx_entries: u64,
+    pub zip_entries: u64,
+    pub apk_entries: u64,
     pub zlib: u64,
     pub gzip: u64,
     pub zstd: u64,
@@ -59,6 +65,10 @@ impl ScanStats {
         self.files += o.files;
         self.bytes += o.bytes;
         self.raw += o.raw;
+        self.cpk_entries += o.cpk_entries;
+        self.dcx_entries += o.dcx_entries;
+        self.zip_entries += o.zip_entries;
+        self.apk_entries += o.apk_entries;
         self.zlib += o.zlib;
         self.gzip += o.gzip;
         self.zstd += o.zstd;
@@ -223,6 +233,7 @@ pub fn container_at(b: &[u8]) -> Option<Container> {
 struct Found {
     shaders: HashMap<u64, Shader>,
     skipped: HashMap<u64, ()>,
+    glsl: HashSet<u128>,
     stats: ScanStats,
     oodle: Option<Oodle>,
 }
@@ -253,7 +264,105 @@ impl Found {
             self.shaders.entry(k).or_insert(v);
         }
         self.skipped.extend(o.skipped);
+        self.glsl.extend(o.glsl);
         self
+    }
+
+    fn search_zip(&mut self, data: &[u8]) {
+        let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(data)) else { return };
+        let mut out = Vec::new();
+        for i in 0..archive.len() {
+            let Ok(entry) = archive.by_index(i) else { continue };
+            let size = entry.size();
+            if !entry.is_file() || entry.compression() == zip::CompressionMethod::Stored ||
+                !(MIN_FILE..=STREAM_CAP).contains(&size) {
+                continue;
+            }
+            out.clear();
+            if entry.take(size + 1).read_to_end(&mut out).is_ok() && out.len() as u64 == size {
+                self.stats.zip_entries += 1;
+                self.search(&out, 1);
+            }
+        }
+    }
+
+    fn search_cpk(&mut self, data: &[u8]) {
+        let Some(entries) = crate::cri::shaders(data) else { return };
+        let mut out = Vec::new();
+        for (bytes, size) in entries {
+            let decoded = if bytes.len() == size {
+                bytes
+            } else {
+                if crate::cri::decompress(bytes, size, &mut out).is_none() { continue; }
+                &out
+            };
+            self.stats.cpk_entries += 1;
+            self.search(decoded, 1);
+        }
+    }
+
+    fn search_apk(&mut self, data: &[u8]) -> bool {
+        let Some(entries) = crate::artdink::entries(data) else { return false };
+        let mut complete = !entries.is_empty();
+        let mut out = Vec::new();
+        for entry in entries {
+            if !entry.compressed {
+                self.stats.apk_entries += 1;
+                self.search(entry.bytes, 1);
+            } else if entry.unpacked as u64 <= STREAM_CAP {
+                out.clear();
+                let decoded = flate2::read::ZlibDecoder::new(entry.bytes)
+                    .take(entry.unpacked as u64 + 1).read_to_end(&mut out);
+                if decoded.is_ok() && out.len() == entry.unpacked {
+                    self.stats.apk_entries += 1;
+                    self.search(&out, 1);
+                } else {
+                    complete = false;
+                }
+            } else {
+                complete = false;
+            }
+        }
+        complete
+    }
+
+    fn search_dcx(&mut self, data: &[u8]) {
+        let mut out = Vec::new();
+        for at in memchr::memmem::find_iter(data, b"DCX\0") {
+            let bytes = &data[at..];
+            // DFLT streams are already recognised by the zlib search.
+            let Some((payload, size)) = dcx_kraken(bytes) else { continue };
+            if size as u64 > STREAM_CAP {
+                // Keep at most one large decompression buffer across the scan's workers.
+                let Ok(_guard) = LARGE_DCX.lock() else { continue };
+                self.search_dcx_payload(payload, size, &mut Vec::new());
+            } else {
+                self.search_dcx_payload(payload, size, &mut out);
+            }
+        }
+    }
+
+    fn search_dcx_payload(&mut self, payload: &[u8], size: usize, out: &mut Vec<u8>) {
+        out.clear();
+        if self.oodle.is_some_and(|oodle| oodle.decode_exact(payload, size, out)) {
+            self.stats.dcx_entries += 1;
+            self.search(out, MAX_DEPTH);
+        }
+    }
+
+    fn search_glsl(&mut self, data: &[u8]) {
+        if memchr::memmem::find(data, b"glShaderSource").is_none() { return; }
+        for at in memchr::memmem::find_iter(data, b"#version ") {
+            let rest = &data[at..data.len().min(at.saturating_add(64 << 10))];
+            let Some(end) = memchr::memchr(0, rest) else { continue };
+            let source = &rest[..end];
+            if !source.iter().all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace()) ||
+                memchr::memmem::find(source, b"void main").is_none() ||
+                source.iter().rev().find(|b| !b.is_ascii_whitespace()) != Some(&b'}') {
+                continue;
+            }
+            self.glsl.insert(xxhash_rust::xxh3::xxh3_128(source));
+        }
     }
 
     fn record(&mut self, c: &Container, code: &[u8]) -> bool {
@@ -365,6 +474,18 @@ impl Found {
     }
 }
 
+fn dcx_kraken(bytes: &[u8]) -> Option<(&[u8], usize)> {
+    if bytes.get(24..28)? != b"DCS\0" || bytes.get(36..44)? != b"DCP\0KRAK" ||
+        bytes.get(68..76)? != b"DCA\0\0\0\0\x08" {
+        return None;
+    }
+    let big = |at| Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize);
+    let raw = big(28)?;
+    let compressed = big(32)?;
+    if !(MIN_FILE as usize..=DCX_CAP).contains(&raw) || compressed == 0 { return None; }
+    Some((bytes.get(76..76usize.checked_add(compressed)?)?, raw))
+}
+
 /// zlib header: deflate, 32 KiB window or less, check bits, no preset dictionary.
 fn is_zlib_header(b: &[u8]) -> bool {
     let (cmf, flg) = (b[0], b[1]);
@@ -453,8 +574,21 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>) -> Found {
     f.stats.unreal_packages += pak.packages;
     f.stats.unreadable_unreal_packages += pak.unreadable;
     f.stats.locked_unreal_paks += u64::from(pak.locked);
-    if !pak.opened || pak.unreadable > 0 {
+    let apk = map.starts_with(b"ENDILTLE") && f.search_apk(&map);
+    if (!pak.opened || pak.unreadable > 0) && !apk {
         f.search(&map, 0);
+    }
+    if map.starts_with(b"PK\x03\x04") {
+        f.search_zip(&map);
+    } else if map.starts_with(b"CPK ") {
+        f.search_cpk(&map);
+    }
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
+    if oodle.is_some() && (extension.eq_ignore_ascii_case("bdt") || extension.eq_ignore_ascii_case("dcx")) {
+        f.search_dcx(&map);
+    }
+    if extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll") {
+        f.search_glsl(&map);
     }
     f
 }
@@ -493,6 +627,7 @@ fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
     shaders.sort_unstable_by_key(|s| s.hash);
     stats.usable = shaders.len() as u64;
     stats.skipped = found.skipped.len() as u64;
+    stats.glsl = found.glsl.len() as u64;
     (shaders, stats)
 }
 
@@ -533,7 +668,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         m.len().hash(&mut key);
         m.modified().ok().hash(&mut key);
     }
-    format!("tessera-scan 5 {:016x}", key.finish())
+    format!("tessera-scan 6 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -586,6 +721,7 @@ pub struct ScanRecord {
     pub unreadable_unreal_packages: Option<u64>,
     pub locked_unreal_paks: Option<u64>,
     pub auto_key_archives: Option<u64>,
+    pub glsl: Option<u64>,
 }
 
 pub fn record_at(base: &Path) -> Option<ScanRecord> {
@@ -598,6 +734,7 @@ pub fn record_at(base: &Path) -> Option<ScanRecord> {
         unreal_packages: value("unreal_packages "), unreadable_unreal_packages: value("unreadable_unreal_packages "),
         locked_unreal_paks: value("locked_unreal_paks "),
         auto_key_archives: value("auto_key_archives "),
+        glsl: value("glsl "),
     })
 }
 
@@ -624,8 +761,9 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
     shaders.retain(|s| !stored.contains(&s.hash));
     crate::shaders::write_base(&base, &shaders)?;
     fs::write(key_path(&base), format!(
-        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\n",
-        stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks, detected.count()
+        "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\n",
+        stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks,
+        detected.count(), stats.glsl, stats.cpk_entries, stats.dcx_entries, stats.zip_entries, stats.apk_entries
     ))?;
     Ok(stats)
 }
@@ -633,6 +771,26 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_deflated_dxbc_and_deduplicates_embedded_glsl() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dxbc = container(0x0000_0050, 0);
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive.start_file("shader.bin", zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)).unwrap();
+        archive.write_all(&dxbc).unwrap();
+        fs::write(dir.path().join("archive.dat"), archive.finish().unwrap().into_inner()).unwrap();
+        let glsl = b"glShaderSource\0#version 330\nvoid main() { gl_Position = vec4(0); }\0";
+        fs::write(dir.path().join("a.dll"), glsl).unwrap();
+        fs::write(dir.path().join("b.dll"), glsl).unwrap();
+        let (shaders, stats) = scan_dir(dir.path());
+        assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
+        assert_eq!(stats.zip_entries, 1);
+        assert_eq!(stats.glsl, 1);
+    }
 
     /// A minimal container: one SHEX part with the given version token.
     pub(crate) fn container(token: u32, checksum: u64) -> Vec<u8> {

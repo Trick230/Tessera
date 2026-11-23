@@ -20,6 +20,7 @@ export struct GameRow {
     blocked: bool,
     can-install: bool,
     d3d11: bool,
+    scan-shaders: bool,
     // First letter, shown when there is no icon.
     initial: string,
     // Steam's 32x32 icon; empty for other stores.
@@ -1056,8 +1057,8 @@ export component MainWindow inherits Window {
                 Btn {
                     flat: true;
                     icon: "\u{E945}";
-                    text: "Prepare shaders";
-                    enabled: root.has-sel && root.cur.d3d11 && !root.busy;
+                    text: root.has-sel && !root.cur.d3d11 && root.cur.scan-shaders ? "Scan shaders" : "Prepare shaders";
+                    enabled: root.has-sel && (root.cur.d3d11 || root.cur.scan-shaders) && !root.busy;
                     clicked => { root.warm-shaders(root.selected); }
                 }
                 ToolSep { }
