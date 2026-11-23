@@ -6,6 +6,7 @@
 
 mod advanced;
 mod art;
+mod preferences;
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::collections::HashMap;
@@ -1176,6 +1177,48 @@ fn main() -> Result<(), slint::PlatformError> {
         return Ok(());
     }
     let ui = MainWindow::new()?;
+    let theme = preferences::load_theme();
+    ui.set_app_theme(theme);
+    ui.set_dark_theme(preferences::is_dark(theme));
+    ui.set_start_with_windows(preferences::starts_with_windows());
+    let _system_theme = slint::Timer::default();
+    {
+        let w = ui.as_weak();
+        _system_theme.start(slint::TimerMode::Repeated, std::time::Duration::from_secs(1), move || {
+            if let Some(ui) = w.upgrade().filter(|ui| ui.get_app_theme() == AppTheme::System) {
+                ui.set_dark_theme(preferences::is_dark(AppTheme::System));
+            }
+        });
+    }
+    {
+        let w = ui.as_weak();
+        ui.on_app_theme_changed(move |theme| {
+            let ui = w.unwrap();
+            match preferences::save_theme(theme) {
+                Ok(()) => {
+                    ui.set_app_theme(theme);
+                    ui.set_dark_theme(preferences::is_dark(theme));
+                    ui.set_status_text("Theme saved.".into());
+                }
+                Err(e) => ui.set_status_text(format!("Could not save the theme: {e}").into()),
+            }
+        });
+    }
+    {
+        let w = ui.as_weak();
+        ui.on_startup_changed(move |enabled| {
+            let ui = w.unwrap();
+            let msg = match preferences::set_starts_with_windows(enabled) {
+                Ok(()) if enabled => "Tessera will start when you sign in to Windows.".to_owned(),
+                Ok(()) => "Tessera startup disabled.".to_owned(),
+                Err(e) => {
+                    ui.set_start_with_windows(preferences::starts_with_windows());
+                    format!("Could not change Windows startup: {e}")
+                }
+            };
+            ui.set_status_text(msg.into());
+        });
+    }
     let state: Shared = Arc::new(Mutex::new(State {
         folders: ManualFolders {
             legacy: load_folders("folders.txt"),

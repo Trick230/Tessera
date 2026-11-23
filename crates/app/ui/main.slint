@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { ScrollView } from "std-widgets.slint";
+import { Palette, ScrollView } from "std-widgets.slint";
 // Chakra Petch (SIL OFL 1.1, see fonts/OFL.txt) is the face of the whole app.
 import "./fonts/ChakraPetch-Regular.ttf";
 import "./fonts/ChakraPetch-Medium.ttf";
@@ -116,45 +116,51 @@ export struct GameSettings {
     advanced: AdvancedOptions,
 }
 
+export enum AppTheme { System, Light, Dark }
+
 // Neutral greys; colour is kept for state only (ok, warning, error). The
 // mosaic tones are greys too.
 global Theme {
-    out property <color> bg: #161616;
-    out property <color> side: #1f1f1f;
-    out property <color> surface: #1d1d1d;
-    out property <color> raised: #222222;
-    out property <color> hover: #ffffff0a;
-    out property <color> press: #ffffff12;
-    out property <color> line: #2a2a2a;
-    out property <color> line-strong: #3a3a3a;
-    out property <color> text: #ebebeb;
-    out property <color> dim: #a0a0a0;
-    out property <color> faint: #808080;
-    out property <color> accent: #e4e4e4;
-    out property <color> ink: #141414;
-    out property <color> ok: #8cc88c;
-    out property <color> warn: #e3b25a;
-    out property <color> bad: #e06c5a;
+    in property <bool> dark: true;
+    out property <color> bg: dark ? #161616 : #fafafa;
+    out property <color> side: dark ? #1f1f1f : #f0f0f0;
+    out property <color> surface: dark ? #1d1d1d : #ffffff;
+    out property <color> raised: dark ? #222222 : #f4f4f4;
+    out property <color> hover: dark ? #ffffff0a : #00000008;
+    out property <color> press: dark ? #ffffff12 : #00000012;
+    out property <color> selection: dark ? #ffffff17 : #00000017;
+    out property <color> line: dark ? #2a2a2a : #e0e0e0;
+    out property <color> line-strong: dark ? #3a3a3a : #cccccc;
+    out property <color> text: dark ? #ebebeb : #202020;
+    out property <color> dim: dark ? #a0a0a0 : #505050;
+    out property <color> faint: dark ? #808080 : #616161;
+    out property <color> accent: dark ? #e4e4e4 : #303030;
+    out property <color> ink: dark ? #141414 : #ffffff;
+    out property <color> ok: dark ? #8cc88c : #286536;
+    out property <color> warn: dark ? #e3b25a : #805300;
+    out property <color> bad: dark ? #e06c5a : #a43b2c;
     // Mosaic tones.
-    out property <color> ochre: #d6d6d6;
-    out property <color> sand: #9a9a9a;
-    out property <color> umber: #5c5c5c;
-    out property <color> slate: #3a3a3a;
+    out property <color> ochre: dark ? #d6d6d6 : #4a4a4a;
+    out property <color> sand: dark ? #9a9a9a : #777777;
+    out property <color> umber: dark ? #5c5c5c : #a4a4a4;
+    out property <color> slate: dark ? #3a3a3a : #c6c6c6;
     out property <string> display: "Chakra Petch";
     out property <string> mono: "Consolas";
     out property <string> icons: "Segoe Fluent Icons";
     // Windows 11 control fills and stroke.
-    out property <color> fill: #ffffff0f;
-    out property <color> fill-hover: #ffffff15;
-    out property <color> fill-press: #ffffff08;
-    out property <color> fill-sunk: #0000001f;
-    out property <color> stroke: #ffffff12;
+    out property <color> fill: dark ? #ffffff0f : #ffffffb3;
+    out property <color> fill-hover: dark ? #ffffff15 : #00000008;
+    out property <color> fill-press: dark ? #ffffff08 : #00000012;
+    out property <color> fill-sunk: dark ? #0000001f : #0000000c;
+    out property <color> stroke: dark ? #ffffff12 : #00000026;
+    out property <color> track: dark ? #ffffff1c : #00000029;
+    out property <color> track-hover: dark ? #ffffff26 : #00000038;
     // Slightly rounded corners, graphite switches, white knobs.
     out property <length> r-ctl: 3px;
     out property <length> r-card: 5px;
     out property <color> graphite: #8e8e93;
     out property <color> knob: #f4f4f4;
-    out property <color> ring: #ffffff38;
+    out property <color> ring: dark ? #ffffff38 : #00000065;
 }
 
 // The mark: a 3x3 patch of mosaic tiles. While busy, the tiles breathe in a
@@ -259,7 +265,7 @@ component Toggle inherits Rectangle {
     opacity: root.enabled ? 1 : 0.45;
     background: root.checked
         ? (ta.has-hover ? Theme.graphite.brighter(0.1) : Theme.graphite)
-        : (ta.has-hover ? #ffffff26 : #ffffff1c);
+        : (ta.has-hover ? Theme.track-hover : Theme.track);
     animate background { duration: 100ms; }
     knob := Rectangle {
         property <length> d: 20px;
@@ -353,7 +359,7 @@ component SearchField inherits Rectangle {
     callback edited(string);
     height: 34px;
     border-radius: Theme.r-ctl;
-    background: #ffffff0c;
+    background: Theme.dark ? #ffffff0c : #ffffff;
     border-width: input.has-focus ? 2px : 1px;
     border-color: input.has-focus ? Theme.ring : Theme.stroke;
     HorizontalLayout {
@@ -467,7 +473,7 @@ component GameItem inherits Rectangle {
     callback clicked;
     callback hovered;
     border-radius: Theme.r-ctl;
-    background: root.selected ? #ffffff17 : ta.has-hover ? Theme.hover : transparent;
+    background: root.selected ? Theme.selection : ta.has-hover ? Theme.hover : transparent;
     Rectangle {
         x: 0;
         width: 3px;
@@ -534,7 +540,7 @@ component Tab inherits Rectangle {
     callback clicked;
     width: label.preferred-width + 26px;
     height: 40px;
-    background: ta.pressed ? #ffffff15 : ta.has-hover ? #ffffff0a : transparent;
+    background: ta.pressed ? Theme.fill-hover : ta.has-hover ? Theme.hover : transparent;
     animate background { duration: 100ms; easing: ease-out; }
     label := Text {
         text: root.text;
@@ -615,6 +621,41 @@ component OptionSwitch inherits PropRow {
     Toggle { checked: root.checked; enabled: root.enabled; toggled => { root.changed(self.checked); } }
 }
 
+component AppSettings inherits VerticalLayout {
+    in property <AppTheme> theme;
+    in-out property <bool> start-with-windows;
+    callback theme-changed(AppTheme);
+    callback startup-changed(bool);
+
+    padding: 24px;
+    spacing: 14px;
+    alignment: start;
+    Text { text: "App settings"; color: Theme.text; font-size: 22px; font-weight: 700; }
+    VerticalLayout {
+        PropRow {
+            label: "Theme";
+            help: "System follows the Windows app theme.";
+            HorizontalLayout {
+                spacing: 4px;
+                for choice in [AppTheme.System, AppTheme.Light, AppTheme.Dark]: Btn {
+                    flat: true;
+                    primary: root.theme == choice;
+                    text: choice == AppTheme.System ? "System" : choice == AppTheme.Light ? "Light" : "Dark";
+                    clicked => { root.theme-changed(choice); }
+                }
+            }
+        }
+        PropRow {
+            label: "Start with Windows";
+            help: "Open Tessera when you sign in to Windows.";
+            Toggle {
+                checked <=> root.start-with-windows;
+                toggled => { root.startup-changed(self.checked); }
+            }
+        }
+    }
+}
+
 component Detail inherits Rectangle {
     in property <GameRow> game;
     in property <SessionInfo> session;
@@ -652,7 +693,7 @@ component Detail inherits Rectangle {
             height: root.has-hero || root.game.recomp ? 168px : head.preferred-height;
             clip: true;
             if root.game.recomp && !root.wide-hero: Rectangle {
-                background: @linear-gradient(105deg, #161616 0%, #20272a 65%, #35434a 100%);
+                background: @linear-gradient(105deg, Theme.bg 0%, Theme.dark ? #20272a : #e6ebed 65%, Theme.dark ? #35434a : #d1dde2 100%);
             }
             if root.wide-hero: Image {
                 source: root.hero;
@@ -661,10 +702,10 @@ component Detail inherits Rectangle {
                 image-fit: cover;
             }
             if root.wide-hero: Rectangle {
-                background: @linear-gradient(90deg, #161616e6 0%, #16161699 45%, #16161626 100%);
+                background: @linear-gradient(90deg, Theme.bg.with-alpha(0.92) 0%, Theme.bg.with-alpha(0.64) 45%, Theme.bg.with-alpha(0.15) 100%);
             }
             if root.wide-hero: Rectangle {
-                background: @linear-gradient(180deg, #16161600 40%, #161616 100%);
+                background: @linear-gradient(180deg, Theme.bg.with-alpha(0) 40%, Theme.bg 100%);
             }
             if root.game.recomp && !root.wide-hero && (root.has-hero || root.game.icon.width > 0): Image {
                 width: 132px;
@@ -1065,6 +1106,16 @@ export component MainWindow inherits Window {
     in property <SessionInfo> session;
     in property <GameSettings> settings;
     in property <ShaderState> shader-state;
+    in property <AppTheme> app-theme;
+    in property <bool> dark-theme: true;
+    in-out property <bool> start-with-windows;
+    property <bool> show-app-settings;
+    function apply-theme() {
+        Theme.dark = root.dark-theme;
+        Palette.color-scheme = root.dark-theme ? ColorScheme.dark : ColorScheme.light;
+    }
+    init => { root.apply-theme(); }
+    changed dark-theme => { root.apply-theme(); }
     // Key art of the selected game.
     in property <image> hero;
     // S7: driver shader cache advice, empty when all is well.
@@ -1076,6 +1127,8 @@ export component MainWindow inherits Window {
     callback warm-shaders(int);
     callback clear-shaders(int);
     callback add-folder(bool);
+    callback app-theme-changed(AppTheme);
+    callback startup-changed(bool);
     callback filter-changed(string);
     callback install(int);
     callback uninstall(int);
@@ -1100,11 +1153,11 @@ export component MainWindow inherits Window {
                 padding-bottom: 8px;
                 spacing: 2px;
                 alignment: start;
-                Btn { flat: true; icon: "\u{E8F4}"; text: "Add game folder"; enabled: !root.busy; clicked => { root.add-folder(false); } }
-                Btn { flat: true; icon: "\u{E8B7}"; text: "Add library folder"; enabled: !root.busy; clicked => { root.add-folder(true); } }
-                Btn { flat: true; icon: "\u{E72C}"; text: "Refresh"; enabled: !root.busy; clicked => { root.refresh(); } }
-                ToolSep { }
-                if !root.has-sel || !root.cur.installed: Btn {
+                if !root.show-app-settings: Btn { flat: true; icon: "\u{E8F4}"; text: "Add game folder"; enabled: !root.busy; clicked => { root.add-folder(false); } }
+                if !root.show-app-settings: Btn { flat: true; icon: "\u{E8B7}"; text: "Add library folder"; enabled: !root.busy; clicked => { root.add-folder(true); } }
+                if !root.show-app-settings: Btn { flat: true; icon: "\u{E72C}"; text: "Refresh"; enabled: !root.busy; clicked => { root.refresh(); } }
+                if !root.show-app-settings: ToolSep { }
+                if !root.show-app-settings && (!root.has-sel || !root.cur.installed): Btn {
                     flat: !(root.has-sel && root.cur.can-install);
                     primary: root.has-sel && root.cur.can-install;
                     icon: "\u{E896}";
@@ -1112,38 +1165,62 @@ export component MainWindow inherits Window {
                     enabled: root.has-sel && root.cur.can-install && !root.cur.blocked && !root.busy;
                     clicked => { root.install(root.selected); }
                 }
-                if root.has-sel && root.cur.installed: Btn {
+                if !root.show-app-settings && root.has-sel && root.cur.installed: Btn {
                     flat: true;
                     icon: "\u{E74D}";
                     text: "Uninstall";
                     enabled: !root.busy;
                     clicked => { root.uninstall(root.selected); }
                 }
-                Btn {
+                if !root.show-app-settings: Btn {
                     flat: true;
                     icon: "\u{E945}";
                     text: root.has-sel && !root.cur.d3d11 && root.cur.scan-shaders ? "Scan shaders" : "Prepare shaders";
                     enabled: root.has-sel && (root.cur.d3d11 || root.cur.scan-shaders) && !root.busy;
                     clicked => { root.warm-shaders(root.selected); }
                 }
-                ToolSep { }
-                Btn {
+                if !root.show-app-settings: ToolSep { }
+                if !root.show-app-settings: Btn {
                     flat: true;
                     icon: "\u{E838}";
                     text: "Open folder";
                     enabled: root.has-sel;
                     clicked => { root.open-folder(root.selected); }
                 }
+                if root.show-app-settings: Btn {
+                    flat: true;
+                    icon: "\u{E8B7}";
+                    text: "Library";
+                    clicked => { root.show-app-settings = false; }
+                }
+            }
+            Btn {
+                x: parent.width - self.width - 8px;
+                y: 8px;
+                width: self.preferred-width;
+                flat: true;
+                primary: root.show-app-settings;
+                icon: "\u{E713}";
+                text: "App settings";
+                clicked => { root.show-app-settings = !root.show-app-settings; }
             }
             Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
         }
 
-        if root.driver-notice != "": VerticalLayout {
+        if !root.show-app-settings && root.driver-notice != "": VerticalLayout {
             padding: 8px;
             Banner { text: root.driver-notice; }
         }
 
-        HorizontalLayout {
+        if root.show-app-settings: AppSettings {
+            vertical-stretch: 1;
+            theme: root.app-theme;
+            start-with-windows <=> root.start-with-windows;
+            theme-changed(theme) => { root.app-theme-changed(theme); }
+            startup-changed(enabled) => { root.startup-changed(enabled); }
+        }
+
+        if !root.show-app-settings: HorizontalLayout {
             vertical-stretch: 1;
             // Game list.
             Rectangle {
@@ -1232,7 +1309,7 @@ export component MainWindow inherits Window {
                         width: 156px;
                         alignment: center;
                         Rectangle {
-                            background: #ffffff1c;
+                            background: Theme.track;
                             clip: true;
                             height: 4px;
                             Rectangle {
