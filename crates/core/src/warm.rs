@@ -173,6 +173,13 @@ pub fn is_running(exe: &Path) -> bool {
 /// lines. Blocks until done: call it off the UI thread. `on_stall` gets the
 /// seconds the log has not moved, from STALL_S on, every 10 s.
 pub fn run(exe: &Path, warm_exe: &Path, on_stall: &dyn Fn(u64)) -> io::Result<String> {
+    run_with_progress(exe, warm_exe, on_stall, &|_, _| {})
+}
+
+/// Reports processed and total store entries across the layer and scan stores.
+pub fn run_with_progress(
+    exe: &Path, warm_exe: &Path, on_stall: &dyn Fn(u64), on_progress: &dyn Fn(u64, u64),
+) -> io::Result<String> {
     let other = |m: &str| io::Error::other(m.to_string());
     let base = store_base(exe).ok_or_else(|| other("invalid game path"))?;
     let todo: Vec<PathBuf> = bases(exe).into_iter().filter(|b| with_suffix(b, ".tshi").is_file()).collect();
@@ -187,17 +194,54 @@ pub fn run(exe: &Path, warm_exe: &Path, on_stall: &dyn Fn(u64)) -> io::Result<St
     fs::create_dir_all(&dir)?;
     let copy = dir.join(name);
     fs::copy(warm_exe, &copy)?;
+    let counts: Vec<_> = todo.iter().map(|b| {
+        crate::shaders::stats_at(&with_suffix(b, ".tshd"), &with_suffix(b, ".tshi")).shaders
+    }).collect();
+    let total = counts.iter().sum::<u64>();
+    let mut completed = 0;
     let mut lines = Vec::new();
-    for b in &todo {
+    for (b, count) in todo.iter().zip(counts) {
         let peer = bases(exe).into_iter().find(|other| other != b);
-        lines.push(run_one(&copy, b, peer.as_deref(), on_stall)?);
+        let latest = std::cell::Cell::new(completed);
+        lines.push(run_one(&copy, b, peer.as_deref(), on_stall, &|processed| {
+            let done = completed + processed.min(count);
+            if done >= latest.get() && total != 0 {
+                latest.set(done);
+                on_progress(done, total);
+            }
+        })?);
+        completed += count;
+        if total != 0 {
+            on_progress(completed, total);
+        }
     }
     Ok(lines.join("\n"))
 }
 
 /// Runs one warm-up to its end, reporting (never acting on) a log that stops
 /// growing: the warm exe flushes it before each risky driver call.
-fn wait_reporting(mut cmd: Command, log: &Path, stall_s: u64, on_stall: &dyn Fn(u64)) -> io::Result<std::process::Output> {
+fn read_warm_output(mut reader: impl io::BufRead, on_progress: impl Fn(u64)) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        let progress = std::str::from_utf8(&line).ok().and_then(|line| {
+            let (done, total) = line.trim_end().strip_prefix("tessera-progress ")?.split_once(' ')?;
+            let (done, total) = (done.parse::<u64>().ok()?, total.parse::<u64>().ok()?);
+            (done <= total).then_some(done)
+        });
+        if let Some(done) = progress {
+            on_progress(done);
+        } else {
+            output.extend_from_slice(&line);
+        }
+        line.clear();
+    }
+    Ok(output)
+}
+
+fn wait_reporting(
+    mut cmd: Command, log: &Path, stall_s: u64, on_stall: &dyn Fn(u64), on_progress: &dyn Fn(u64),
+) -> io::Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -217,11 +261,20 @@ fn wait_reporting(mut cmd: Command, log: &Path, stall_s: u64, on_stall: &dyn Fn(
             v
         })
     }
-    let out = drain(child.stdout.take());
+    let (send, progress) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take();
+    let out = std::thread::spawn(move || {
+        stdout.map_or_else(|| Ok(Vec::new()), |stdout| {
+            read_warm_output(io::BufReader::new(stdout), |done| { let _ = send.send(done); })
+        }).unwrap_or_default()
+    });
     let err = drain(child.stderr.take());
     let size = || fs::metadata(log).map(|m| m.len()).unwrap_or(0);
     let (mut last, mut moved, mut next) = (size(), Instant::now(), stall_s);
     let status = loop {
+        if let Some(done) = progress.try_iter().last() {
+            on_progress(done);
+        }
         if let Some(st) = child.try_wait()? {
             break st;
         }
@@ -237,17 +290,20 @@ fn wait_reporting(mut cmd: Command, log: &Path, stall_s: u64, on_stall: &dyn Fn(
         }
     };
     let (stdout, stderr) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    if let Some(done) = progress.try_iter().last() {
+        on_progress(done);
+    }
     Ok(std::process::Output { status, stdout, stderr })
 }
 
-fn run_one(copy: &Path, base: &Path, peer: Option<&Path>, on_stall: &dyn Fn(u64)) -> io::Result<String> {
+fn run_one(
+    copy: &Path, base: &Path, peer: Option<&Path>, on_stall: &dyn Fn(u64), on_progress: &dyn Fn(u64),
+) -> io::Result<String> {
     for attempt in 0..=MAX_RELAUNCHES {
         let mut cmd = Command::new(copy);
         cmd.arg(base).arg(peer.unwrap_or_else(|| Path::new("")));
-        if attempt == 0 {
-            cmd.arg("--retry-failed");
-        }
-        let out = wait_reporting(cmd, &with_suffix(base, ".twarm"), STALL_S, on_stall)?;
+        cmd.arg(if attempt == 0 { "--retry-failed" } else { "" }).arg("--progress");
+        let out = wait_reporting(cmd, &with_suffix(base, ".twarm"), STALL_S, on_stall, on_progress)?;
         match out.status.code() {
             Some(0) => return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
             Some(1) => {
@@ -267,11 +323,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn separates_progress_updates_from_the_warm_summary() {
+        let output = b"tessera-progress 3 7\r\ntessera-progress 7 7\r\nstored 7, compiled now 4\r\n";
+        let progress = std::cell::RefCell::new(Vec::new());
+        let summary = read_warm_output(&output[..], |done| progress.borrow_mut().push(done)).unwrap();
+        assert_eq!(progress.into_inner(), [3, 7]);
+        assert_eq!(summary, b"stored 7, compiled now 4\r\n");
+    }
+
+    #[test]
     fn reports_a_stalled_warm_up_and_lets_it_finish() {
         let mut cmd = Command::new("ping");
         cmd.args(["-n", "4", "127.0.0.1"]); // about 3 s, no log written
         let told = std::cell::Cell::new(0u32);
-        let out = wait_reporting(cmd, Path::new("no such log"), 1, &|_| told.set(told.get() + 1)).unwrap();
+        let out = wait_reporting(cmd, Path::new("no such log"), 1, &|_| told.set(told.get() + 1), &|_| {}).unwrap();
         assert!(out.status.success(), "never killed");
         assert!(!out.stdout.is_empty(), "output still collected");
         assert_eq!(told.get(), 1, "told once at the limit, then every 10 s");

@@ -883,6 +883,9 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         return;
     };
     ui.set_busy(true);
+    ui.set_shader_progress_active(true);
+    ui.set_shader_progress(-1.0);
+    ui.set_shader_progress_label("".into());
     ui.set_status_text("Preparing shaders…".into());
     let (weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
@@ -913,7 +916,15 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
             } else {
                 tessera_core::warm::WARM_EXE
             };
-            match tessera_core::warm::run(&exe, &app_dir().join(helper), &stall) {
+            let progress = |done: u64, total: u64| {
+                let label = format!("{done} / {total}");
+                let value = (done as f64 / total as f64) as f32;
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_shader_progress(value);
+                    ui.set_shader_progress_label(label.into());
+                });
+            };
+            match tessera_core::warm::run_with_progress(&exe, &app_dir().join(helper), &stall, &progress) {
                 Ok(_) => {
                     let drivers: Vec<_> = tessera_core::driver::gpus()
                         .iter()
@@ -934,6 +945,7 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_busy(false);
+            ui.set_shader_progress_active(false);
             ui.set_status_text(msg.into());
             // The selection may have moved while this ran: reload only this game.
             let mut st = state.lock().unwrap();

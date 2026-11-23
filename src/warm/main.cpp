@@ -478,11 +478,23 @@ int wmain(int argc, wchar_t** argv) {
     Log log;
     const wchar_t* peer = argc > 2 ? argv[2] : nullptr;
     const bool retry = argc > 3 && wcscmp(argv[3], L"--retry-failed") == 0;
+    const bool progress = argc > 4 && wcscmp(argv[4], L"--progress") == 0;
     if (!open_log(base + L".twarm", peer, w.driver(), retry, &log)) {
         fprintf(stderr, "cannot write the warm-up log\n");
         return 1;
     }
     const ULONGLONG t0 = GetTickCount64();
+    ULONGLONG last_progress = t0;
+    size_t processed = 0;
+    auto report_progress = [&] {
+        printf("tessera-progress %zu %zu\n", processed, shaders.size());
+        fflush(stdout);
+        last_progress = GetTickCount64();
+    };
+    if (progress) {
+        for (const Shader& s : shaders) processed += log.done.count(s.hash);
+        report_progress();
+    }
     uint32_t now_ok = 0, now_failed = 0, now_skipped = 0;
     for (const Shader& s : shaders) {
         if (log.done.count(s.hash)) continue;
@@ -497,9 +509,14 @@ int wmain(int argc, wchar_t** argv) {
         }
         log.line(result, s.hash);
         log.done.insert(s.hash);
+        if (progress) {
+            ++processed;
+            if (GetTickCount64() - last_progress >= 200) report_progress();
+        }
         ++*(result[0] == 'f' ? &now_failed : result[0] == 's' ? &now_skipped : &now_ok);
     }
     w.ctx->Flush();
+    if (progress) report_progress();
     fclose(log.f);
     printf("stored %zu, compiled now %u, failed now %u, skipped now %u, total ok %u failed %u, %llu ms\n",
            shaders.size(), now_ok, now_failed, now_skipped, log.ok + now_ok, log.failed + now_failed,
