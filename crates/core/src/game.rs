@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn sdl_d3d9_probes_do_not_add_a_backend_to_a_modern_renderer() {
+    fn sdl_backends_do_not_add_to_a_confirmed_modern_renderer() {
         let t = tempfile::tempdir().unwrap();
         let exe = t.path().join("Game.exe");
         let mut executable = pe64_importing("SDL3.dll");
@@ -258,6 +258,13 @@ mod tests {
         std::fs::write(t.path().join("SDL3.dll"), windowing).unwrap();
         std::fs::write(&exe, &executable).unwrap();
         assert_eq!(pe::scan_exe(&exe).unwrap().all(), ApiSet(ApiSet::D3D9));
+
+        let mut windowing = minimal_pe64();
+        windowing.extend_from_slice(b"Direct3DCreate9\0D3D11CreateDevice\0D3D12CreateDevice\0");
+        std::fs::write(t.path().join("SDL3.dll"), windowing).unwrap();
+        executable.extend_from_slice(b"vkCreateGraphicsPipelines\0");
+        std::fs::write(&exe, &executable).unwrap();
+        assert_eq!(pe::scan_exe(&exe).unwrap().all(), ApiSet(ApiSet::VULKAN));
 
         executable.extend_from_slice(b"D3D12CreateDevice\0vkCreateGraphicsPipelines\0");
         std::fs::write(&exe, executable).unwrap();
@@ -311,6 +318,34 @@ mod tests {
         managers.extend_from_slice(&settings);
         let data_dir = root.join("Game_Data");
         std::fs::create_dir(&data_dir).unwrap();
+        let mut table = vec![0; 16];
+        table.extend_from_slice(&2u32.to_be_bytes());
+        let parts = managers.split_at(managers.len() / 2);
+        let mut blocks = Vec::new();
+        for part in [parts.0, parts.1] {
+            let block = lz4_flex::compress(part);
+            table.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            table.extend_from_slice(&(block.len() as u32).to_be_bytes());
+            table.extend_from_slice(&3u16.to_be_bytes());
+            blocks.extend_from_slice(&block);
+        }
+        table.extend_from_slice(&1u32.to_be_bytes());
+        table.extend_from_slice(&0u64.to_be_bytes());
+        table.extend_from_slice(&(managers.len() as u64).to_be_bytes());
+        table.extend_from_slice(&0u32.to_be_bytes());
+        table.extend_from_slice(b"globalgamemanagers\0");
+        let packed_table = lz4_flex::compress(&table);
+        let mut bundle = b"UnityFS\0\0\0\0\x065.x.x\x002022.3.54f1\0".to_vec();
+        let bundle_size = (bundle.len() + 20 + packed_table.len() + blocks.len()) as u64;
+        bundle.extend_from_slice(&bundle_size.to_be_bytes());
+        bundle.extend_from_slice(&(packed_table.len() as u32).to_be_bytes());
+        bundle.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        bundle.extend_from_slice(&0x43u32.to_be_bytes());
+        bundle.extend_from_slice(&packed_table);
+        bundle.extend_from_slice(&blocks);
+        std::fs::write(data_dir.join("data.unity3d"), bundle).unwrap();
+        assert_eq!(analyze(entry.clone()).api_label(), "D3D11, Vulkan");
+
         std::fs::write(data_dir.join("globalgamemanagers"), managers).unwrap();
 
         let game = analyze(entry);

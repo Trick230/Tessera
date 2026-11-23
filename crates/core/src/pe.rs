@@ -81,12 +81,13 @@ pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
     let (mut scan, mut pending) = scan_binary(&executable);
     let mut linked = scan.imported;
     let mut modern_renderer = scan.all().has(ApiSet::D3D11 | ApiSet::D3D12 | ApiSet::VULKAN);
-    let mut sdl_d3d9 = false;
+    let mut sdl_apis = ApiSet::default();
+    let mut sdl_imported = ApiSet::default();
     let mut seen = HashSet::new();
     let mut checked_bootstrap = false;
     loop {
         let Some(name) = pending.pop() else {
-            if checked_bootstrap || !scan.all().is_empty() || sdl_d3d9 {
+            if checked_bootstrap || !scan.all().is_empty() || !sdl_apis.is_empty() {
                 break;
             }
             checked_bootstrap = true;
@@ -103,22 +104,23 @@ pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
             continue;
         }
         let Ok(data) = map_binary(&path.with_file_name(dll)) else { continue };
-        let (mut dependency, imports) = scan_binary(&data);
+        let (dependency, imports) = scan_binary(&data);
         if dependency.architecture == scan.architecture {
-            // SDL has D3D9 code for display probing and its own optional 2D renderer.
+            // SDL includes optional rendering backends even when used only for windowing or input.
             if ["sdl2.dll", "sdl3.dll"].iter().any(|sdl| name.eq_ignore_ascii_case(sdl)) {
-                sdl_d3d9 |= dependency.referenced.has(ApiSet::D3D9);
-                dependency.referenced.0 &= !ApiSet::D3D9;
+                sdl_apis.0 |= dependency.all().0;
+                sdl_imported.0 |= dependency.imported.0;
             } else {
                 modern_renderer |= dependency.all().has(ApiSet::D3D11 | ApiSet::D3D12 | ApiSet::VULKAN);
+                linked.0 |= dependency.imported.0;
+                scan.referenced.0 |= dependency.all().0;
             }
-            linked.0 |= dependency.imported.0;
-            scan.referenced.0 |= dependency.all().0;
             pending.extend(imports);
         }
     }
-    if sdl_d3d9 && !modern_renderer {
-        scan.referenced.0 |= ApiSet::D3D9;
+    if !modern_renderer {
+        scan.referenced.0 |= sdl_apis.0;
+        linked.0 |= sdl_imported.0;
     }
     Ok(prefer_linked_direct3d(scan, linked))
 }

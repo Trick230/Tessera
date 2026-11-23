@@ -37,7 +37,13 @@ pub fn detect(root: &Path) -> Vec<String> {
     for entry in walker.flatten() {
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
         for (marker, label) in MARKERS {
-            if name.contains(marker) && !found.iter().any(|f| f == label) {
+            let matched = if *marker == "sguard" {
+                // ACE's SGuard name starts a component, unlike words ending in "sGuardian".
+                name.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| part.starts_with(marker))
+            } else {
+                name.contains(marker)
+            };
+            if matched && !found.iter().any(|f| f == label) {
                 found.push((*label).to_string());
             }
         }
@@ -56,5 +62,14 @@ mod tests {
         assert!(detect(t.path()).is_empty());
         std::fs::create_dir_all(t.path().join("EasyAntiCheat")).unwrap();
         assert_eq!(detect(t.path()), vec!["Easy Anti-Cheat"]);
+    }
+
+    #[test]
+    fn distinguishes_sguard_components_from_game_assets() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("Obj_TravelersGuardianDeity_A.sbfres"), []).unwrap();
+        assert!(detect(t.path()).is_empty());
+        std::fs::write(t.path().join("SGuard64.exe"), []).unwrap();
+        assert_eq!(detect(t.path()), vec!["Tencent ACE"]);
     }
 }

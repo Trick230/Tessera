@@ -33,6 +33,8 @@ fn title(stem: &str) -> Option<&'static str> {
         "jetsetradiofuture" => "Jet Set Radio Future",
         "legodimensions" => "LEGO Dimensions",
         "projectdream" => "Sonic Dream Team (Project Dream)",
+        // https://github.com/Revivedx/SavageWindRecomp
+        "savagewind" => "Savage Wind Recomp",
         "shipofharkinian" | "soh" => "Ship of Harkinian",
         "2ship2harkinian" | "2ship" => "2 Ship 2 Harkinian",
         "skate3" | "skate3recomp" => "Skate 3 Recompiled",
