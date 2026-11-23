@@ -53,6 +53,37 @@ pub fn bases(exe: &Path) -> Vec<PathBuf> {
     [store_base(exe), crate::scan::scan_base(exe)].into_iter().flatten().collect()
 }
 
+/// Clears the shader data Tessera owns for this executable.
+pub fn clear_shader_cache(exe: &Path) -> io::Result<usize> {
+    if is_running(exe) {
+        return Err(io::Error::other("close the game before clearing its shader cache"));
+    }
+    let key = crate::session::exe_key_name(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
+    clear_shader_files(&crate::paths::data_dir(), &key)
+}
+
+fn clear_shader_files(data: &Path, key: &str) -> io::Result<usize> {
+    let base = data.join("shaders").join(key);
+    let mut removed = 0;
+    for path in [
+        with_suffix(&base, ".scan.key"),
+        with_suffix(&base, ".scan.tshi"),
+        with_suffix(&base, ".scan.tshd"),
+        with_suffix(&base, ".scan.twarm"),
+        with_suffix(&base, ".tshi"),
+        with_suffix(&base, ".tshd"),
+        with_suffix(&base, ".twarm"),
+        data.join("feedback").join(format!("{key}.tmip")),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        }
+    }
+    Ok(removed)
+}
+
 /// Shaders in both stores, each hash once (a later session may store a
 /// shader the scan found first).
 pub fn stored(exe: &Path) -> crate::shaders::StoreStats {
@@ -321,6 +352,27 @@ fn run_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clears_only_the_selected_games_shader_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        fs::create_dir(data.join("shaders")).unwrap();
+        fs::create_dir(data.join("feedback")).unwrap();
+        let files = ["shaders/game-a.tshd", "shaders/game-a.tshi", "shaders/game-a.twarm",
+            "shaders/game-a.scan.tshd", "shaders/game-a.scan.tshi", "shaders/game-a.scan.twarm",
+            "shaders/game-a.scan.key", "feedback/game-a.tmip"];
+        let other = data.join("shaders/game-b.tshd");
+        fs::write(&other, b"keep").unwrap();
+        for file in files {
+            fs::write(data.join(file), []).unwrap();
+        }
+
+        assert_eq!(clear_shader_files(data, "game-a").unwrap(), files.len());
+        assert!(files.iter().all(|file| !data.join(file).exists()));
+        assert_eq!(fs::read(other).unwrap(), b"keep");
+        assert_eq!(clear_shader_files(data, "game-a").unwrap(), 0);
+    }
 
     #[test]
     fn separates_progress_updates_from_the_warm_summary() {

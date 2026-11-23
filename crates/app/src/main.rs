@@ -1005,6 +1005,51 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
     });
 }
 
+fn clear_shader_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
+    if ui.get_busy() {
+        return;
+    }
+    let Some((exe, root, name)) = ({
+        let st = state.lock().unwrap();
+        st.view.get(view_idx as usize).and_then(|&gi| {
+            let game = &st.games[gi];
+            game.exe.clone().map(|exe| (exe, game.entry.root.clone(), game.entry.name.clone()))
+        })
+    }) else {
+        return;
+    };
+    let answer = rfd::MessageDialog::new()
+        .set_title("Clear shader cache")
+        .set_description(format!("Clear the shaders Tessera collected or prepared for {name}?"))
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::OkCancel)
+        .show();
+    if answer != rfd::MessageDialogResult::Ok {
+        return;
+    }
+    ui.set_busy(true);
+    ui.set_status_text("Clearing shader cache…".into());
+    let (weak, state) = (ui.as_weak(), state.clone());
+    std::thread::spawn(move || {
+        let msg = match tessera_core::warm::clear_shader_cache(&exe) {
+            Ok(0) => format!("{name} has no Tessera shader cache."),
+            Ok(_) => format!("Cleared the Tessera shader cache for {name}."),
+            Err(e) => format!("Could not clear the shader cache: {e}"),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_busy(false);
+            ui.set_status_text(msg.into());
+            let mut st = state.lock().unwrap();
+            if st.shown_root.as_ref() == Some(&root) {
+                request_view(&ui, &state, &mut st, ui.get_selected(), true);
+            } else {
+                invalidate_view(&mut st, &root);
+                start_view_worker(&ui, &state, &mut st);
+            }
+        });
+    });
+}
+
 /// Runs install/uninstall on the selected game and refreshes its row.
 fn layer_action(ui: &MainWindow, state: &Shared, view_idx: i32, do_install: bool) {
     let mut st = state.lock().unwrap();
@@ -1193,6 +1238,10 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_warm_shaders(move |i| warm_action(&w.unwrap(), &s, i));
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_clear_shaders(move |i| clear_shader_action(&w.unwrap(), &s, i));
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());

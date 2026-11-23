@@ -641,6 +641,7 @@ component Detail inherits Rectangle {
     property <bool> has-hero: root.hero.width > 0;
     property <bool> wide-hero: root.has-hero && (!root.game.recomp || root.hero.width > root.hero.height);
     callback reset-safe-mode();
+    callback clear-shaders();
     callback settings-changed(bool, bool, bool, bool, bool, int, int);
     callback advanced-changed(string, int);
     callback prepare-quality();
@@ -828,6 +829,15 @@ component Detail inherits Rectangle {
                 // Shaders: compiled, covered, damaged, out of date.
                 if root.tab == 3: VerticalLayout {
                     spacing: 20px;
+                    if root.shaders.present: HorizontalLayout {
+                        alignment: start;
+                        Btn {
+                            icon: "\u{E74D}";
+                            text: "Clear shader cache";
+                            enabled: !root.busy;
+                            clicked => { root.clear-shaders(); }
+                        }
+                    }
                     if !root.shaders.present: Text { text: "No game executable found."; color: Theme.dim; font-size: 14px; }
                     for r in root.shaders.rows: ShaderLine { check: r; }
                 }
@@ -1064,6 +1074,7 @@ export component MainWindow inherits Window {
     callback hover-game(int);
     callback reset-safe-mode(int);
     callback warm-shaders(int);
+    callback clear-shaders(int);
     callback add-folder(bool);
     callback filter-changed(string);
     callback install(int);
@@ -1171,6 +1182,7 @@ export component MainWindow inherits Window {
                 shaders: root.shader-state;
                 tab <=> root.tab;
                 reset-safe-mode => { root.reset-safe-mode(root.selected); }
+                clear-shaders => { root.clear-shaders(root.selected); }
                 settings-changed(p, r, fl, rc, u, f, v) => { root.settings-changed(root.selected, p, r, fl, rc, u, f, v); }
                 advanced-changed(key, value) => { root.advanced-changed(root.selected, key, value); }
                 prepare-quality => { root.prepare-quality(root.selected); }
