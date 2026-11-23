@@ -246,6 +246,16 @@ mod tests {
     }
 
     #[test]
+    fn renderer_symbols_must_start_a_string() {
+        let mut executable = pe64_importing("d3d12.dll");
+        executable.extend_from_slice(b"__FUNCTION__, D3D11CreateDevice\0vkCreateGraphicsPipelines\0");
+        assert_eq!(pe::scan_bytes(&executable).all(), ApiSet(ApiSet::D3D12 | ApiSet::VULKAN));
+
+        executable.extend_from_slice(b"D3D11CreateDevice\0");
+        assert_eq!(pe::scan_bytes(&executable).all(), ApiSet(ApiSet::D3D12 | ApiSet::D3D11 | ApiSet::VULKAN));
+    }
+
+    #[test]
     fn unity_detects_graphics_api_in_player_dll() {
         let t = tempfile::tempdir().unwrap();
         let root = t.path();

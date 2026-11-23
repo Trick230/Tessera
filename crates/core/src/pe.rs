@@ -179,7 +179,10 @@ fn scan_binary(data: &[u8]) -> (ExeScan, Vec<String>) {
         (b"vkCreateGraphicsPipelines\0", ApiSet::VULKAN),
         (b"glDrawElements\0", ApiSet::OPENGL),
     ] {
-        if !scan.all().has(bit) && memmem::find(data, symbol).is_some() {
+        if !scan.all().has(bit) && memmem::find_iter(data, symbol).any(|offset| {
+            // Reject suffixes of longer strings, such as diagnostic messages.
+            offset == 0 || !(b' '..=b'~').contains(&data[offset - 1])
+        }) {
             scan.referenced.0 |= bit;
         }
     }
