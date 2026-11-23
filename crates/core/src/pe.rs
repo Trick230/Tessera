@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Graphics API detection from a PE executable: static and delay-load
-//! imports, plus DLL names referenced as strings (LoadLibrary paths).
+//! Graphics API detection from a PE executable and its local dependencies.
+//! Uses static and delay-load imports plus graphics entry point names.
 
-use memchr::{memchr2, memmem};
+use memchr::memmem;
 use object::read::pe::{ImageNtHeaders, PeFile, PeFile32, PeFile64, ResourceDirectory, ResourceDirectoryTable};
 use object::{LittleEndian as LE, ReadRef};
 use std::collections::HashSet;
@@ -66,10 +66,6 @@ impl ExeScan {
     }
 }
 
-pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
-    Ok(scan_bytes(&map_binary(path)?))
-}
-
 fn map_binary(path: &Path) -> io::Result<memmap2::Mmap> {
     let file = File::open(path)?;
     // SAFETY: read-only mapping of a file we do not modify.
@@ -77,8 +73,8 @@ fn map_binary(path: &Path) -> io::Result<memmap2::Mmap> {
 }
 
 /// Inspect the executable and its adjacent, architecture-matched PE dependencies.
-pub(crate) fn scan_recomp(path: &Path) -> io::Result<ExeScan> {
-    let (mut scan, mut pending) = scan_recomp_binary(&map_binary(path)?);
+pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
+    let (mut scan, mut pending) = scan_binary(&map_binary(path)?);
     let mut seen = HashSet::new();
     while let Some(name) = pending.pop() {
         let dll = Path::new(&name);
@@ -90,7 +86,7 @@ pub(crate) fn scan_recomp(path: &Path) -> io::Result<ExeScan> {
             continue;
         }
         let Ok(data) = map_binary(&path.with_file_name(dll)) else { continue };
-        let (dependency, imports) = scan_recomp_binary(&data);
+        let (dependency, imports) = scan_binary(&data);
         if dependency.architecture == scan.architecture {
             scan.referenced.0 |= dependency.all().0;
             pending.extend(imports);
@@ -150,19 +146,21 @@ fn pe_icon<'a, Pe: ImageNtHeaders>(pe: PeFile<'a, Pe>) -> Option<Vec<u8>> {
 }
 
 pub fn scan_bytes(data: &[u8]) -> ExeScan {
-    let (mut scan, _) = scan_imports(data);
-    for (dll, bit, _) in DLLS {
-        if contains_ascii_ci(data, dll.as_bytes()) || contains_utf16_ci(data, dll.as_bytes()) {
-            scan.referenced.0 |= bit;
-        }
-    }
-    scan
+    scan_binary(data).0
 }
 
-fn scan_recomp_binary(data: &[u8]) -> (ExeScan, Vec<String>) {
+fn scan_binary(data: &[u8]) -> (ExeScan, Vec<String>) {
     let (mut scan, imports) = scan_imports(data);
     if scan.architecture.is_none() {
         return (ExeScan::default(), Vec::new());
+    }
+    // D3DPERF functions are exposed by d3d9.dll and can be used without a D3D9 device.
+    if ![b"Direct3DCreate9\0".as_slice(), b"Direct3DCreate9Ex\0"].iter()
+        .any(|symbol| memmem::find(data, symbol).is_some())
+    {
+        scan.imported.0 &= !ApiSet::D3D9;
+    } else if !scan.imported.has(ApiSet::D3D9) {
+        scan.referenced.0 |= ApiSet::D3D9;
     }
     // A graphics entry point is stronger evidence than a DLL name in text.
     // Vulkan loaders can also be present in windowing libraries without a Vulkan renderer.
@@ -170,8 +168,6 @@ fn scan_recomp_binary(data: &[u8]) -> (ExeScan, Vec<String>) {
         (b"D3D12CreateDevice\0".as_slice(), ApiSet::D3D12),
         (b"D3D11CreateDevice\0", ApiSet::D3D11),
         (b"D3D11CreateDeviceAndSwapChain\0", ApiSet::D3D11),
-        (b"Direct3DCreate9\0", ApiSet::D3D9),
-        (b"Direct3DCreate9Ex\0", ApiSet::D3D9),
         (b"Direct3DCreate8\0", ApiSet::D3D8),
         (b"vkCreateGraphicsPipelines\0", ApiSet::VULKAN),
         (b"glDrawElements\0", ApiSet::OPENGL),
@@ -231,67 +227,9 @@ fn imports<'d, Pe: ImageNtHeaders, R: ReadRef<'d>>(pe: &PeFile<'d, Pe, R>) -> Ve
     out
 }
 
-/// Case-insensitive search for a lowercase ASCII needle.
-pub fn contains_ascii_ci(hay: &[u8], needle: &[u8]) -> bool {
-    let (first, rest) = match needle.split_first() {
-        Some(x) => x,
-        None => return true,
-    };
-    let mut pos = 0;
-    while let Some(off) = memchr2(*first, first.to_ascii_uppercase(), &hay[pos..]) {
-        let start = pos + off;
-        let tail = &hay[start + 1..];
-        if tail.len() >= rest.len() && tail[..rest.len()].eq_ignore_ascii_case(rest) {
-            return true;
-        }
-        pos = start + 1;
-    }
-    false
-}
-
-/// Case-insensitive search for a lowercase ASCII needle stored as UTF-16LE.
-pub fn contains_utf16_ci(hay: &[u8], needle: &[u8]) -> bool {
-    let (first, rest) = match needle.split_first() {
-        Some(x) => x,
-        None => return true,
-    };
-    let mut pos = 0;
-    while let Some(off) = memchr2(*first, first.to_ascii_uppercase(), &hay[pos..]) {
-        let start = pos + off;
-        let tail = &hay[start..];
-        if tail.len() >= needle.len() * 2
-            && tail[1] == 0
-            && rest.iter().enumerate().all(|(i, c)| {
-                let lo = tail[2 + i * 2];
-                tail[3 + i * 2] == 0 && lo.to_ascii_lowercase() == *c
-            })
-        {
-            return true;
-        }
-        pos = start + 1;
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ascii_search_ignores_case() {
-        assert!(contains_ascii_ci(b"xxD3D11.DLLyy", b"d3d11.dll"));
-        assert!(!contains_ascii_ci(b"xxd3d11.dlyy", b"d3d11.dll"));
-    }
-
-    #[test]
-    fn utf16_search_ignores_case() {
-        let w: Vec<u8> = "..D3D12.dll.."
-            .encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
-            .collect();
-        assert!(contains_utf16_ci(&w, b"d3d12.dll"));
-        assert!(!contains_utf16_ci(&w, b"d3d11.dll"));
-    }
 
     #[test]
     fn own_test_binary_parses_as_pe64() {

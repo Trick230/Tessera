@@ -52,14 +52,13 @@ impl GameInfo {
 pub fn analyze(entry: GameEntry) -> GameInfo {
     let exe = find_main_exe(&entry.root, entry.exe_hint.as_deref());
     let engine = engine::detect(&entry.root);
-    let scan_exe = if entry.store == Store::Recomp { pe::scan_recomp } else { pe::scan_exe };
     let (mut scan, exe_hash) = match &exe {
-        Some(p) => (scan_exe(p).unwrap_or_default(), hash_file(p).ok()),
+        Some(p) => (pe::scan_exe(p).unwrap_or_default(), hash_file(p).ok()),
         None => (ExeScan::default(), None),
     };
     // Unity launchers can leave all graphics API references in the player DLL.
     if let (Engine::Unity, Some(p), Some(architecture)) = (engine, exe.as_deref(), scan.architecture) {
-        if let Some(player) = scan_exe(&p.with_file_name("UnityPlayer.dll")).ok()
+        if let Some(player) = pe::scan_exe(&p.with_file_name("UnityPlayer.dll")).ok()
             .filter(|player| player.architecture == Some(architecture))
         {
             scan.referenced.0 |= player.all().0;
@@ -180,13 +179,52 @@ mod tests {
         pe
     }
 
+    fn pe64_importing(dll: &str) -> Vec<u8> {
+        let mut pe = minimal_pe64();
+        // Add one .rdata section containing the import table.
+        pe.resize(1024, 0);
+        pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        pe[0x104..0x108].copy_from_slice(&16u32.to_le_bytes());
+        pe[0x110..0x114].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[0x114..0x118].copy_from_slice(&40u32.to_le_bytes());
+        pe[0x188..0x190].copy_from_slice(b".rdata\0\0");
+        pe[0x190..0x194].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[0x194..0x198].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[0x198..0x19c].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[0x19c..0x1a0].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[0x20c..0x210].copy_from_slice(&0x1030u32.to_le_bytes());
+        pe[0x230..0x230 + dll.len()].copy_from_slice(dll.as_bytes());
+        pe
+    }
+
+    #[test]
+    fn d3d9_import_without_device_creation_does_not_identify_a_renderer() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("Game.exe");
+        let entry = GameEntry {
+            name: "Game".into(),
+            root: t.path().into(),
+            store: Store::Steam,
+            exe_hint: None,
+            steam_appid: None,
+        };
+        let mut executable = pe64_importing("d3d9.dll");
+        executable.extend_from_slice(b"D3DPERF_BeginEvent\0D3D11CreateDevice\0");
+        std::fs::write(&exe, &executable).unwrap();
+        assert_eq!(analyze(entry.clone()).api_label(), "D3D11");
+
+        executable.extend_from_slice(b"Direct3DCreate9Ex\0");
+        std::fs::write(&exe, executable).unwrap();
+        assert_eq!(analyze(entry).api_label(), "D3D11, D3D9");
+    }
+
     #[test]
     fn unity_detects_graphics_api_in_player_dll() {
         let t = tempfile::tempdir().unwrap();
         let root = t.path();
         let mut pe = minimal_pe64();
         std::fs::write(root.join("Game.exe"), &pe).unwrap();
-        pe.extend_from_slice(b"d3d11.dll\0");
+        pe.extend_from_slice(b"D3D11CreateDevice\0");
         std::fs::write(root.join("UnityPlayer.dll"), &pe).unwrap();
 
         let game = analyze(GameEntry {
@@ -221,21 +259,7 @@ mod tests {
         std::fs::write(root.join("Renderer.dll"), renderer).unwrap();
         assert_eq!(analyze(entry.clone()).api_label(), "Unknown API");
 
-        // Add one .rdata section containing the executable's import table.
-        executable.resize(1024, 0);
-        executable[0x200..].fill(0);
-        executable[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
-        executable[0x104..0x108].copy_from_slice(&16u32.to_le_bytes());
-        executable[0x110..0x114].copy_from_slice(&0x1000u32.to_le_bytes());
-        executable[0x114..0x118].copy_from_slice(&40u32.to_le_bytes());
-        executable[0x188..0x190].copy_from_slice(b".rdata\0\0");
-        executable[0x190..0x194].copy_from_slice(&0x200u32.to_le_bytes());
-        executable[0x194..0x198].copy_from_slice(&0x1000u32.to_le_bytes());
-        executable[0x198..0x19c].copy_from_slice(&0x200u32.to_le_bytes());
-        executable[0x19c..0x1a0].copy_from_slice(&0x200u32.to_le_bytes());
-        executable[0x20c..0x210].copy_from_slice(&0x1030u32.to_le_bytes());
-        executable[0x230..0x23d].copy_from_slice(b"Renderer.dll\0");
-        std::fs::write(&exe, executable).unwrap();
+        std::fs::write(&exe, pe64_importing("Renderer.dll")).unwrap();
         assert_eq!(analyze(entry).api_label(), "D3D12, Vulkan (detected)");
     }
 
