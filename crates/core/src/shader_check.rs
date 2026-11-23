@@ -83,15 +83,14 @@ pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&
     let mut stored: HashMap<u64, u16> = HashMap::new();
     for b in &bases {
         let (store, index) = (with_suffix(b, ".tshd"), with_suffix(b, ".tshi"));
-        let shaders = crate::shaders::read_at(&store, &index);
-        c.damaged += crate::shaders::listed_at(&index).saturating_sub(shaders.len() as u64);
-        for s in shaders {
-            if s.flags & FLAG_DXBC != 0 && !intact(&s.code) {
+        let valid = crate::shaders::visit_at(&store, &index, |hash, _, flags, code| {
+            if flags & FLAG_DXBC != 0 && !intact(code) {
                 c.damaged += 1;
-                continue;
+            } else {
+                stored.entry(hash).or_insert(flags);
             }
-            stored.entry(s.hash).or_insert(s.flags);
-        }
+        });
+        c.damaged += crate::shaders::listed_at(&index).saturating_sub(valid);
     }
 
     // Logs written with the installed driver describe its cache; older ones

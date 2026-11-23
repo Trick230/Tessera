@@ -70,7 +70,7 @@ export struct ShaderRow {
     tone: int,
 }
 
-// The Shaders tab; not present while the stores are being checked.
+// The Shaders tab starts with a summary from the store indexes.
 export struct ShaderState {
     present: bool,
     rows: [ShaderRow],
@@ -529,6 +529,8 @@ component Tab inherits Rectangle {
     callback clicked;
     width: label.preferred-width + 26px;
     height: 40px;
+    background: ta.pressed ? #ffffff15 : ta.has-hover ? #ffffff0a : transparent;
+    animate background { duration: 100ms; easing: ease-out; }
     label := Text {
         text: root.text;
         color: root.active ? Theme.text : ta.has-hover ? Theme.dim.brighter(0.25) : Theme.dim;
@@ -536,14 +538,7 @@ component Tab inherits Rectangle {
         font-weight: root.active ? 600 : 500;
         horizontal-alignment: center;
         vertical-alignment: center;
-    }
-    Rectangle {
-        x: 12px;
-        y: parent.height - 2px;
-        width: parent.width - 24px;
-        height: 2px;
-        background: Theme.accent;
-        visible: root.active;
+        animate color { duration: 110ms; }
     }
     ta := TouchArea {
         clicked => { root.clicked(); }
@@ -622,6 +617,20 @@ component Detail inherits Rectangle {
     in property <ShaderState> shaders;
     in property <bool> busy;
     in-out property <int> tab;
+    property <bool> entering-page;
+    changed tab => {
+        page.content-y = 0px;
+        root.entering-page = true;
+        page-motion.running = true;
+    }
+    page-motion := Timer {
+        interval: 16ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            root.entering-page = false;
+        }
+    }
     // Steam's key art for the game; empty when there is none.
     in property <image> hero;
     property <bool> has-hero: root.hero.width > 0;
@@ -699,14 +708,27 @@ component Detail inherits Rectangle {
         // Tabs.
         VerticalLayout {
             padding-top: 8px;
-            HorizontalLayout {
-                padding-left: 8px;
-                alignment: start;
-                Tab { text: "Session"; active: root.tab == 0; clicked => { root.tab = 0; } }
-                Tab { text: "Shaders"; active: root.tab == 3; clicked => { root.tab = 3; } }
-                Tab { text: "Settings"; active: root.tab == 1; clicked => { root.tab = 1; } }
-                Tab { text: "Textures"; active: root.tab == 4; clicked => { root.tab = 4; } }
-                Tab { text: "Files"; active: root.tab == 2; clicked => { root.tab = 2; } }
+            Rectangle {
+                height: 40px;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    alignment: start;
+                    session-tab := Tab { text: "Session"; active: root.tab == 0; clicked => { root.tab = 0; } }
+                    shaders-tab := Tab { text: "Shaders"; active: root.tab == 3; clicked => { root.tab = 3; } }
+                    settings-tab := Tab { text: "Settings"; active: root.tab == 1; clicked => { root.tab = 1; } }
+                    textures-tab := Tab { text: "Textures"; active: root.tab == 4; clicked => { root.tab = 4; } }
+                    files-tab := Tab { text: "Files"; active: root.tab == 2; clicked => { root.tab = 2; } }
+                }
+                Rectangle {
+                    x: 12px + (root.tab == 0 ? session-tab.x : root.tab == 3 ? shaders-tab.x :
+                        root.tab == 1 ? settings-tab.x : root.tab == 4 ? textures-tab.x : files-tab.x);
+                    y: parent.height - self.height;
+                    width: (root.tab == 0 ? session-tab.width : root.tab == 3 ? shaders-tab.width :
+                        root.tab == 1 ? settings-tab.width : root.tab == 4 ? textures-tab.width : files-tab.width) - 24px;
+                    height: 2px;
+                    background: Theme.accent;
+                    animate x, width { duration: 175ms; easing: ease-out; }
+                }
             }
             Hairline { }
         }
@@ -716,6 +738,15 @@ component Detail inherits Rectangle {
             content-width: self.visible-width;
             content-height: content.preferred-height;
             content := VerticalLayout {
+                y: 0px;
+                opacity: 1;
+                states [
+                    entering when root.entering-page : {
+                        y: 6px;
+                        opacity: 0.78;
+                        out { animate y, opacity { duration: 140ms; easing: ease-out; } }
+                    }
+                ]
                 width: page.visible-width;
                 padding: 20px;
                 padding-top: 16px;
@@ -779,7 +810,7 @@ component Detail inherits Rectangle {
                 // Shaders: compiled, covered, damaged, out of date.
                 if root.tab == 3: VerticalLayout {
                     spacing: 20px;
-                    if !root.shaders.present: Text { text: "Checking the stored shaders…"; color: Theme.dim; font-size: 14px; }
+                    if !root.shaders.present: Text { text: "No game executable found."; color: Theme.dim; font-size: 14px; }
                     for r in root.shaders.rows: ShaderLine { check: r; }
                 }
 

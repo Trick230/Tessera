@@ -367,6 +367,21 @@ fn session_info(exe: &Path) -> (SessionInfo, (u32, Option<u32>), Option<(u64, u6
 
 /// The Shaders tab: what the driver already compiled, how much of what the
 /// game uses is covered, what is damaged and what is out of date.
+fn shader_preview(exe: &Path, can_prepare: bool, scan_gl: bool) -> ShaderState {
+    let mut rows = Vec::new();
+    if can_prepare || !scan_gl {
+        let stored = tessera_core::warm::stored(exe).shaders;
+        let value = if stored == 0 { "Nothing stored".to_string() } else { format!("{stored} stored") };
+        rows.push(ShaderRow { label: "Shader preparation".into(), value: value.into(), ..Default::default() });
+    }
+    if scan_gl {
+        let record = tessera_core::scan::scan_base(exe).and_then(|base| tessera_core::scan::record_at(&base));
+        let value = record.and_then(|r| r.glsl).map_or_else(|| "Scan available".to_string(), |n| n.to_string());
+        rows.push(ShaderRow { label: "OpenGL shaders".into(), value: value.into(), ..Default::default() });
+    }
+    ShaderState { present: true, rows: ModelRc::new(VecModel::from(rows)) }
+}
+
 fn shader_state(
     c: &ShaderCheck,
     run: Option<(u64, u64)>,
@@ -636,11 +651,21 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
     let gen = SESSION_GEN.fetch_add(1, Ordering::Relaxed) + 1;
     ui.set_session(SessionInfo::default());
     ui.set_settings(GameSettings::default());
-    ui.set_shader_state(ShaderState::default());
-    let Some(exe) = exe else { return };
+    let Some(exe) = exe else {
+        ui.set_shader_state(ShaderState::default());
+        return;
+    };
     let root = game.map(|g| g.entry.root.clone());
     let prepare = game.is_some_and(can_prepare);
     let scan_gl = game.is_some_and(can_scan_gl);
+    let cached = SHADER_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        if force {
+            views.remove(&exe);
+        }
+        views.get(&exe).cloned()
+    });
+    ui.set_shader_state(cached.unwrap_or_else(|| shader_preview(&exe, prepare, scan_gl)));
     let is_unreal = game.is_some_and(|g| matches!(g.engine, tessera_core::engine::Engine::Unreal { .. }));
     let ue_exe = is_unreal.then(|| exe.clone());
     let weak = ui.as_weak();
@@ -668,6 +693,9 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
             }
         });
         // Reads whole stores (checksums): after the session, which shows first.
+        if SESSION_GEN.load(Ordering::Relaxed) != gen {
+            return;
+        }
         let drivers: Vec<u64> = gpus
             .iter()
             .filter_map(|g| tessera_core::driver::umd_version(&g.driver_version))
@@ -677,13 +705,18 @@ fn load_session(ui: &MainWindow, st: &mut State, view_idx: i32, force: bool) {
         let disk_cache = tessera_core::driver::nvidia_game_cache(&exe);
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if SESSION_GEN.load(Ordering::Relaxed) == gen {
-                ui.set_shader_state(shader_state(&check, run, prepare, scan_gl, pak_key, disk_cache));
+                let view = shader_state(&check, run, prepare, scan_gl, pak_key, disk_cache);
+                SHADER_VIEWS.with(|views| views.borrow_mut().insert(exe, view.clone()));
+                ui.set_shader_state(view);
             }
         });
     });
 }
 
 static SESSION_GEN: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static SHADER_VIEWS: std::cell::RefCell<std::collections::HashMap<PathBuf, ShaderState>> = Default::default();
+}
 
 fn apply_view(ui: &MainWindow, st: &mut State) {
     let f = st.filter.to_lowercase();
@@ -711,6 +744,7 @@ fn refresh(ui: &MainWindow, state: &Shared, added: Option<String>) {
             let mut st = state.lock().unwrap();
             let n = games.len();
             st.games = games;
+            SHADER_VIEWS.with(|views| views.borrow_mut().clear());
             st.shown_exe = None; // a session may have been written since the last load
             if added.is_some() {
                 ui.set_selected(-1);
@@ -809,6 +843,7 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_busy(false);
             ui.set_status_text(msg.into());
+            SHADER_VIEWS.with(|views| views.borrow_mut().remove(&exe));
             // The selection may have moved while this ran: reload only this game.
             let mut st = state.lock().unwrap();
             let sel = ui.get_selected();
