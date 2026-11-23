@@ -21,7 +21,7 @@ export struct GameRow {
     blocked: bool,
     can-install: bool,
     d3d11: bool,
-    scan-shaders: bool,
+    shader-apis: [string],
     // First letter, shown when there is no icon.
     initial: string,
     // Library icon, empty when there is no image.
@@ -1178,7 +1178,7 @@ export component MainWindow inherits Window {
     callback select(int);
     callback hover-game(int);
     callback reset-safe-mode(int);
-    callback warm-shaders(int);
+    callback warm-shaders(int, string);
     callback clear-shaders(int);
     callback add-folder(bool);
     callback remove-folder(FolderSource, int);
@@ -1195,6 +1195,17 @@ export component MainWindow inherits Window {
     property <length> row-h: 40px;
     property <bool> has-sel: root.selected >= 0 && root.selected < root.games.length;
     property <GameRow> cur: root.games[root.selected];
+    property <string> shader-game: root.cur.root;
+    property <int> shader-api-count: root.cur.shader-apis.length;
+    property <int> shader-api-index: 0;
+    property <string> shader-api: root.has-sel && root.shader-api-index < root.shader-api-count
+        ? root.cur.shader-apis[root.shader-api-index] : "";
+    property <bool> prepare-shaders: root.shader-api == "D3D11" && root.cur.d3d11;
+    property <bool> scan-shaders: root.shader-api == "Vulkan" || root.shader-api == "OpenGL";
+    changed shader-game => { root.shader-api-index = 0; }
+    changed shader-api-count => {
+        if root.shader-api-index >= root.shader-api-count { root.shader-api-index = 0; }
+    }
 
     VerticalLayout {
         Rectangle {
@@ -1261,12 +1272,21 @@ export component MainWindow inherits Window {
                                 enabled: !root.busy;
                                 clicked => { root.uninstall(root.selected); }
                             }
+                            if root.has-sel && root.shader-api-count > 1: Stepper {
+                                width: 144px;
+                                model: root.cur.shader-apis;
+                                current-index <=> root.shader-api-index;
+                                enabled: !root.busy;
+                            }
                             Btn {
+                                width: 224px;
                                 flat: true;
                                 icon: "\u{E945}";
-                                text: root.has-sel && !root.cur.d3d11 && root.cur.scan-shaders ? "Scan shaders" : "Prepare shaders";
-                                enabled: root.has-sel && (root.cur.d3d11 || root.cur.scan-shaders) && !root.busy;
-                                clicked => { root.warm-shaders(root.selected); }
+                                text: root.prepare-shaders ? "Prepare D3D11 shaders"
+                                    : root.scan-shaders ? "Scan " + root.shader-api + " shaders"
+                                    : root.shader-api == "" ? "Prepare shaders" : root.shader-api + " warm-up unavailable";
+                                enabled: root.has-sel && (root.prepare-shaders || root.scan-shaders) && !root.busy;
+                                clicked => { root.warm-shaders(root.selected, root.shader-api); }
                             }
                             ToolSep { }
                             Btn {

@@ -147,6 +147,14 @@ fn status_label(s: &InstallState) -> String {
 }
 
 fn row(g: &GameInfo, icon: Option<&art::Pixels>) -> GameRow {
+    let d3d11 = can_prepare(g);
+    let mut shader_apis = g.graphics_apis().names();
+    shader_apis.sort_by_key(|api| match *api {
+        "D3D11" if d3d11 => 0,
+        "OpenGL" => 1,
+        "Vulkan" => 2,
+        _ => 3,
+    });
     let s = |v: String| SharedString::from(v);
     GameRow {
         name: s(g.entry.name.clone()),
@@ -166,10 +174,8 @@ fn row(g: &GameInfo, icon: Option<&art::Pixels>) -> GameRow {
         installed: g.install.is_installed(),
         blocked: !g.anticheat.is_empty(),
         can_install: g.can_install(),
-        d3d11: can_prepare(g),
-        scan_shaders: g.exe.is_some() && g.graphics_apis().has(
-            tessera_core::pe::ApiSet::OPENGL | tessera_core::pe::ApiSet::VULKAN,
-        ),
+        d3d11,
+        shader_apis: ModelRc::new(VecModel::from(shader_apis.into_iter().map(SharedString::from).collect::<Vec<_>>())),
         icon: icon.cloned().map(slint::Image::from_rgba8).unwrap_or_default(),
         initial: s(g.entry.name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_default()),
     }
@@ -962,13 +968,23 @@ fn payload_path(architecture: Architecture) -> PathBuf {
 /// S1 + S5: finds shader bytecode in the install files (again only when the
 /// install changed), then compiles everything stored in the driver, off the
 /// UI thread.
-fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
+fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString) {
+    use tessera_core::pe::ApiSet;
+    if ui.get_busy() {
+        return;
+    }
     let Some((exe, root, prepare, architecture, vulkan)) = ({
         let st = state.lock().unwrap();
         st.view.get(view_idx as usize).and_then(|&gi| {
             let g = &st.games[gi];
-            let vulkan = g.graphics_apis().has(tessera_core::pe::ApiSet::VULKAN);
-            g.exe.clone().map(|e| (e, g.entry.root.clone(), can_prepare(g), g.scan.architecture, vulkan))
+            let apis = g.graphics_apis();
+            let prepare = match api.as_str() {
+                "D3D11" if can_prepare(g) => true,
+                "Vulkan" if apis.has(ApiSet::VULKAN) => false,
+                "OpenGL" if apis.has(ApiSet::OPENGL) => false,
+                _ => return None,
+            };
+            g.exe.clone().map(|e| (e, g.entry.root.clone(), prepare, g.scan.architecture, apis.has(ApiSet::VULKAN)))
         })
     }) else {
         return;
@@ -977,30 +993,30 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
     ui.set_shader_progress_active(true);
     ui.set_shader_progress(-1.0);
     ui.set_shader_progress_label("".into());
-    ui.set_status_text("Preparing shaders…".into());
+    ui.set_status_text(if prepare { "Preparing D3D11 shaders…" } else { "Scanning shaders…" }.into());
     let (weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
         let status = |m: &'static str| {
             let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
         };
-        let mut found = String::new();
         let running = tessera_core::warm::is_running(&exe);
-        if !running && (!prepare || !tessera_core::scan::up_to_date(&exe, &root, vulkan)) {
+        let scan_error = if !running && (!prepare || !tessera_core::scan::up_to_date(&exe, &root, vulkan)) {
             status("Searching the game files for shaders (read only)…");
-            match scan_isolated(&exe, &root) {
-                Ok(n) => found = format!("{n} found in the files, "),
-                Err(e) => found = format!("search failed ({e}), "),
-            }
-        }
+            scan_isolated(&exe, &root).err()
+        } else {
+            None
+        };
         let stall = |s: u64| {
             let m = format!("Warming shaders: the driver has been on one shader for {s} s (left running, it may finish)…");
             let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
         };
         let msg = if !prepare {
             if running { "Close the game before scanning shaders.".to_string() }
-            else { format!("Shaders: {}", found.trim_end_matches(", ")) }
+            else if let Some(e) = scan_error { format!("{api} shader scan failed ({e}).") }
+            else { format!("{api} shader scan complete.") }
         } else {
+            let scan_status = scan_error.map(|e| format!("search failed ({e}), ")).unwrap_or_default();
             status("Warming shaders (outside the game)…");
             let helper = if architecture == Some(Architecture::X86) {
                 tessera_core::warm::WARM_EXE_X86
@@ -1023,7 +1039,7 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
                         .collect();
                     let w = tessera_core::shader_check::check(&exe, None, &drivers);
                     format!(
-                        "Shaders: {found}{} exercised, {} created only, {} pending, {} failed ({:.1} s)",
+                        "Shaders: {scan_status}{} exercised, {} created only, {} pending, {} failed ({:.1} s)",
                         w.compiled,
                         w.created_only,
                         w.pending,
@@ -1031,7 +1047,7 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
                         t0.elapsed().as_secs_f64()
                     )
                 }
-                Err(e) => format!("Shaders: {found}{e}"),
+                Err(e) => format!("Shaders: {scan_status}{e}"),
             }
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -1331,7 +1347,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());
-        ui.on_warm_shaders(move |i| warm_action(&w.unwrap(), &s, i));
+        ui.on_warm_shaders(move |i, api| warm_action(&w.unwrap(), &s, i, api));
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());
