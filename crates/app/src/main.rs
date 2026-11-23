@@ -68,20 +68,6 @@ impl ManualFolders {
             FolderSource::Legacy => &mut self.legacy,
         }
     }
-
-    fn rows(&self) -> Vec<FolderRow> {
-        [
-            (FolderSource::Game, &self.games),
-            (FolderSource::Library, &self.libraries),
-            (FolderSource::Legacy, &self.legacy),
-        ].into_iter().flat_map(|(source, paths)| {
-            paths.iter().enumerate().map(move |(index, path)| FolderRow {
-                source,
-                index: index as i32,
-                path: path.to_string_lossy().as_ref().into(),
-            })
-        }).collect()
-    }
 }
 
 fn load_folders(file: &str) -> Vec<PathBuf> {
@@ -887,7 +873,12 @@ fn refresh(ui: &MainWindow, state: &Shared, added: Option<String>) {
     let weak = ui.as_weak();
     let state = state.clone();
     let folders = state.lock().unwrap().folders.clone();
-    ui.set_manual_folders(ModelRc::new(VecModel::from(folders.rows())));
+    let folder_model = |paths: &[PathBuf]| ModelRc::new(VecModel::from(
+        paths.iter().map(|path| SharedString::from(path.to_string_lossy().as_ref())).collect::<Vec<_>>(),
+    ));
+    ui.set_game_folders(folder_model(&folders.games));
+    ui.set_library_folders(folder_model(&folders.libraries));
+    ui.set_legacy_folders(folder_model(&folders.legacy));
     std::thread::spawn(move || {
         let t = std::time::Instant::now();
         let games = tessera_core::analyze_all(tessera_core::library::discover_with_folders(

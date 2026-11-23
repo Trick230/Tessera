@@ -118,12 +118,6 @@ export struct GameSettings {
 export enum AppTheme { System, Light, Dark }
 export enum FolderSource { Game, Library, Legacy }
 
-export struct FolderRow {
-    source: FolderSource,
-    index: int,
-    path: string,
-}
-
 // Neutral greys; colour is kept for state only (ok, warning, error). The
 // mosaic tones are greys too.
 global Theme {
@@ -627,10 +621,60 @@ component OptionSwitch inherits PropRow {
     Toggle { checked: root.checked; enabled: root.enabled; toggled => { root.changed(self.checked); } }
 }
 
+component FolderList inherits VerticalLayout {
+    in property <string> title;
+    in property <string> add-label;
+    in property <string> add-icon;
+    in property <string> empty-label;
+    in property <[string]> folders;
+    in property <bool> busy;
+    callback add();
+    callback remove(int);
+
+    spacing: 10px;
+    Text { text: root.title; font-size: 17px; font-weight: 600; color: Theme.text; }
+    if root.add-label != "": HorizontalLayout {
+        alignment: start;
+        Btn {
+            icon: root.add-icon;
+            text: root.add-label;
+            enabled: !root.busy;
+            clicked => { root.add(); }
+        }
+    }
+    if root.folders.length == 0: Text { text: root.empty-label; font-size: 14px; color: Theme.dim; }
+    for folder[index] in root.folders: VerticalLayout {
+        HorizontalLayout {
+            padding-top: 4px;
+            padding-bottom: 9px;
+            spacing: 12px;
+            Text {
+                text: folder;
+                font-size: 14px;
+                color: Theme.text;
+                wrap: char-wrap;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            VerticalLayout {
+                alignment: center;
+                Btn {
+                    text: "Remove";
+                    enabled: !root.busy;
+                    clicked => { root.remove(index); }
+                }
+            }
+        }
+        Hairline { }
+    }
+}
+
 component AppSettings inherits ScrollView {
     in property <AppTheme> theme;
     in-out property <bool> start-with-windows;
-    in property <[FolderRow]> folders;
+    in property <[string]> game-folders;
+    in property <[string]> library-folders;
+    in property <[string]> legacy-folders;
     in property <bool> busy;
     callback theme-changed(AppTheme);
     callback startup-changed(bool);
@@ -667,53 +711,31 @@ component AppSettings inherits ScrollView {
                 }
             }
         }
-        VerticalLayout {
-            spacing: 10px;
-            Text { text: "Game folders"; font-size: 17px; font-weight: 600; color: Theme.text; }
-            HorizontalLayout {
-                alignment: start;
-                spacing: 8px;
-                Btn {
-                    icon: "\u{E8F4}";
-                    text: "Add game folder";
-                    enabled: !root.busy;
-                    clicked => { root.add-folder(false); }
-                }
-                Btn {
-                    icon: "\u{E8B7}";
-                    text: "Add library folder";
-                    enabled: !root.busy;
-                    clicked => { root.add-folder(true); }
-                }
-            }
-            if root.folders.length == 0: Text { text: "No folders added manually."; font-size: 14px; color: Theme.dim; }
-            for folder in root.folders: VerticalLayout {
-                HorizontalLayout {
-                    padding-top: 4px;
-                    padding-bottom: 9px;
-                    spacing: 12px;
-                    VerticalLayout {
-                        spacing: 3px;
-                        horizontal-stretch: 1;
-                        Text { text: folder.path; font-size: 14px; color: Theme.text; wrap: char-wrap; }
-                        Text {
-                            text: folder.source == FolderSource.Game ? "Game folder" :
-                                folder.source == FolderSource.Library ? "Library folder" : "Previously added folder";
-                            font-size: 13px;
-                            color: Theme.dim;
-                        }
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        Btn {
-                            text: "Remove";
-                            enabled: !root.busy;
-                            clicked => { root.remove-folder(folder.source, folder.index); }
-                        }
-                    }
-                }
-                Hairline { }
-            }
+        FolderList {
+            title: "Game folders";
+            add-label: "Add game folder";
+            add-icon: "\u{E8F4}";
+            empty-label: "No game folders added.";
+            folders: root.game-folders;
+            busy: root.busy;
+            add => { root.add-folder(false); }
+            remove(index) => { root.remove-folder(FolderSource.Game, index); }
+        }
+        FolderList {
+            title: "Library folders";
+            add-label: "Add library folder";
+            add-icon: "\u{E8B7}";
+            empty-label: "No library folders added.";
+            folders: root.library-folders;
+            busy: root.busy;
+            add => { root.add-folder(true); }
+            remove(index) => { root.remove-folder(FolderSource.Library, index); }
+        }
+        if root.legacy-folders.length > 0: FolderList {
+            title: "Previously added folders";
+            folders: root.legacy-folders;
+            busy: root.busy;
+            remove(index) => { root.remove-folder(FolderSource.Legacy, index); }
         }
     }
 }
@@ -1136,7 +1158,9 @@ export component MainWindow inherits Window {
     in property <GameSettings> settings;
     in property <ShaderState> shader-state;
     in property <AppTheme> app-theme;
-    in property <[FolderRow]> manual-folders;
+    in property <[string]> game-folders;
+    in property <[string]> library-folders;
+    in property <[string]> legacy-folders;
     in property <bool> dark-theme: true;
     in-out property <bool> start-with-windows;
     property <bool> show-app-settings;
@@ -1219,8 +1243,6 @@ export component MainWindow inherits Window {
                             padding-bottom: 4px;
                             spacing: 2px;
                             alignment: start;
-                            Btn { flat: true; icon: "\u{E8F4}"; text: "Add game folder"; enabled: !root.busy; clicked => { root.add-folder(false); } }
-                            Btn { flat: true; icon: "\u{E8B7}"; text: "Add library folder"; enabled: !root.busy; clicked => { root.add-folder(true); } }
                             Btn { flat: true; icon: "\u{E72C}"; text: "Refresh"; enabled: !root.busy; clicked => { root.refresh(); } }
                             ToolSep { }
                             if !root.has-sel || !root.cur.installed: Btn {
@@ -1328,7 +1350,9 @@ export component MainWindow inherits Window {
                 width: parent.width;
                 height: parent.height;
                 theme: root.app-theme;
-                folders: root.manual-folders;
+                game-folders: root.game-folders;
+                library-folders: root.library-folders;
+                legacy-folders: root.legacy-folders;
                 busy: root.busy;
                 start-with-windows <=> root.start-with-windows;
                 theme-changed(theme) => { root.app-theme-changed(theme); }
