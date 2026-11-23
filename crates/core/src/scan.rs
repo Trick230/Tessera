@@ -881,7 +881,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 12 {:016x}", key.finish())
+    format!("tessera-scan 13 {:016x}", key.finish())
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -1113,12 +1113,21 @@ mod tests {
         let dxbc = signed(0x0000_0050);
         let mut dxil = signed(0x0000_0060);
         dxil[36..40].copy_from_slice(b"DXIL");
-        let stored = [lz4_flex::block::compress(&dxbc), lz4_flex::block::compress(&dxil)];
-        let stored_len = stored[0].len() as u32;
+        // SMOL-V representation of a minimal Vulkan compute module.
+        let smolv = [
+            0x4c, 0x4f, 0x4d, 0x53, 0, 0, 1, 1, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0,
+            0x8c, 0, 0, 0, 0x91, 2, 1, 0xa0, 4, 0, 1, 0xcf, 0x0e, 5, 3, 0xed, 0xc2,
+            0xa5, 0xf3, 6, 0, 0xd0, 2, 3, 0x11, 1, 1, 1, 0x93, 2, 2, 0xa1, 4, 2, 1,
+            0xc6, 6, 1, 2, 0, 2, 0x18, 2, 0x8d, 0x1e, 0x88, 6,
+        ];
+        let programs = [dxbc.as_slice(), &dxil, &smolv];
+        let stored = programs.map(lz4_flex::block::compress);
         let mut shader = vec![0; 12]; // Empty name and part of the ShaderLab data.
-        for word in [1, 4, 1, 2, 0, stored_len, 1, 2, stored_len, stored[1].len() as u32,
-                     1, 2, dxbc.len() as u32, dxil.len() as u32,
-                     stored_len + stored[1].len() as u32] {
+        let lengths = stored.each_ref().map(|segment| segment.len() as u32);
+        for word in [1, 4, 1, 3, 0, lengths[0], lengths[0] + lengths[1],
+                     1, 3, lengths[0], lengths[1], lengths[2],
+                     1, 3, dxbc.len() as u32, dxil.len() as u32, smolv.len() as u32,
+                     lengths.iter().sum()] {
             shader.extend_from_slice(&word.to_le_bytes());
         }
         for segment in stored { shader.extend_from_slice(&segment); }
@@ -1156,6 +1165,7 @@ mod tests {
         let (shaders, stats) = scan_dir(dir.path());
         assert_eq!((stats.unity_shader_objects, stats.unreadable_unity_shader_objects), (2, 1));
         assert_eq!(stats.dxil, 1);
+        assert_eq!(stats.spirv, 1);
         assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
     }
 

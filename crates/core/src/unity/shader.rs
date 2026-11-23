@@ -185,6 +185,10 @@ impl SerializedFile {
 }
 
 impl ShaderLayout {
+    pub(super) fn legacy_smolv(self) -> bool {
+        self.version < (2021, 1)
+    }
+
     pub(super) fn scan(
         self,
         data: &[u8],

@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 mod shader;
+mod smolv;
 
 pub(crate) fn graphics_apis(exe: &Path) -> Option<ApiSet> {
     let mut data_dir = exe.file_stem()?.to_os_string();
@@ -299,10 +300,18 @@ fn scan_serialized(
     let (layout, objects) = index?;
     let found = objects.len() as u64;
     let mut failed = 0;
+    let mut spirv = Vec::new();
     for (offset, size) in objects {
         let mut complete = false;
         read(offset, size, &mut |bytes| {
-            complete = layout.scan(bytes, decoded, |code| visit(code, true)).is_some();
+            complete = layout.scan(bytes, decoded, |code| {
+                visit(code, true);
+                for start in memchr::memmem::find_iter(code, smolv::MAGIC) {
+                    if smolv::decode(&code[start..], layout.legacy_smolv(), &mut spirv).is_some() {
+                        visit(&spirv, true);
+                    }
+                }
+            }).is_some();
         });
         failed += u64::from(!complete);
     }
