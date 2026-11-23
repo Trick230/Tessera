@@ -475,7 +475,7 @@ fn shader_state(
                 let source = match source {
                     PakKeySource::Environment => "Environment variable",
                     PakKeySource::LinkedFile => "Linked file",
-                    PakKeySource::ScsKiller => "Detected automatically in SCSKiller",
+                    PakKeySource::ScsKiller => "Key file detected automatically.",
                 };
                 ("Available", source, OK)
             }
@@ -520,7 +520,7 @@ fn shader_state(
         ("Unconfirmed".to_string(), NEUTRAL)
     };
     if c.compiled > 0 {
-        d.push(format!("D3D11 warm-up confirmed {} with a test draw or dispatch on the current driver.", c.compiled));
+        d.push(format!("The last D3D11 warm-up confirmed {} with a test draw or dispatch on the current driver.", c.compiled));
     }
     if cache.is_none() && c.stored == 0 && (can_prepare || !scan_gl) {
         d.push(if can_prepare {
@@ -538,17 +538,19 @@ fn shader_state(
     if c.pending > 0 || c.failed > 0 {
         d.push(format!("{} pending, {} failed.", c.pending, c.failed));
     }
-    if let Some(n) = c.unsupported_in_install.filter(|&n| n > 0) {
-        d.push(format!("The file scan also found {n} containers outside D3D11 warm-up support."));
-    }
-    if c.unreal_packages > 0 {
-        d.push(format!("Searched {} Unreal packages.", c.unreal_packages));
-    }
-    if c.locked_unreal_paks > 0 {
-        d.push(format!("{} encrypted Unreal PAKs could not be opened.", c.locked_unreal_paks));
-    }
-    if c.unreadable_unreal_packages > 0 {
-        d.push(format!("{} Unreal packages could not be decoded.", c.unreadable_unreal_packages));
+    if c.scan_outdated == Some(false) {
+        if let Some(n) = c.unsupported_in_install.filter(|&n| n > 0) {
+            d.push(format!("The file scan also found {n} containers outside D3D11 warm-up support."));
+        }
+        if c.unreal_packages > 0 {
+            d.push(format!("Searched {} Unreal packages.", c.unreal_packages));
+        }
+        if c.locked_unreal_paks > 0 {
+            d.push(format!("{} encrypted Unreal PAKs could not be opened.", c.locked_unreal_paks));
+        }
+        if c.unreadable_unreal_packages > 0 {
+            d.push(format!("{} Unreal packages could not be decoded.", c.unreadable_unreal_packages));
+        }
     }
     rows.push(line("Compiled shaders", value, d, tone));
 
@@ -579,7 +581,7 @@ fn shader_state(
     if c.failed > 0 {
         d.push(format!("The driver refused {} in the warm-up.", c.failed));
     }
-    let bad_files = c.bad_in_install.unwrap_or(0);
+    let bad_files = if c.scan_outdated == Some(false) { c.bad_in_install.unwrap_or(0) } else { 0 };
     if bad_files > 0 {
         d.push(format!("{bad_files} shaders in the game files fail their checksum; the search leaves them out."));
     }
@@ -590,10 +592,11 @@ fn shader_state(
     }
     rows.push(line("Damaged", value, d, tone));
 
-    // Out of date: game updated since the search, driver updated since the warm-up.
+    // Scan freshness and driver compatibility can change independently.
     let mut d = Vec::new();
     if c.scan_outdated == Some(true) {
-        d.push("The game changed since its files were searched; Prepare shaders searches them again.".to_string());
+        let action = if !can_prepare && scan_gl { "Scan shaders" } else { "Prepare shaders" };
+        d.push(format!("Run {action} to refresh the game file scan."));
     }
     if c.old_driver > 0 {
         d.push(format!("{} were compiled with an older driver and must be compiled again.", c.old_driver));
@@ -604,7 +607,7 @@ fn shader_state(
     } else if c.old_driver > 0 {
         "Driver updated"
     } else {
-        "Game updated"
+        "Scan out of date"
     };
     if tone == OK {
         if c.scan_outdated == Some(false) {
