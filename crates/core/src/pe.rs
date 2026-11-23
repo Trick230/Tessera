@@ -45,6 +45,8 @@ const DLLS: [(&str, u8, &str); 6] = [
     ("opengl32.dll", ApiSet::OPENGL, "OpenGL"),
 ];
 const D3D9_CREATORS: [&[u8]; 2] = [b"Direct3DCreate9\0", b"Direct3DCreate9Ex\0"];
+// Local copies of these Windows graphics DLLs can be mod or overlay proxies.
+const SYSTEM_GRAPHICS_DLLS: [&str; 2] = ["dxgi.dll", "dwrite.dll"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
@@ -77,23 +79,36 @@ fn map_binary(path: &Path) -> io::Result<memmap2::Mmap> {
 pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
     let (mut scan, mut pending) = scan_binary(&map_binary(path)?);
     let mut linked = scan.imported;
+    let mut modern_renderer = scan.all().has(ApiSet::D3D11 | ApiSet::D3D12 | ApiSet::VULKAN);
+    let mut sdl_d3d9 = false;
     let mut seen = HashSet::new();
     while let Some(name) = pending.pop() {
         let dll = Path::new(&name);
         if !dll.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
             || dll.file_name() != Some(dll.as_os_str())
             || DLLS.iter().any(|(api, _, _)| name.eq_ignore_ascii_case(api))
+            || SYSTEM_GRAPHICS_DLLS.iter().any(|system| name.eq_ignore_ascii_case(system))
             || !seen.insert(name.to_ascii_lowercase())
         {
             continue;
         }
         let Ok(data) = map_binary(&path.with_file_name(dll)) else { continue };
-        let (dependency, imports) = scan_binary(&data);
+        let (mut dependency, imports) = scan_binary(&data);
         if dependency.architecture == scan.architecture {
+            // SDL has D3D9 code for display probing and its own optional 2D renderer.
+            if ["sdl2.dll", "sdl3.dll"].iter().any(|sdl| name.eq_ignore_ascii_case(sdl)) {
+                sdl_d3d9 |= dependency.referenced.has(ApiSet::D3D9);
+                dependency.referenced.0 &= !ApiSet::D3D9;
+            } else {
+                modern_renderer |= dependency.all().has(ApiSet::D3D11 | ApiSet::D3D12 | ApiSet::VULKAN);
+            }
             linked.0 |= dependency.imported.0;
             scan.referenced.0 |= dependency.all().0;
             pending.extend(imports);
         }
+    }
+    if sdl_d3d9 && !modern_renderer {
+        scan.referenced.0 |= ApiSet::D3D9;
     }
     Ok(prefer_linked_direct3d(scan, linked))
 }

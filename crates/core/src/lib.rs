@@ -25,6 +25,7 @@ pub mod shader_check;
 pub mod shaders;
 pub mod streams;
 pub mod uecvars;
+mod unity;
 pub mod warm;
 
 pub use game::{analyze, analyze_all, GameInfo};

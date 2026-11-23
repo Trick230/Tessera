@@ -15,7 +15,6 @@ pub struct GameInfo {
     pub exe: Option<PathBuf>,
     pub scan: ExeScan,
     pub engine: Engine,
-    unity_last_api: Option<&'static str>,
     pub anticheat: Vec<String>,
     /// xxh3-128 of the main executable; keys every cache of this game.
     pub exe_hash: Option<u128>,
@@ -29,10 +28,6 @@ impl GameInfo {
 
     /// Short API description for the UI, e.g. "D3D12, D3D11 (-dx11)".
     pub fn api_label(&self) -> String {
-        if self.engine == Engine::Unity {
-            return self.unity_last_api
-                .map_or_else(|| "Unknown API".into(), |name| format!("{name} (last run)"));
-        }
         let all = self.scan.all();
         if all.is_empty() {
             return "Unknown API".into();
@@ -57,12 +52,10 @@ pub fn analyze(entry: GameEntry) -> GameInfo {
         Some(p) => (pe::scan_exe(p).unwrap_or_default(), hash_file(p).ok()),
         None => (ExeScan::default(), None),
     };
-    // Unity launchers can leave all graphics API references in the player DLL.
-    if let (Engine::Unity, Some(p), Some(architecture)) = (engine, exe.as_deref(), scan.architecture) {
-        if let Some(player) = pe::scan_exe(&p.with_file_name("UnityPlayer.dll")).ok()
-            .filter(|player| player.architecture == Some(architecture))
-        {
-            scan.referenced.0 |= player.all().0;
+    if let (Engine::Unity, Some(p)) = (engine, exe.as_deref()) {
+        if let Some(apis) = crate::unity::graphics_apis(p) {
+            scan.imported = ApiSet::default();
+            scan.referenced = apis;
         }
     }
     // FFVIII Remastered's bootstrap loads its locale-specific OpenGL renderer.
@@ -80,7 +73,6 @@ pub fn analyze(entry: GameEntry) -> GameInfo {
         .unwrap_or(InstallState::NotInstalled);
     GameInfo {
         engine,
-        unity_last_api: if engine == Engine::Unity { exe.as_deref().and_then(engine::unity_last_api) } else { None },
         anticheat: crate::anticheat::detect(&entry.root),
         entry,
         exe,
@@ -253,7 +245,34 @@ mod tests {
     }
 
     #[test]
-    fn unity_detects_graphics_api_in_player_dll() {
+    fn graphics_proxy_dependencies_do_not_add_renderers() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("Game.exe");
+        let mut executable = pe64_importing("DWrite.dll");
+        executable.extend_from_slice(b"D3D11CreateDevice\0");
+        std::fs::write(&exe, executable).unwrap();
+        std::fs::write(t.path().join("dwrite.dll"), pe64_importing("d3d12.dll")).unwrap();
+        assert_eq!(pe::scan_exe(&exe).unwrap().all(), ApiSet(ApiSet::D3D11));
+    }
+
+    #[test]
+    fn sdl_d3d9_probes_do_not_add_a_backend_to_a_modern_renderer() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("Game.exe");
+        let mut executable = pe64_importing("SDL3.dll");
+        let mut windowing = minimal_pe64();
+        windowing.extend_from_slice(b"Direct3DCreate9\0");
+        std::fs::write(t.path().join("SDL3.dll"), windowing).unwrap();
+        std::fs::write(&exe, &executable).unwrap();
+        assert_eq!(pe::scan_exe(&exe).unwrap().all(), ApiSet(ApiSet::D3D9));
+
+        executable.extend_from_slice(b"D3D12CreateDevice\0vkCreateGraphicsPipelines\0");
+        std::fs::write(&exe, executable).unwrap();
+        assert_eq!(pe::scan_exe(&exe).unwrap().all(), ApiSet(ApiSet::D3D12 | ApiSet::VULKAN));
+    }
+
+    #[test]
+    fn unity_uses_the_graphics_apis_configured_for_the_build() {
         let t = tempfile::tempdir().unwrap();
         let root = t.path();
         let mut pe = minimal_pe64();
@@ -261,16 +280,49 @@ mod tests {
         pe.extend_from_slice(b"D3D11CreateDevice\0D3D12CreateDevice\0vkCreateGraphicsPipelines\0");
         std::fs::write(root.join("UnityPlayer.dll"), &pe).unwrap();
 
-        let game = analyze(GameEntry {
+        let entry = GameEntry {
             name: "Game".into(),
             root: root.to_path_buf(),
             store: Store::Manual,
             exe_hint: None,
             steam_appid: None,
-        });
+        };
+        assert_eq!(analyze(entry.clone()).api_label(), "Unknown API");
+
+        let version = b"2022.3.54f1\0";
+        let mut settings = Vec::new();
+        settings.extend_from_slice(&11u32.to_le_bytes());
+        settings.extend_from_slice(version);
+        // Some Unity versions store the auth token between the version and API array.
+        settings.extend_from_slice(&4u32.to_le_bytes());
+        settings.extend_from_slice(b"test");
+        for value in [2u32, 2, 21] {
+            settings.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut metadata = version.to_vec();
+        metadata.extend_from_slice(&[0; 5]); // Build target and type tree flag.
+        metadata.extend_from_slice(&1u32.to_le_bytes()); // One serialized type.
+        metadata.extend_from_slice(&141u32.to_le_bytes()); // BuildSettings class ID.
+        metadata.extend_from_slice(&[0; 19]);
+        metadata.extend_from_slice(&1u32.to_le_bytes()); // One object.
+        metadata.resize(metadata.len().next_multiple_of(4), 0);
+        metadata.extend_from_slice(&[0; 16]); // Path ID and offset into the data section.
+        metadata.extend_from_slice(&(settings.len() as u32).to_le_bytes());
+        metadata.extend_from_slice(&0u32.to_le_bytes()); // Type index.
+
+        let mut managers = vec![0; 48];
+        managers[8..12].copy_from_slice(&22u32.to_be_bytes());
+        managers[20..24].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+        managers[32..40].copy_from_slice(&(48 + metadata.len() as u64).to_be_bytes());
+        managers.extend_from_slice(&metadata);
+        managers.extend_from_slice(&settings);
+        let data_dir = root.join("Game_Data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("globalgamemanagers"), managers).unwrap();
+
+        let game = analyze(entry);
         assert_eq!(game.engine, Engine::Unity);
-        assert_eq!(game.api_label(), "Unknown API");
-        assert!(game.scan.all().has(ApiSet::D3D11));
+        assert_eq!(game.api_label(), "D3D11, Vulkan");
         assert!(game.can_install());
     }
 
