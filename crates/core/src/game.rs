@@ -4,7 +4,7 @@
 
 use crate::engine::{self, Engine};
 use crate::install::{self, InstallState};
-use crate::library::{GameEntry, Store};
+use crate::library::GameEntry;
 use crate::pe::{self, ApiSet, ExeScan};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -37,15 +37,11 @@ impl GameInfo {
         if all.is_empty() {
             return "Unknown API".into();
         }
-        let names = all.names();
-        if self.entry.store == Store::Recomp && names.len() > 1 {
-            return format!("{} (detected)", names.join(", "));
-        }
         // Unreal ships D3D12 and D3D11 RHIs; D3D11 is picked with -dx11.
         if matches!(self.engine, Engine::Unreal { .. }) && all.has(ApiSet::D3D12) && all.has(ApiSet::D3D11) {
             return "D3D12, D3D11 (-dx11)".into();
         }
-        names.join(", ")
+        all.names().join(", ")
     }
 
     /// Phase 0 layer only supports D3D11, and never with anti-cheat.
@@ -168,6 +164,7 @@ pub fn find_main_exe(root: &Path, hint: Option<&Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::Store;
 
     fn touch(p: &Path, size: usize) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -298,7 +295,7 @@ mod tests {
         assert_eq!(analyze(entry.clone()).api_label(), "Unknown API");
 
         std::fs::write(&exe, pe64_importing("Renderer.dll")).unwrap();
-        assert_eq!(analyze(entry).api_label(), "D3D12, Vulkan (detected)");
+        assert_eq!(analyze(entry).api_label(), "D3D12, Vulkan");
     }
 
     #[test]
