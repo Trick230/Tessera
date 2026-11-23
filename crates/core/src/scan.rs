@@ -512,6 +512,32 @@ impl Found {
         false
     }
 
+    fn search_unity_web(&mut self, bytes: &[u8]) -> bool {
+        let Some(entries) = crate::unity::web_entries(bytes) else { return false };
+        for entry in entries {
+            if !self.search_unity(entry) {
+                self.search(entry, 0);
+            }
+        }
+        true
+    }
+
+    fn search_compressed_unity_web(&mut self, path: &Path, bytes: &[u8]) -> bool {
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_ascii_lowercase();
+        let unity_web = name.ends_with(".data.gz") || name.ends_with(".data.br") || name.ends_with(".unityweb");
+        let brotli_comment = b"UnityWeb Compressed Content (brotli)";
+        let mut decoded = Vec::new();
+        let result = if unity_web && bytes.starts_with(b"\x1f\x8b\x08") {
+            flate2::read::MultiGzDecoder::new(bytes).take(STREAM_CAP + 1).read_to_end(&mut decoded)
+        } else if name.ends_with(".data.br") ||
+            memchr::memmem::find(&bytes[..bytes.len().min(64)], brotli_comment).is_some() {
+            brotli_decompressor::Decompressor::new(bytes, 8192).take(STREAM_CAP + 1).read_to_end(&mut decoded)
+        } else {
+            return false;
+        };
+        result.is_ok() && decoded.len() as u64 <= STREAM_CAP && self.search_unity_web(&decoded)
+    }
+
     fn record(&mut self, c: &Container, code: &[u8]) -> bool {
         let entries = if c.d3d11() { &mut self.shaders } else { &mut self.d3d12 };
         if entries.contains_key(&c.hash) {
@@ -800,14 +826,8 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
     f.stats.unreal_shaders_expected += pak.expected_shaders;
     f.stats.unreal_libraries_unreadable += pak.unreadable_libraries;
     let apk = map.starts_with(b"ENDILTLE") && f.search_apk(&map);
-    let unity = if let Some(entries) = crate::unity::web_entries(&map) {
-        for entry in entries {
-            if !f.search_unity(entry) { f.search(entry, 0); }
-        }
-        true
-    } else {
-        f.search_unity(&map)
-    };
+    let unity = f.search_unity_web(&map) || f.search_unity(&map)
+        || f.search_compressed_unity_web(path, &map);
     if (!pak.opened || pak.unreadable > 0) && !apk && !unity {
         f.search(&map, 0);
     }
@@ -960,7 +980,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 19 {:016x}", key.finish())
+    format!("tessera-scan 20 {:016x}", key.finish())
 }
 
 fn external_oodle() -> Option<PathBuf> {
@@ -1200,7 +1220,10 @@ mod tests {
         }
         web_data.extend_from_slice(entry);
         web_data.extend_from_slice(&bundle);
-        fs::write(dir.path().join("modern.data"), web_data).unwrap();
+        fs::write(dir.path().join("modern.data"), &web_data).unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&web_data).unwrap();
+        fs::write(dir.path().join("modern.data.gz"), gzip.finish().unwrap()).unwrap();
 
         let mut assets = 1u32.to_be_bytes().to_vec();
         string(&mut assets, b"legacy.assets");
@@ -1225,7 +1248,7 @@ mod tests {
         }
 
         let (shaders, stats) = scan_dir(dir.path());
-        assert_eq!((stats.unity_entries, stats.unreadable_unity_entries), (3, 0));
+        assert_eq!((stats.unity_entries, stats.unreadable_unity_entries), (4, 0));
         assert_eq!(stats.dxil, 1);
         assert_eq!(shaders.iter().map(|s| s.hash).collect::<Vec<_>>(), [hash_of(&dxbc)]);
     }
