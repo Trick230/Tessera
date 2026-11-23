@@ -347,19 +347,25 @@ impl Found {
         for i in 0..archive.len() {
             let Ok(entry) = archive.by_index(i) else { continue };
             let size = entry.size();
-            let spirv = is_spv_path(Path::new(entry.name()));
-            let stored = entry.compression() == zip::CompressionMethod::Stored;
-            if !entry.is_file() || (stored && !spirv) || !(MIN_FILE..=STREAM_CAP).contains(&size) {
+            if !entry.is_file() || size < MIN_FILE {
                 continue;
             }
-            out.clear();
-            if entry.take(size + 1).read_to_end(&mut out).is_ok() && out.len() as u64 == size {
-                if spirv {
-                    self.record_spirv(&out);
+            if entry.compression() == zip::CompressionMethod::Stored {
+                // Unity APKs can store large assets directly in the ZIP.
+                let Some(start) = entry.data_start().and_then(|offset| usize::try_from(offset).ok())
+                    else { continue };
+                let Ok(size) = usize::try_from(size) else { continue };
+                if size as u64 != entry.compressed_size() { continue; }
+                if let Some(bytes) = data.get(start..start.saturating_add(size)) {
+                    self.record_spirv(bytes);
+                    self.search_unity(bytes);
                 }
-                if !stored {
+            } else if size <= STREAM_CAP {
+                out.clear();
+                if entry.take(size + 1).read_to_end(&mut out).is_ok() && out.len() as u64 == size {
                     self.stats.zip_entries += 1;
-                    self.search(&out, 1);
+                    self.record_spirv(&out);
+                    if !self.search_unity(&out) { self.search(&out, 1); }
                 }
             }
         }
@@ -842,7 +848,8 @@ pub fn scan_dir(dir: &Path) -> (Vec<Shader>, ScanStats) {
 
 fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
               detected: Option<&crate::unreal_key::DetectedKeys>) -> Found {
-    let oodle = oodle::find(dir).and_then(|p| oodle::load(&p));
+    let oodle = oodle::find(dir).and_then(|p| oodle::load(&p))
+        .or_else(|| external_oodle().and_then(|p| oodle::load(&p)));
     // Each thread may hold a few STREAM_CAP buffers (a stream and the streams
     // inside it), so the thread count bounds the scan's memory.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(SCAN_THREADS);
@@ -941,12 +948,23 @@ fn install_key(exe: &Path, root: &Path) -> String {
         path.hash(&mut key);
         fs::metadata(path).ok().and_then(|meta| meta.modified().ok()).hash(&mut key);
     }
+    if let Some(path) = external_oodle() {
+        path.hash(&mut key);
+        if let Ok(meta) = fs::metadata(path) {
+            meta.len().hash(&mut key);
+            meta.modified().ok().hash(&mut key);
+        }
+    }
     for (p, len, modified) in files {
         p.strip_prefix(root).unwrap_or(&p).hash(&mut key);
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 18 {:016x}", key.finish())
+    format!("tessera-scan 19 {:016x}", key.finish())
+}
+
+fn external_oodle() -> Option<PathBuf> {
+    std::env::var_os("TESSERA_OODLE_DLL").filter(|p| !p.is_empty()).map(PathBuf::from)
 }
 
 fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
@@ -1290,7 +1308,7 @@ mod tests {
         serialized.extend_from_slice(&shader);
         serialized.extend_from_slice(&[255; 4]); // Malformed Shader object.
         serialized.extend_from_slice(&compute);
-        fs::write(dir.path().join("globalgamemanagers.assets"), serialized).unwrap();
+        fs::write(dir.path().join("globalgamemanagers.assets"), &serialized).unwrap();
 
         let (found, entries) = exported(dir.path());
         let stats = found.stats;
@@ -1303,6 +1321,21 @@ mod tests {
         assert_eq!(entries[&format!("d3d12/{:016x}.dxil", hash_of(&dxil))], dxil);
         let spv: Vec<_> = spirv_compute_fixture().into_iter().flat_map(u32::to_le_bytes).collect();
         assert_eq!(entries[&format!("vulkan/{:032x}.spv", xxhash_rust::xxh3::xxh3_128(&spv))], spv);
+
+        let apk = tempfile::tempdir().unwrap();
+        let file = fs::File::create(apk.path().join("player.apk")).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, method) in [("stored", zip::CompressionMethod::Stored),
+                               ("deflated", zip::CompressionMethod::Deflated)] {
+            zip.start_file(format!("assets/bin/Data/{name}"), zip::write::SimpleFileOptions::default()
+                .compression_method(method)).unwrap();
+            zip.write_all(&serialized).unwrap();
+        }
+        zip.finish().unwrap();
+        let (packaged, packaged_entries) = exported(apk.path());
+        assert_eq!(packaged.stats.unity_shader_objects, 6);
+        assert_eq!(packaged.stats.unreadable_unity_shader_objects, 2);
+        assert_eq!(packaged_entries, entries);
     }
 
     fn spirv_compute_fixture() -> [u32; 35] {
