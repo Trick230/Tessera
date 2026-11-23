@@ -25,6 +25,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "tessera/shader_store_format.h"
@@ -236,6 +237,24 @@ struct Warm {
     ID3D11Buffer* args = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
     std::unordered_map<std::string, ID3D11VertexShader*> feeders;  // PS input signature -> generated VS
+    struct VertexSource {
+        const Shader* shader;
+        std::vector<SigElem> outputs;
+    };
+    std::vector<VertexSource> vertex_sources;
+
+    void index_vertex_sources(const std::vector<Shader>& shaders) {
+        for (const Shader& shader : shaders) {
+            if (shader.stage != TESSERA_STAGE_VS || (shader.flags & TESSERA_SHADER_DXIL)) continue;
+            VertexSource source{&shader, {}};
+            if (!signature(shader.code, shader.size, "OSGN", "OSG1", &source.outputs)) continue;
+            for (const SigElem& output : source.outputs) {
+                if (output.sv != 1) continue;
+                vertex_sources.push_back(std::move(source));
+                break;
+            }
+        }
+    }
 
     bool init() {
         // The high-performance GPU: on hybrid laptops adapter 0 is the iGPU,
@@ -347,7 +366,8 @@ struct Warm {
             if (system_generated(e.sv) || !(e.mask & 0xF)) continue;
             bool ok = false;
             for (const SigElem& o : out)
-                ok = ok || (o.index == e.index && o.reg == e.reg && (o.mask & 0xF) == (e.mask & 0xF) &&
+                ok = ok || (o.index == e.index && o.reg == e.reg && o.type == e.type &&
+                            (o.mask & e.mask & 0xF) == (e.mask & 0xF) &&
                             _stricmp(o.name.c_str(), e.name.c_str()) == 0);
             if (!ok) return false;
         }
@@ -366,6 +386,36 @@ struct Warm {
         ID3D11InputLayout* il = nullptr;
         if (n) dev->CreateInputLayout(e, n, s.code, s.size, &il);
         return il;
+    }
+
+    // The generated feeder cannot reproduce every register packing. Reuse a
+    // compatible game vertex shader when the store already contains one.
+    bool draw_pixel_with_game_vertex(const std::vector<SigElem>& inputs, ID3D11PixelShader* ps) {
+        for (const VertexSource& source : vertex_sources) {
+            if (!links(source.outputs, inputs)) continue;
+            const Shader& shader = *source.shader;
+            std::vector<SigElem> vertex_inputs;
+            if (!signature(shader.code, shader.size, "ISGN", "ISG1", &vertex_inputs)) continue;
+            ID3D11InputLayout* il = layout(shader, vertex_inputs);
+            if (!il) {
+                bool needs_layout = false;
+                for (const SigElem& input : vertex_inputs)
+                    needs_layout = needs_layout || (input.sv == 0 && components(input.mask) != 0);
+                if (needs_layout) continue;
+            }
+            ID3D11VertexShader* vs = nullptr;
+            const HRESULT hr = dev->CreateVertexShader(shader.code, shader.size, nullptr, &vs);
+            if (SUCCEEDED(hr)) {
+                ctx->IASetInputLayout(il);
+                ctx->VSSetShader(vs, nullptr, 0);
+                ctx->PSSetShader(ps, nullptr, 0);
+                draw();
+                vs->Release();
+            }
+            if (il) il->Release();
+            if (SUCCEEDED(hr)) return true;
+        }
+        return false;
     }
 
     // The log word for one shader: "ok" created and used in a draw/dispatch,
@@ -410,6 +460,8 @@ struct Warm {
                         ctx->PSSetShader(ps, nullptr, 0);
                         draw();
                         used = true;
+                    } else {
+                        used = draw_pixel_with_game_vertex(in, ps);
                     }
                 }
                 ps->Release();
@@ -475,6 +527,7 @@ int wmain(int argc, wchar_t** argv) {
         fprintf(stderr, "no D3D11 device\n");
         return 1;
     }
+    w.index_vertex_sources(shaders);
     Log log;
     const wchar_t* peer = argc > 2 ? argv[2] : nullptr;
     const bool retry = argc > 3 && wcscmp(argv[3], L"--retry-failed") == 0;
