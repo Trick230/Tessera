@@ -45,8 +45,8 @@ const DLLS: [(&str, u8, &str); 6] = [
     ("opengl32.dll", ApiSet::OPENGL, "OpenGL"),
 ];
 const D3D9_CREATORS: [&[u8]; 2] = [b"Direct3DCreate9\0", b"Direct3DCreate9Ex\0"];
-// Local copies of these Windows graphics DLLs can be mod or overlay proxies.
-const SYSTEM_GRAPHICS_DLLS: [&str; 2] = ["dxgi.dll", "dwrite.dll"];
+// Local copies of these Windows DLLs can be mod or overlay proxies.
+const SYSTEM_PROXY_DLLS: [&str; 3] = ["dxgi.dll", "dwrite.dll", "dinput8.dll"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
@@ -77,17 +77,27 @@ fn map_binary(path: &Path) -> io::Result<memmap2::Mmap> {
 
 /// Inspect the executable and its adjacent, architecture-matched PE dependencies.
 pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
-    let (mut scan, mut pending) = scan_binary(&map_binary(path)?);
+    let executable = map_binary(path)?;
+    let (mut scan, mut pending) = scan_binary(&executable);
     let mut linked = scan.imported;
     let mut modern_renderer = scan.all().has(ApiSet::D3D11 | ApiSet::D3D12 | ApiSet::VULKAN);
     let mut sdl_d3d9 = false;
     let mut seen = HashSet::new();
-    while let Some(name) = pending.pop() {
+    let mut checked_bootstrap = false;
+    loop {
+        let Some(name) = pending.pop() else {
+            if checked_bootstrap || !scan.all().is_empty() || sdl_d3d9 {
+                break;
+            }
+            checked_bootstrap = true;
+            pending = bootstrap_dependencies(&executable);
+            continue;
+        };
         let dll = Path::new(&name);
         if !dll.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
             || dll.file_name() != Some(dll.as_os_str())
             || DLLS.iter().any(|(api, _, _)| name.eq_ignore_ascii_case(api))
-            || SYSTEM_GRAPHICS_DLLS.iter().any(|system| name.eq_ignore_ascii_case(system))
+            || SYSTEM_PROXY_DLLS.iter().any(|system| name.eq_ignore_ascii_case(system))
             || !seen.insert(name.to_ascii_lowercase())
         {
             continue;
@@ -111,6 +121,41 @@ pub fn scan_exe(path: &Path) -> io::Result<ExeScan> {
         scan.referenced.0 |= ApiSet::D3D9;
     }
     Ok(prefer_linked_direct3d(scan, linked))
+}
+
+fn bootstrap_dependencies(data: &[u8]) -> Vec<String> {
+    let loads_dlls = PeFile64::parse(data).map(|pe| imports_library_loader(&pe))
+        .or_else(|_| PeFile32::parse(data).map(|pe| imports_library_loader(&pe))).unwrap_or(false);
+    if !loads_dlls {
+        return Vec::new();
+    }
+
+    // A renderer bootstrap may pass a local DLL filename to LoadLibrary.
+    memchr::memchr_iter(b'.', data).flat_map(|dot| {
+        [dll_literal(data, dot, b".dll\0", 1), dll_literal(data, dot, b".\0d\0l\0l\0\0\0", 2)]
+            .into_iter().flatten()
+    }).collect()
+}
+
+fn imports_library_loader<'d, Pe: ImageNtHeaders, R: ReadRef<'d>>(pe: &PeFile<'d, Pe, R>) -> bool {
+    pe.imports().is_ok_and(|imports| imports.flatten().any(|import| {
+        matches!(import.name(), NameOrOrdinal::Name(b"LoadLibraryA" | b"LoadLibraryW" | b"LoadLibraryExA" | b"LoadLibraryExW"))
+    }))
+}
+
+fn dll_literal(data: &[u8], dot: usize, suffix: &[u8], width: usize) -> Option<String> {
+    let end = dot.checked_add(suffix.len())?;
+    if !data.get(dot..end)?.eq_ignore_ascii_case(suffix) {
+        return None;
+    }
+    let prefix = data[..dot].rchunks_exact(width).take_while(|unit| {
+        (b' '..=b'~').contains(&unit[0]) && unit.get(1).is_none_or(|high| *high == 0)
+    }).take(256).count();
+    if !(1..=251).contains(&prefix) {
+        return None;
+    }
+    let start = dot - prefix * width;
+    Some(data[start..end - width].iter().step_by(width).map(|&b| char::from(b)).collect())
 }
 
 /// Returns the best image in the executable's first icon group as an ICO file.

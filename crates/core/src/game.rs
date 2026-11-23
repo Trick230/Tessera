@@ -26,15 +26,14 @@ impl GameInfo {
         self.exe.as_deref().and_then(Path::parent)
     }
 
-    /// Short API description for the UI, e.g. "D3D12, D3D11 (-dx11)".
+    /// Short API description for the UI, e.g. "D3D12, D3D11".
     pub fn api_label(&self) -> String {
-        let all = self.scan.all();
+        let mut all = self.scan.all();
         if all.is_empty() {
             return "Unknown API".into();
         }
-        // Unreal ships D3D12 and D3D11 RHIs; D3D11 is picked with -dx11.
         if matches!(self.engine, Engine::Unreal { .. }) && all.has(ApiSet::D3D12) && all.has(ApiSet::D3D11) {
-            return "D3D12, D3D11 (-dx11)".into();
+            all.0 &= ApiSet::D3D12 | ApiSet::D3D11;
         }
         all.names().join(", ")
     }
@@ -56,14 +55,6 @@ pub fn analyze(entry: GameEntry) -> GameInfo {
         if let Some(apis) = crate::unity::graphics_apis(p) {
             scan.imported = ApiSet::default();
             scan.referenced = apis;
-        }
-    }
-    // FFVIII Remastered's bootstrap loads its locale-specific OpenGL renderer.
-    if let Some(p) = exe.as_deref().filter(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("FFVIII.exe"))) {
-        if ["FFVIII_EFIGS.dll", "FFVIII_JP.dll"].iter().any(|name| {
-            pe::scan_exe(&p.with_file_name(name)).is_ok_and(|renderer| renderer.all().has(ApiSet::OPENGL))
-        }) {
-            scan.referenced.0 |= ApiSet::OPENGL;
         }
     }
     let install = exe
@@ -248,11 +239,13 @@ mod tests {
     fn graphics_proxy_dependencies_do_not_add_renderers() {
         let t = tempfile::tempdir().unwrap();
         let exe = t.path().join("Game.exe");
-        let mut executable = pe64_importing("DWrite.dll");
-        executable.extend_from_slice(b"D3D11CreateDevice\0");
-        std::fs::write(&exe, executable).unwrap();
-        std::fs::write(t.path().join("dwrite.dll"), pe64_importing("d3d12.dll")).unwrap();
-        assert_eq!(pe::scan_exe(&exe).unwrap().all(), ApiSet(ApiSet::D3D11));
+        for name in ["DWrite.dll", "dinput8.dll"] {
+            let mut executable = pe64_importing(name);
+            executable.extend_from_slice(b"D3D11CreateDevice\0");
+            std::fs::write(&exe, executable).unwrap();
+            std::fs::write(t.path().join(name), pe64_importing("d3d12.dll")).unwrap();
+            assert_eq!(pe::scan_exe(&exe).unwrap().all(), ApiSet(ApiSet::D3D11));
+        }
     }
 
     #[test]
@@ -348,6 +341,26 @@ mod tests {
 
         std::fs::write(&exe, pe64_importing("Renderer.dll")).unwrap();
         assert_eq!(analyze(entry).api_label(), "D3D12, Vulkan");
+    }
+
+    #[test]
+    fn bootstrap_detects_a_local_renderer_with_a_library_loader() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("Game.exe");
+        let mut executable = pe64_importing("KERNEL32.dll");
+        executable.extend_from_slice(b"Renderer.dll\0\0\0\0");
+        executable.extend("Optional.dll\0".encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(t.path().join("Renderer.dll"), pe64_importing("opengl32.dll")).unwrap();
+        std::fs::write(t.path().join("Optional.dll"), pe64_importing("d3d11.dll")).unwrap();
+        std::fs::write(t.path().join("Unused.dll"), pe64_importing("d3d12.dll")).unwrap();
+        std::fs::write(&exe, &executable).unwrap();
+        assert!(pe::scan_exe(&exe).unwrap().all().is_empty());
+
+        executable[0x200..0x204].copy_from_slice(&0x1080u32.to_le_bytes());
+        executable[0x280..0x288].copy_from_slice(&0x10b0u64.to_le_bytes());
+        executable[0x2b2..0x2bf].copy_from_slice(b"LoadLibraryA\0");
+        std::fs::write(&exe, executable).unwrap();
+        assert_eq!(pe::scan_exe(&exe).unwrap().all(), ApiSet(ApiSet::D3D11 | ApiSet::OPENGL));
     }
 
     #[test]
