@@ -75,7 +75,11 @@ fn row(g: &GameInfo, icon: Option<&art::Pixels>) -> GameRow {
     GameRow {
         name: s(g.entry.name.clone()),
         store: s(g.entry.store.label().into()),
-        engine: s(g.engine.label().into()),
+        engine: if g.engine == tessera_core::engine::Engine::Unknown {
+            SharedString::default()
+        } else {
+            g.engine.label().into()
+        },
         api: s(g.api_label()),
         exe: s(g.exe.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "not found".into())),
         root: s(g.entry.root.display().to_string()),

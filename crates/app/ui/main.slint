@@ -702,7 +702,7 @@ component Detail inherits Rectangle {
                 alignment: start;
                 spacing: 18px;
                 Text { text: root.game.api; color: Theme.dim; font-size: 13px; }
-                Text { text: root.game.engine; color: Theme.dim; font-size: 13px; }
+                if root.game.engine != "": Text { text: root.game.engine; color: Theme.dim; font-size: 13px; }
                 Text { text: root.game.store; color: Theme.dim; font-size: 13px; }
             }
         }
@@ -1025,7 +1025,7 @@ component Detail inherits Rectangle {
                     spacing: 7px;
                     InfoRow { label: "Layer"; value: root.game.status; }
                     InfoRow { label: "Store"; value: root.game.store; }
-                    InfoRow { label: "Engine"; value: root.game.engine; }
+                    if root.game.engine != "": InfoRow { label: "Engine"; value: root.game.engine; }
                     InfoRow { label: "Executable"; value: root.game.exe; code: true; }
                     InfoRow { label: "Folder"; value: root.game.root; code: true; }
                     InfoRow { label: "Hash (xxh3)"; value: root.game.hash; code: true; }
