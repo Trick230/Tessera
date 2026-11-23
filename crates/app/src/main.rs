@@ -194,6 +194,13 @@ fn num(v: f64, decimals: usize) -> String {
     format!("{v:.decimals$}")
 }
 
+fn count(value: u64) -> String {
+    if value < 1000 {
+        return value.to_string();
+    }
+    format!("{},{:03}", count(value / 1000), value % 1000)
+}
+
 fn size(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= 1024.0 * 1024.0 * 1024.0 {
@@ -494,35 +501,17 @@ fn shader_state(
         rows.push(line("OpenGL shaders", value, vec![detail.to_string()], NEUTRAL));
     }
 
-    // Driver cache files and warm-up results report compiled shaders. The
-    // scan and layer stores supply bytecode for preparation.
     let mut d = Vec::new();
-    let cache = disk_cache.filter(|cache| cache.files > 0);
-    let (value, tone) = if let Some(cache) = cache {
-        let files = if cache.files == 1 { "file" } else { "files" };
-        d.push(format!("{} across {} matching NVIDIA cache {files}.", size(cache.bytes), cache.files));
-        let value = if cache.counted_files == 0 {
-            "Count unavailable".to_string()
-        } else {
-            if cache.counted_files < cache.files {
-                d.push(format!("Count covers {} of {} files.", cache.counted_files, cache.files));
-            }
-            let entries = if cache.entries == 1 { "entry" } else { "entries" };
-            format!("{} cache {entries}", cache.entries)
-        };
-        (value, NEUTRAL)
-    } else if c.compiled > 0 {
-        (format!("{} compiled", c.compiled), OK)
-    } else if disk_cache.is_some() {
-        d.push("0 KB in matching NVIDIA cache files.".to_string());
-        ("0 NVIDIA cache entries".to_string(), NEUTRAL)
+    let (value, tone) = if c.stored == 0 {
+        ("Not measured".to_string(), NEUTRAL)
     } else {
-        ("Unconfirmed".to_string(), NEUTRAL)
+        let value = format!("{} of {} prepared", count(c.compiled), count(c.stored));
+        (value, if c.compiled == c.stored { OK } else { NEUTRAL })
     };
     if c.compiled > 0 {
-        d.push(format!("The last D3D11 warm-up confirmed {} with a test draw or dispatch on the current driver.", c.compiled));
+        d.push("Prepared shaders passed a D3D11 execution test on the current driver.".to_string());
     }
-    if cache.is_none() && c.stored == 0 && (can_prepare || !scan_gl) {
+    if c.stored == 0 && (can_prepare || !scan_gl) {
         d.push(if can_prepare {
             "Prepare shaders searches the game files for bytecode, and the layer captures more during play."
         } else {
@@ -530,20 +519,23 @@ fn shader_state(
         }.to_string());
     }
     if c.skipped > 0 {
-        d.push(format!("{} are D3D12 shaders (DXIL) the D3D11 warm-up cannot take.", c.skipped));
+        d.push(format!("{} skipped during D3D11 preparation.", count(c.skipped)));
     }
     if c.created_only > 0 {
-        d.push(format!("{} created without a compatible draw or dispatch.", c.created_only));
+        d.push(format!("{} created with execution still unverified.", count(c.created_only)));
     }
-    if c.pending > 0 || c.failed > 0 {
-        d.push(format!("{} pending, {} failed.", c.pending, c.failed));
+    if c.pending > 0 {
+        d.push(format!("{} still to prepare.", count(c.pending)));
+    }
+    if c.failed > 0 {
+        d.push(format!("{} failed preparation.", count(c.failed)));
     }
     if c.scan_outdated == Some(false) {
         if let Some(n) = c.unsupported_in_install.filter(|&n| n > 0) {
             d.push(format!("The file scan also found {n} containers outside D3D11 warm-up support."));
         }
         if c.unreal_packages > 0 {
-            d.push(format!("Searched {} Unreal packages.", c.unreal_packages));
+            d.push(format!("Searched {} Unreal packages.", count(c.unreal_packages)));
         }
         if c.locked_unreal_paks > 0 {
             d.push(format!("{} encrypted Unreal PAKs could not be opened.", c.locked_unreal_paks));
@@ -552,7 +544,11 @@ fn shader_state(
             d.push(format!("{} Unreal packages could not be decoded.", c.unreadable_unreal_packages));
         }
     }
-    rows.push(line("Compiled shaders", value, d, tone));
+    if let Some(cache) = disk_cache {
+        let usage = if cache.bytes == 0 { "0 KB".to_string() } else { size(cache.bytes) };
+        d.push(format!("NVIDIA shader cache uses {usage}."));
+    }
+    rows.push(line("Shaders", value, d, tone));
 
     // Newly captured shaders from the last recorded game session.
     let (value, tone, d) = match run {
