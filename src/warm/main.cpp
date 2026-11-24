@@ -714,7 +714,15 @@ HRESULT replay_stream(ID3D12Device* device, ID3D12RootSignature* root, std::vect
     return device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline));
 }
 
-HRESULT create_ray_state(ID3D12Device* device, uint32_t kind, std::span<const uint8_t> data,
+// Raytracing states created so far, by record payload hash, for AddToStateObject parents.
+struct RayParent {
+    uint32_t kind;
+    uint32_t size;
+    Microsoft::WRL::ComPtr<ID3D12StateObject> state;
+};
+using RayStates = std::unordered_map<uint64_t, RayParent>;
+
+HRESULT create_ray_state(ID3D12Device* device, uint32_t kind, std::span<const uint8_t> data, const RayStates& states,
                          unsigned depth, size_t& budget, Microsoft::WRL::ComPtr<ID3D12StateObject>& state) {
     using namespace tessera::d3d12_capture;
     using Microsoft::WRL::ComPtr;
@@ -723,14 +731,12 @@ HRESULT create_ray_state(ID3D12Device* device, uint32_t kind, std::span<const ui
     ComPtr<ID3D12StateObject> parent;
     if (kind == raytracing_add_kind) {
         RayAddition header{};
-        if (!take_capture(data, header) || header.parent_size > data.size()
-            || header.addition_size != data.size() - header.parent_size) return E_INVALIDARG;
-        auto base = data.first(header.parent_size);
-        uint32_t parent_kind = 0;
-        if (!take_capture(base, parent_kind)) return E_INVALIDARG;
-        const HRESULT hr = create_ray_state(device, parent_kind, base, depth + 1, budget, parent);
-        if (FAILED(hr)) return hr;
-        data = data.subspan(header.parent_size);
+        if (!take_capture(data, header)) return E_INVALIDARG;
+        const auto found = states.find(header.parent_hash);
+        // The parent was not recorded, or failed to replay.
+        if (found == states.end() || found->second.kind != header.parent_kind || found->second.size != header.parent_size)
+            return E_INVALIDARG;
+        parent = found->second.state;
     } else if (kind != raytracing_kind) {
         return E_INVALIDARG;
     }
@@ -767,7 +773,7 @@ HRESULT create_ray_state(ID3D12Device* device, uint32_t kind, std::span<const ui
         uint32_t dependency_kind = 0;
         if (!take_capture(bytes, dependency_kind)) return false;
         auto& slot = dependencies.emplace_back();
-        dependent_result = create_ray_state(device, dependency_kind, bytes, depth + 1, budget, slot.state);
+        dependent_result = create_ray_state(device, dependency_kind, bytes, states, depth + 1, budget, slot.state);
         if (FAILED(dependent_result)) return false;
         slot.desc = {slot.state.Get(), dependency.export_count, dependency.exports};
         sub.pDesc = &slot.desc;
@@ -867,6 +873,7 @@ int replay_d3d12(const wchar_t* path, bool warp, const wchar_t* log_path, bool p
     const uint64_t file_bytes = GetFileAttributesExW(path, GetFileExInfoStandard, &info)
         ? (uint64_t{info.nFileSizeHigh} << 32) | info.nFileSizeLow : 0;
     bool removed = false;
+    RayStates ray_states;
     std::vector<uint8_t> payload, root;
     uint64_t total_bytes = sizeof(header);
     size_t prepared[5]{}, failed = 0;
@@ -913,7 +920,11 @@ int replay_d3d12(const wchar_t* path, bool warp, const wchar_t* log_path, bool p
         } else if (SUCCEEDED(hr) && (record.kind == raytracing_kind || record.kind == raytracing_add_kind)) {
             size_t budget = 128 << 20;
             Microsoft::WRL::ComPtr<ID3D12StateObject> state;
-            hr = create_ray_state(device.dev.Get(), record.kind, payload, 0, budget, state);
+            hr = create_ray_state(device.dev.Get(), record.kind, payload, ray_states, 0, budget, state);
+            if (SUCCEEDED(hr)) {
+                ray_states.insert_or_assign(ray_payload_hash(payload.data(), payload.size()),
+                    RayParent{record.kind, static_cast<uint32_t>(payload.size()), state});
+            }
         } else if (SUCCEEDED(hr)) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
             desc.pRootSignature = signature.Get();

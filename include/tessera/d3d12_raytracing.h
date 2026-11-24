@@ -9,10 +9,19 @@ struct RayHeader {
     uint32_t collection;
 };
 
+// An AddToStateObject record names its parent, an earlier raytracing record of the same
+// capture, by its payload size and hash, so a chain of additions stays linear in size.
 struct RayAddition {
+    uint32_t parent_kind;
     uint32_t parent_size;
-    uint32_t addition_size;
+    uint64_t parent_hash;
 };
+
+inline uint64_t ray_payload_hash(const uint8_t* bytes, size_t size) {
+    uint64_t hash = 0xcbf29ce484222325ull;  // FNV-1a
+    for (size_t i = 0; i < size; ++i) hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+    return hash;
+}
 
 struct RayDependency {
     const uint8_t* bytes;

@@ -288,12 +288,15 @@ HRESULT STDMETHODCALLTYPE record_addition(ID3D12Device7* device, const D3D12_STA
         try {
             D3D12_STATE_OBJECT_DESC unused{};
             std::vector<uint8_t> base, addition;
+            // The parent's private data is its kind followed by its record payload.
             if (read_state(parent, base) && relocate_raytracing<true>(addition, *desc, unused, read_root_signature, read_state)
-                && sizeof(RayAddition) + base.size() + addition.size() <= max_graphics_bytes) {
-                const RayAddition header{static_cast<uint32_t>(base.size()), static_cast<uint32_t>(addition.size())};
+                && sizeof(RayAddition) + addition.size() <= max_graphics_bytes) {
+                RayAddition header{};
+                std::memcpy(&header.parent_kind, base.data(), sizeof(header.parent_kind));
+                header.parent_size = static_cast<uint32_t>(base.size() - sizeof(header.parent_kind));
+                header.parent_hash = ray_payload_hash(base.data() + sizeof(header.parent_kind), header.parent_size);
                 std::vector<uint8_t> payload;
                 append_payload(payload, &header, sizeof(header));
-                append_payload(payload, base.data(), base.size());
                 append_payload(payload, addition.data(), addition.size());
                 remember_state(*result, payload, raytracing_add_kind);
                 if (desc->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)

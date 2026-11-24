@@ -7,7 +7,8 @@
 
 namespace tessera::d3d12_capture {
 inline constexpr char magic[8] = "TSRD12C";
-inline constexpr uint32_t version = 1;
+// 2: AddToStateObject records name their parent by hash instead of embedding it.
+inline constexpr uint32_t version = 2;
 inline constexpr uint32_t max_shader_bytes = 16 * 1024 * 1024;
 inline constexpr uint32_t max_root_bytes = 1024 * 1024;
 inline constexpr uint32_t max_graphics_bytes = 64 * 1024 * 1024;
