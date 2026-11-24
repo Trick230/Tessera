@@ -118,6 +118,8 @@ export struct GameSettings {
     flip-model: bool,
     rt-recycle: bool,
     ue-streaming: bool,
+    // The D3D11 layer: memory, presentation and texture options apply (not on dxgi.dll or vulkan-1.dll).
+    d3d11: bool,
     fps-options: [string],
     fps-index: int,
     vram-options: [string],
@@ -977,20 +979,20 @@ component Detail inherits Rectangle {
                             width: 170px;
                             model: root.settings.fps-options;
                             current-index: root.settings.fps-index;
-                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
+                            selected => { root.settings-changed(process.checked, root.settings.residency, root.settings.flip-model, root.settings.rt-recycle, root.settings.ue-streaming, fps.current-index, root.settings.vram-index); }
                         }
                     }
-                    PropRow {
+                    if root.settings.d3d11: PropRow {
                         label: "VRAM cap";
                         help: root.settings.vram-hint;
                         vram := Stepper {
                             width: 170px;
                             model: root.settings.vram-options;
                             current-index: root.settings.vram-index;
-                            selected => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
+                            selected => { root.settings-changed(process.checked, root.settings.residency, root.settings.flip-model, root.settings.rt-recycle, root.settings.ue-streaming, fps.current-index, vram.current-index); }
                         }
                     }
-                    PropRow {
+                    if root.settings.d3d11: PropRow {
                         label: "Memory priority";
                         help: root.settings.priority-blocked
                             ? "Can crash NVIDIA driver 621.14. Leave this off."
@@ -998,7 +1000,7 @@ component Detail inherits Rectangle {
                         residency := Toggle {
                             checked: root.settings.residency;
                             enabled: !root.settings.priority-blocked || root.settings.residency;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, residency.checked, root.settings.flip-model, root.settings.rt-recycle, root.settings.ue-streaming, fps.current-index, root.settings.vram-index); }
                         }
                     }
                     PropRow {
@@ -1006,34 +1008,34 @@ component Detail inherits Rectangle {
                         help: "High-resolution timer and moderate priority, game process only.";
                         process := Toggle {
                             checked: root.settings.process;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, root.settings.residency, root.settings.flip-model, root.settings.rt-recycle, root.settings.ue-streaming, fps.current-index, root.settings.vram-index); }
                         }
                     }
-                    PropRow {
+                    if root.settings.d3d11: PropRow {
                         label: "Flip presentation";
                         help: "Experimental. Lower latency and G-Sync/FreeSync in borderless windows. Turn off if the screen flickers.";
                         flip := Toggle {
                             checked: root.settings.flip-model;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, root.settings.residency, flip.checked, root.settings.rt-recycle, root.settings.ue-streaming, fps.current-index, root.settings.vram-index); }
                         }
                     }
-                    PropRow {
+                    if root.settings.d3d11: PropRow {
                         label: "Render target reuse";
                         help: "Hands big render targets the game drops back on its next matching create. Cuts hitches in games that recreate them.";
                         recycle := Toggle {
                             checked: root.settings.rt-recycle;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, root.settings.ue-streaming, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, root.settings.residency, root.settings.flip-model, recycle.checked, root.settings.ue-streaming, fps.current-index, root.settings.vram-index); }
                         }
                     }
-                    if root.game.unreal: PropRow {
+                    if root.game.unreal && root.settings.d3d11: PropRow {
                         label: "Unreal texture streaming";
                         help: "Unreal Engine games. Sets the engine's streaming pool to fit this card and streams fewer textures per frame, as players do by hand. Experimental.";
                         ue := Toggle {
                             checked: root.settings.ue-streaming;
-                            toggled => { root.settings-changed(process.checked, residency.checked, flip.checked, recycle.checked, ue.checked, fps.current-index, vram.current-index); }
+                            toggled => { root.settings-changed(process.checked, root.settings.residency, root.settings.flip-model, root.settings.rt-recycle, ue.checked, fps.current-index, root.settings.vram-index); }
                         }
                     }
-                    PropRow {
+                    if root.settings.d3d11: PropRow {
                         label: "Maximum frame latency";
                         help: "Limits how many frames can be queued ahead. Game default leaves the existing limit alone.";
                         Stepper {
@@ -1046,7 +1048,7 @@ component Detail inherits Rectangle {
                             selected => { root.advanced-changed("max_frame_latency", self.current-index); }
                         }
                     }
-                    OptionSwitch {
+                    if root.settings.d3d11: OptionSwitch {
                         label: "D3D11 call diagnostics";
                         help: "Records context calls taking at least 1 ms. The session report shows timings and overlap with stutters.";
                         checked: root.settings.advanced.d3d11-call-diagnostics;
@@ -1062,7 +1064,7 @@ component Detail inherits Rectangle {
                     }
                     Text { text: "Changes apply the next time the game starts."; color: Theme.faint; font-size: 13px; }
                 }
-                if root.tab == 4 && root.settings.present: VerticalLayout {
+                if root.tab == 4 && root.settings.present && root.settings.d3d11: VerticalLayout {
                     Text { text: "Streaming"; color: Theme.text; font-size: 16px; font-weight: 700; }
                     OptionSwitch {
                         label: "Mip residency";
@@ -1144,6 +1146,12 @@ component Detail inherits Rectangle {
                         changed(value) => { root.advanced-changed("mip_feedback", value ? 1 : 0); }
                     }
                     Text { text: "Changes apply the next time the game starts."; color: Theme.faint; font-size: 13px; }
+                }
+                if root.tab == 4 && root.settings.present && !root.settings.d3d11: Text {
+                    color: Theme.dim;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                    text: "Texture and memory options work in D3D11 games. In this game the layer paces frames.";
                 }
                 if (root.tab == 1 || root.tab == 4) && !root.settings.present: Text {
                     color: Theme.dim;

@@ -25,6 +25,10 @@ slint::include_modules!();
 /// Built layer shipped next to tessera.exe; installed under the proxy name.
 const PAYLOAD_D3D11: &str = "tessera_d3d11.dll";
 const PAYLOAD_D3D11_X86: &str = "tessera_d3d11_x86.dll";
+const PAYLOAD_DXGI: &str = "tessera_dxgi.dll";
+const PAYLOAD_DXGI_X86: &str = "tessera_dxgi_x86.dll";
+const PAYLOAD_VULKAN: &str = "tessera_vulkan.dll";
+const PAYLOAD_VULKAN_X86: &str = "tessera_vulkan_x86.dll";
 
 #[derive(Default)]
 struct State {
@@ -433,7 +437,8 @@ fn session_info(exe: &Path) -> (SessionInfo, (u32, Option<u32>), Option<(u64, u6
     info.recompressed_textures = sum.recompressed_textures.min(i32::MAX as u64) as i32;
     info.mip_feedback_samples = sum.mip_feedback_samples.min(i32::MAX as u64) as i32;
     info.display = s(match sum.swapchain {
-        Some((w, h)) => format!("{w}×{h}, D3D feature level {}_{}", fl >> 12, (fl >> 8) & 0xF),
+        Some((w, h)) if fl != 0 => format!("{w}×{h}, D3D feature level {}_{}", fl >> 12, (fl >> 8) & 0xF),
+        Some((w, h)) => format!("{w}×{h}"),
         None => "no swapchain recorded".into(),
     });
     if sum.tiled_tier > 0 {
@@ -714,6 +719,7 @@ fn game_settings(
     ue_exe: Option<PathBuf>,
     (budget_mb, suggest_mb): (u32, Option<u32>),
     facts: advanced::Facts,
+    d3d11: bool,
 ) -> (GameSettings, SettingsLists) {
     let cur = install::settings(dir);
     let mut fps: Vec<u32> = FPS_CHOICES.to_vec();
@@ -753,6 +759,7 @@ fn game_settings(
         flip_model: cur.flip_model,
         rt_recycle: cur.rt_recycle,
         ue_streaming: cur.ue_streaming,
+        d3d11,
         fps_options: labels(&fps, "Off", &|x| format!("{x} fps")),
         fps_index: idx(&fps, cur.fps_limit),
         vram_options: labels(&vram, "Off", &|x| {
@@ -829,7 +836,7 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
     let (settings, lists) = match (view.facts, game.exe_dir()) {
         (Some(facts), Some(dir)) => {
             let ue_exe = game.exe.clone().filter(|_| is_unreal(game) && game.scan.architecture == Some(Architecture::X64));
-            let (settings, lists) = game_settings(dir, ue_exe, view.budget, facts);
+            let (settings, lists) = game_settings(dir, ue_exe, view.budget, facts, game.layer_proxy() == Some(install::PROXY_D3D11));
             (settings, Some(lists))
         }
         _ => (GameSettings::default(), None),
@@ -1026,10 +1033,12 @@ fn app_dir() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default()
 }
 
-fn payload_path(architecture: Architecture) -> PathBuf {
-    app_dir().join(match architecture {
-        Architecture::X86 => PAYLOAD_D3D11_X86,
-        Architecture::X64 => PAYLOAD_D3D11,
+fn payload_path(architecture: Architecture, proxy: &str) -> PathBuf {
+    let x86 = architecture == Architecture::X86;
+    app_dir().join(match proxy {
+        install::PROXY_DXGI => if x86 { PAYLOAD_DXGI_X86 } else { PAYLOAD_DXGI },
+        install::PROXY_VULKAN => if x86 { PAYLOAD_VULKAN_X86 } else { PAYLOAD_VULKAN },
+        _ => if x86 { PAYLOAD_D3D11_X86 } else { PAYLOAD_D3D11 },
     })
 }
 
@@ -1338,9 +1347,10 @@ fn layer_action(ui: &MainWindow, state: &Shared, view_idx: i32, do_install: bool
         ui.set_status_text("Close the game first: the layer is installed or removed only while it is not running".into());
         return;
     }
+    let proxy = g.layer_proxy().unwrap_or(install::PROXY_D3D11);
     let result = if do_install {
         let Some(architecture) = g.scan.architecture else { return };
-        install::install(&dir, &payload_path(architecture), install::PROXY_D3D11)
+        install::install(&dir, &payload_path(architecture, proxy), proxy)
     } else {
         install::uninstall(&dir)
     };
@@ -1349,7 +1359,7 @@ fn layer_action(ui: &MainWindow, state: &Shared, view_idx: i32, do_install: bool
         Ok(_) => format!("Layer removed from {}", dir.display()),
         Err(e) => format!("Error: {e}"),
     };
-    st.games[gi].install = install::state(&dir, install::PROXY_D3D11);
+    st.games[gi].install = install::state(&dir, proxy);
     apply_view(ui, &mut st);
     request_view(ui, state, &mut st, view_idx, true); // the settings card follows the install state
     ui.set_status_text(msg.into());
@@ -1363,7 +1373,7 @@ fn quality_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
         let st = state.lock().unwrap();
         st.view.get(view_idx as usize).and_then(|&i| {
             let game = &st.games[i];
-            if game.install.is_installed() && game.can_install() {
+            if game.install.is_installed() && game.can_install() && game.layer_proxy() == Some(install::PROXY_D3D11) {
                 game.exe.clone().map(|exe| (exe, game.entry.root.clone()))
             } else {
                 None

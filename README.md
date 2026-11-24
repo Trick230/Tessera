@@ -16,7 +16,7 @@ It does the heavy work **before** you play, in a small app. While you play, only
 |---|---|
 | **Hitches the first time you see an effect or area** | Finds the game's shaders on disk (or records them while you play) and compiles them ahead of time, so the driver's cache is ready before you launch the game. |
 | **Hitches while moving through the world** | Learns which files the game reads together and loads them early, at low priority. |
-| **Uneven frame times** | A precise frame limiter, lower input latency settings and per-game scheduling tweaks. It steps aside when Reflex, RTSS or the NVIDIA limiter is already doing the job. |
+| **Uneven frame times** | A precise frame limiter, lower input latency settings and per-game scheduling tweaks. It works in D3D11, D3D12 and Vulkan games and steps aside when Reflex, frame generation, RTSS or the NVIDIA limiter is already doing the job. |
 | **Running out of video memory** | Reports the real budget to the game and keeps memory close to what is actually on screen. Removed texture detail comes back *before* it is drawn, so there is no pop-in. |
 | **Unreal Engine games** | Applies better engine settings (for example texture streaming) safely, without editing the game's files. |
 | **"Why does it stutter?"** | Every session is recorded. The app shows frame time percentiles, stutters per minute, video memory used and the likely cause. |
@@ -51,7 +51,7 @@ To undo everything, select **Uninstall**. The game folder goes back to how it wa
 | App: library, detection, install/uninstall, session panel | Works |
 | Shader discovery and warming (Unreal, Unity, recompiled games, D3D11/D3D12/Vulkan bytecode) | Works; first-session stutter test still to do |
 | D3D12 and Vulkan pipeline recording and offline replay | Works as a tool; game benefit not yet measured |
-| Frame limiter, frame latency, process tweaks (D3D11) | Works |
+| Frame limiter (D3D11, D3D12, Vulkan), process tweaks, frame latency (D3D11) | Works; measured on a synthetic bench, game test still to do |
 | Unreal texture streaming profile | Measured on FF7 Remake: 47.8–51.5 → 59.8 FPS at a 60 cap. Off by default for now. |
 | Other Unreal settings (dynamic resolution, render targets, pools) | Being measured |
 | Render target reuse | Measured on FF7 Remake at 4K: hitches over 50 ms from 8.0 to 1.5 per minute. Off by default. |

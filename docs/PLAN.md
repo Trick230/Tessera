@@ -166,8 +166,11 @@ Measure cache reuse per shader stage and pipeline on the tested GPU and driver. 
 
 ### Pacing and system (P) — all at process level only
 
-- **P1 Precise limiter** — high-resolution timer + final busy-wait next to `Present`. After a late
-  frame, the next interval starts from its actual release time. RTSS or NVIDIA takes precedence
+- **P1 Precise limiter** — high-resolution timer + final busy-wait. The core (`limiter.cpp`) has no graphics
+  API dependency. Default low-latency mode: after a present, hold the next frame's start until the target
+  minus the predicted work (p90 of the last 32 frames, stutters excluded) minus an adaptive margin, then align
+  the present to the target. After a late frame the cadence restarts from its release (no catch-up burst).
+  Modes 0 (wait before `Present`) and 2 (front edge only) stay selectable. RTSS or NVIDIA takes precedence
   when the cap detected during preparation is equal to or below Tessera's.
 - **P2 Flip model + tearing** for D3D11 in borderless windows: convert blit swapchains (`DISCARD` →
   `FLIP_DISCARD`, `SEQUENTIAL` → `FLIP_SEQUENTIAL`, at least 2 buffers) and, with VRR, `ALLOW_TEARING` at
@@ -179,7 +182,9 @@ Measure cache reuse per shader stage and pipeline on the tested GPU and driver. 
 - **P4 CPU sets** — the thread that calls `Present` on P-cores (hybrid CPUs).
 - **P5 Process** — timer resolution, EcoQoS off (`SetProcessInformation`), moderate priority.
 - **P6 Back-off** — the D3D11 limiter yields to confirmed Reflex or NVAPI pacing on the presenting
-  device and resumes when it is disabled. It also yields while the Smooth Motion runtime is loaded.
+  device and resumes when it is disabled. On D3D12 it yields to NVAPI sleep mode, on Vulkan to
+  `VK_NV_low_latency2`. It also yields while a frame generation runtime is loaded (Smooth Motion, XeSS-FG,
+  FidelityFX frame interpolation DLLs).
 
 ### Diagnostics (D)
 
@@ -256,6 +261,19 @@ built side by side in D3D11, with pipeline recording for D3D12 and Vulkan added 
   M9 BC7/BC6H recompression checked with FLIP (`tessera_texcomp.exe`).
 - Extra: R1 render target reuse, U1 Unreal cvars (+ test variants), SLOW_CREATE records,
   `tools/global_test.ps1` A/B harness.
+- P1 low-latency limiter (`limiter_mode=1`, default). Synthetic bench (`--limiter-bench`, noisy load with
+  stutters and a load step, 60 FPS): mean latency 16.5 → 10.8 ms against waiting before `Present`, cadence p99
+  1.4 ms, no misses, no short frames after stutters; at 120 FPS −2.3 ms. The front-edge mode is 2.3 ms lower
+  but with 4 ms cadence p99 and ~5% missed intervals.
+- D3D12 games: the same layer built as `dxgi.dll` (`tessera_dxgi.dll`, x64 and x86) hooks swap chains from
+  DXGI factories; the limiter, P5/P6 and session recording work there (same bench numbers on a D3D12 flip
+  swap chain). The app installs it for games that use D3D12 and not D3D11. This is not yet the phase 6 layer
+  (no D3D12 memory or residency work; M1 stays out of it entirely).
+- Vulkan games: the same layer built as `vulkan-1.dll` (`tessera_vulkan.dll`, x64 and x86) wraps
+  `vkQueuePresentKHR` from the export and from `vkGet*ProcAddr`; limiter, P5 and session recording only.
+  Same bench numbers as D3D11 (`tessera_vulkan_present`, in the smoke test when built). The app installs it
+  for Vulkan-only games. Open: export coverage of the dxgi/vulkan proxies on other Windows builds, a game
+  test on each API, and FidelityFX 3.1 frame generation (single `amd_fidelityfx_dx12.dll`, not detected).
 
 **Pipeline recording (towards phase 6, S2/S3):**
 - D3D12: `tessera_d3d12_capture.dll` records compute, graphics (pipeline state streams) and ray tracing state
@@ -266,8 +284,8 @@ built side by side in D3D11, with pipeline recording for D3D12 and Vulkan added 
 - Vulkan: an optional layer (`-Vulkan`) records compute and core graphics pipelines and cache feedback;
   `tessera_vulkan_replay` rebuilds them into a driver cache with resumable checkpoints (saved by elapsed
   time). The layer's present hook takes no lock and saves its cache checkpoint off-thread. Added for recompiled
-  games that only ship Vulkan/D3D12 renderers. Scope is recording and offline replay only — there is no
-  Vulkan optimization layer, and none is planned before D3D12.
+  games that only ship Vulkan/D3D12 renderers. Its scope is recording and offline replay; the Vulkan frame
+  limiter is the separate `vulkan-1.dll` proxy above, and no other Vulkan optimization is planned before D3D12.
 - The app has **Record pipelines**, **Import pipeline recording** and **Play and verify cache**.
 
 **Findings that shape the next steps (FF7R, D3D11, RTX 4060, NVIDIA 621.14):**

@@ -44,9 +44,15 @@ impl GameInfo {
         all.names().join(", ")
     }
 
-    /// Phase 0 layer only supports D3D11, and never with anti-cheat.
+    /// The layer needs a known proxy (D3D11, D3D12 or Vulkan) and never installs with anti-cheat.
     pub fn can_install(&self) -> bool {
-        self.anticheat.is_empty() && self.exe.is_some() && self.scan.architecture.is_some() && self.scan.all().has(ApiSet::D3D11)
+        self.anticheat.is_empty() && self.exe.is_some() && self.scan.architecture.is_some() && self.layer_proxy().is_some()
+    }
+
+    /// The DLL name the layer is installed under: d3d11.dll for D3D11 games,
+    /// dxgi.dll for D3D12 games without D3D11, vulkan-1.dll for Vulkan-only games.
+    pub fn layer_proxy(&self) -> Option<&'static str> {
+        layer_proxy(self.scan.all())
     }
 }
 
@@ -66,7 +72,7 @@ pub fn analyze(entry: GameEntry) -> GameInfo {
     let install = exe
         .as_deref()
         .and_then(Path::parent)
-        .map(|d| install::state(d, install::PROXY_D3D11))
+        .map(|d| install::state(d, layer_proxy(scan.all()).unwrap_or(install::PROXY_D3D11)))
         .unwrap_or(InstallState::NotInstalled);
     GameInfo {
         engine,
@@ -76,6 +82,18 @@ pub fn analyze(entry: GameEntry) -> GameInfo {
         scan,
         exe_hash,
         install,
+    }
+}
+
+fn layer_proxy(apis: ApiSet) -> Option<&'static str> {
+    if apis.has(ApiSet::D3D11) {
+        Some(install::PROXY_D3D11)
+    } else if apis.has(ApiSet::D3D12) {
+        Some(install::PROXY_DXGI)
+    } else if apis.has(ApiSet::VULKAN) {
+        Some(install::PROXY_VULKAN)
+    } else {
+        None
     }
 }
 
@@ -154,6 +172,14 @@ pub fn find_main_exe(root: &Path, hint: Option<&Path>) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::library::Store;
+
+    #[test]
+    fn layer_proxy_follows_the_api() {
+        assert_eq!(layer_proxy(ApiSet(ApiSet::D3D11 | ApiSet::D3D12)), Some(install::PROXY_D3D11));
+        assert_eq!(layer_proxy(ApiSet(ApiSet::D3D12 | ApiSet::VULKAN)), Some(install::PROXY_DXGI));
+        assert_eq!(layer_proxy(ApiSet(ApiSet::VULKAN)), Some(install::PROXY_VULKAN));
+        assert_eq!(layer_proxy(ApiSet(0)), None);
+    }
 
     fn touch(p: &Path, size: usize) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

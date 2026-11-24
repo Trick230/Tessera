@@ -15,6 +15,10 @@ use std::sync::Mutex;
 static INI_LOCK: Mutex<()> = Mutex::new(());
 
 pub const PROXY_D3D11: &str = "d3d11.dll";
+/// The same layer as dxgi.dll, for D3D12 games (swap chains come from DXGI factories).
+pub const PROXY_DXGI: &str = "dxgi.dll";
+/// The same layer as vulkan-1.dll, for Vulkan games (frame limiter only).
+pub const PROXY_VULKAN: &str = "vulkan-1.dll";
 pub const INI: &str = "tessera.ini";
 pub const MARKER: &str = "tessera.install";
 
