@@ -38,7 +38,7 @@ struct Device {
     bool feedback{};
     VkDevice handle{};
     VkPipelineCache cache{};
-    bool checkpoint_pending{};
+    uint32_t presentations_to_checkpoint{};
     std::shared_ptr<tessera::vulkan_recipe::Capture> recipes;
 };
 
@@ -69,7 +69,7 @@ struct Log {
         if (fd < 0) { CloseHandle(handle); return; }
         file = _fdopen(fd, "wb");
         if (!file) { _close(fd); return; }
-        fputs("event,time_us,duration_us,pipelines,valid_feedback,application_cache_hits,result,cache\n", file);
+        fputs("event,time_us,duration_us,pipelines,valid_feedback,application_cache_hits,result,cache,qpc_us\n", file);
     }
 
     ~Log() { if (file) fclose(file); }
@@ -79,10 +79,11 @@ struct Log {
         if (!file) return;
         using Us = std::chrono::microseconds;
         const auto timestamp = std::chrono::duration_cast<Us>(begin - start).count();
+        const auto qpc = std::chrono::duration_cast<Us>(begin.time_since_epoch()).count();
         const auto duration = std::chrono::duration_cast<Us>(end - begin).count();
         const std::lock_guard guard(lock);
-        fprintf(file, "%s,%lld,%lld,%u,%u,%u,%d,%s\n", event, static_cast<long long>(timestamp),
-                static_cast<long long>(duration), count, valid, hits, result, cache);
+        fprintf(file, "%s,%lld,%lld,%u,%u,%u,%d,%s,%lld\n", event, static_cast<long long>(timestamp),
+                static_cast<long long>(duration), count, valid, hits, result, cache, static_cast<long long>(qpc));
     }
 };
 
@@ -196,8 +197,15 @@ std::vector<char> read_cache(const std::wstring& path, const VkPhysicalDevicePro
 
 void create_cache(const Instance& parent, VkPhysicalDevice physical, VkDevice device, Device& d) {
     const auto input = environment_path(L"TESSERA_VULKAN_CACHE_INPUT");
-    d.checkpoint_pending = !environment_path(L"TESSERA_VULKAN_CACHE_OUTPUT").empty();
-    if (input.empty() && !d.checkpoint_pending) return;
+    if (!environment_path(L"TESSERA_VULKAN_CACHE_OUTPUT").empty()) {
+        d.presentations_to_checkpoint = 1;
+        const auto target = environment_path(L"TESSERA_VULKAN_CACHE_FRAME");
+        if (!target.empty() && target.size() <= 9 && target.find_first_not_of(L"0123456789") == std::wstring::npos) {
+            const auto count = wcstoul(target.c_str(), nullptr, 10);
+            if (count) d.presentations_to_checkpoint = count;
+        }
+    }
+    if (input.empty() && !d.presentations_to_checkpoint) return;
     const auto create = reinterpret_cast<PFN_vkCreatePipelineCache>(d.get(device, "vkCreatePipelineCache"));
     const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
         parent.get(parent.handle, "vkGetPhysicalDeviceProperties"));
@@ -446,15 +454,13 @@ VKAPI_ATTR VkResult VKAPI_CALL present(VkQueue queue, const VkPresentInfoKHR* in
     const auto start = Clock::now();
     const VkResult status = d.present(queue, info);
     telemetry().record("present", start, Clock::now(), 0, 0, 0, status);
-    if ((status == VK_SUCCESS || status == VK_SUBOPTIMAL_KHR) && d.cache && d.checkpoint_pending) {
+    if ((status == VK_SUCCESS || status == VK_SUBOPTIMAL_KHR) && d.cache && d.presentations_to_checkpoint) {
         bool save = false;
         {
             const std::lock_guard lock(dispatch_lock);
             const auto it = devices.find(dispatch_key(queue));
-            if (it != devices.end() && it->second.checkpoint_pending) {
-                it->second.checkpoint_pending = false;
-                save = true;
-            }
+            if (it != devices.end() && it->second.presentations_to_checkpoint)
+                save = --it->second.presentations_to_checkpoint == 0;
         }
         if (save) {
             try { save_cache(d.handle, d); } catch (...) {}

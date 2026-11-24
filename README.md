@@ -97,12 +97,15 @@ the directory containing the layer DLL and manifest, add
 `VK_LAYER_TESSERA_telemetry` to `VK_INSTANCE_LAYERS`, and set
 `TESSERA_VULKAN_TELEMETRY` to a new CSV path. The CSV records pipeline
 creation times, Vulkan application-cache feedback, and times between
-presentation calls. Displayed frame times and internal driver-cache hits
-require separate telemetry.
+presentation calls. The QPC column aligns events with external input
+markers. Displayed frame times and internal driver-cache hits require
+separate telemetry.
 
 `TESSERA_VULKAN_CACHE_OUTPUT` saves a driver-compatible pipeline-cache
-snapshot at the first successful presentation, or when the device is
-destroyed if it never presents. `TESSERA_VULKAN_CACHE_INPUT` seeds the cache
+snapshot at the first successful presentation by default.
+`TESSERA_VULKAN_CACHE_FRAME` selects a later presentation for a gameplay
+capture. Device teardown saves the snapshot if the checkpoint was missed.
+`TESSERA_VULKAN_CACHE_INPUT` seeds the cache
 on a later launch. Tessera supplies this cache only for calls where the
 game provides no cache of its own. The snapshot contains opaque driver
 data. Recreating pipeline descriptors offline requires a separate recording.
