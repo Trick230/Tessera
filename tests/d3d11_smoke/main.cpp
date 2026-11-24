@@ -375,6 +375,11 @@ int verify(const wchar_t* dir, int fps) {
     int frames = 0, tex = 0, bc7_full = 0, buffers = 0, srvs = 0, devices = 0, swapchains = 0, sc_comp = 0,
         end = 0;
     uint32_t dropped = 0, max_frame_us = 0;
+    // Overlays injected into this process (RTSS, for one) create small staging readbacks of their
+    // own; the DLL rightly flags them foreign. Like foreign shaders below, they are not the exe's.
+    const auto overlay_readback = [](const TesseraRecord& r) {
+        return (r.flags & TESSERA_FLAG_FOREIGN) && (r.d & 0xff) == D3D11_USAGE_STAGING;
+    };
     int prio_buffers = 0, prio_tex = 0, foreign = 0, vram = 0, flipped = 0, shaders = 0, shaders_new = 0;
     uint32_t budget_mb = 0, usage_mb = 0, cap_mb = 0;
     int workset = 0;
@@ -392,9 +397,11 @@ int verify(const wchar_t* dir, int fps) {
                 ++tex;
                 if (r.bytes == 1398128) ++bc7_full;
                 if (r.flags & TESSERA_FLAG_PRIORITY) ++prio_tex;
+                if (overlay_readback(r)) break;
                 if (r.flags & TESSERA_FLAG_FOREIGN) ++foreign;
                 break;
             case TESSERA_REC_BUFFER:
+                if (overlay_readback(r)) break;
                 ++buffers;
                 if (r.flags & TESSERA_FLAG_PRIORITY) ++prio_buffers;
                 if (r.flags & TESSERA_FLAG_FOREIGN) ++foreign;
