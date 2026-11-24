@@ -3,10 +3,11 @@
 // heavier frames, stutters and a sustained load step. The app writes when
 // each frame started (input sampled: its previous Present returned) and when
 // its work ended; the layer's session log has when each Present was released.
-//   d3d11_smoke --limiter-bench <fps> <csv>
+//   d3d11_smoke --limiter-bench <fps> <csv> [d3d12]   (d3d12: run with the layer as dxgi.dll)
 //   d3d11_smoke --limiter-report <sessions dir> <csv> <fps>
 #include <d3d11.h>
-#include <dxgi.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
 #include <windows.h>
 
 #include <algorithm>
@@ -55,18 +56,40 @@ struct Row {
     int64_t start, end;
     int kind;
 };
-}  // namespace
 
-int limiter_bench(int fps, const wchar_t* csv) {
-    if (fps < 20) return bench_fail("fps");
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = DefWindowProcW;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"tessera_limiter_bench";
-    RegisterClassW(&wc);
-    const HWND wnd = CreateWindowExW(0, wc.lpszClassName, L"limiter bench", WS_OVERLAPPEDWINDOW, 0, 0, 320, 180,
-                                     nullptr, nullptr, wc.hInstance, nullptr);
-    if (!wnd) return bench_fail("window");
+// D3D12: a queue and a flip swap chain from a DXGI factory, the path a D3D12
+// game takes (the layer sees it as dxgi.dll). Nothing is rendered: the back
+// buffers stay in the present state.
+IDXGISwapChain* d3d12_swapchain(HWND wnd, IUnknown** keep) {
+    ID3D12Device* dev = nullptr;
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) return nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    ID3D12CommandQueue* queue = nullptr;
+    const HRESULT qhr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+    dev->Release();
+    if (FAILED(qhr)) return nullptr;
+    IDXGIFactory2* factory = nullptr;
+    IDXGISwapChain1* sc = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
+        DXGI_SWAP_CHAIN_DESC1 d = {};
+        d.Width = d.Height = 64;
+        d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        d.BufferCount = 2;
+        d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        factory->CreateSwapChainForHwnd(queue, wnd, &d, nullptr, nullptr, &sc);
+        factory->Release();
+    }
+    if (!sc) {
+        queue->Release();
+        return nullptr;
+    }
+    *keep = queue;
+    return sc;
+}
+
+IDXGISwapChain* d3d11_swapchain(HWND wnd, IUnknown** keep) {
     DXGI_SWAP_CHAIN_DESC desc = {};
     desc.BufferDesc = {64, 64, {0, 1}, DXGI_FORMAT_R8G8B8A8_UNORM};
     desc.SampleDesc.Count = 1;
@@ -79,7 +102,25 @@ int limiter_bench(int fps, const wchar_t* csv) {
     ID3D11Device* dev = nullptr;
     if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
                                              D3D11_SDK_VERSION, &desc, &sc, &dev, nullptr, nullptr)))
-        return bench_fail("device");
+        return nullptr;
+    *keep = dev;
+    return sc;
+}
+}  // namespace
+
+int limiter_bench(int fps, const wchar_t* csv, bool d3d12) {
+    if (fps < 20) return bench_fail("fps");
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"tessera_limiter_bench";
+    RegisterClassW(&wc);
+    const HWND wnd = CreateWindowExW(0, wc.lpszClassName, L"limiter bench", WS_OVERLAPPEDWINDOW, 0, 0, 320, 180,
+                                     nullptr, nullptr, wc.hInstance, nullptr);
+    if (!wnd) return bench_fail("window");
+    IUnknown* keep = nullptr;
+    IDXGISwapChain* sc = d3d12 ? d3d12_swapchain(wnd, &keep) : d3d11_swapchain(wnd, &keep);
+    if (!sc) return bench_fail("device");
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     const double interval = double(freq.QuadPart) / fps;
@@ -91,13 +132,11 @@ int limiter_bench(int fps, const wchar_t* csv) {
         const int64_t start = qpc();
         const int64_t end = start + static_cast<int64_t>(frame_work(i, rng) * interval);
         while (qpc() < end) YieldProcessor();
-        rows.push_back({qpc(), 0, frame_kind(i)});
-        rows.back().end = rows.back().start;
-        rows.back().start = start;
+        rows.push_back({start, qpc(), frame_kind(i)});
         if (FAILED(sc->Present(0, 0))) return bench_fail("present");
     }
     sc->Release();
-    dev->Release();
+    keep->Release();
     DestroyWindow(wnd);
     FILE* f = nullptr;
     if (_wfopen_s(&f, csv, L"w") || !f) return bench_fail("open csv");

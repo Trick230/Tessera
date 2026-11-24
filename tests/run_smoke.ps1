@@ -38,6 +38,37 @@ function CheckPacing {
         Set-Content "$run\tessera.ini" -Value "[tessera]`nfps_limit=60" -Encoding ascii
         & "$run\d3d11_smoke.exe" --pacing driver | Write-Host
         Check "idle SDK, secondary device, Reflex and NVAPI cap transitions" ($LASTEXITCODE -eq 0)
+        # Low-latency limiter on a noisy load with stutters, through d3d11.dll and (D3D12) dxgi.dll.
+        $proxy = Join-Path $root "build\pacing-smoke\$([guid]::NewGuid())"
+        New-Item -ItemType Directory -Path $proxy -Force | Out-Null
+        Copy-Item -LiteralPath $exe -Destination $proxy
+        $dxgi = Join-Path $root "$native\tests\d3d11_smoke\$Config\tessera_dxgi.dll"
+        Copy-Item -LiteralPath $dxgi -Destination "$proxy\dxgi.dll"
+        Set-Content "$proxy\tessera.ini" -Value "[tessera]`nfps_limit=60`nlimiter_mode=1" -Encoding ascii
+        $apis = @("d3d11", "d3d12")
+        # Vulkan through vulkan-1.dll, when the optional Vulkan bench is built (build.ps1 -Vulkan).
+        $vkBuild = if ($X86) { "build\vulkan-win32" } else { "build\vulkan-telemetry" }
+        $vkBench = Join-Path $root "$vkBuild\src\vulkan_telemetry\$Config\tessera_vulkan_present.exe"
+        if (Test-Path $vkBench) {
+            $vk = Join-Path $root "build\pacing-smoke\$([guid]::NewGuid())"
+            New-Item -ItemType Directory -Path $vk -Force | Out-Null
+            Copy-Item -LiteralPath $vkBench -Destination $vk
+            Copy-Item -LiteralPath (Join-Path $root "$native\tests\d3d11_smoke\$Config\tessera_vulkan.dll") -Destination "$vk\vulkan-1.dll"
+            Set-Content "$vk\tessera.ini" -Value "[tessera]`nfps_limit=60`nlimiter_mode=1" -Encoding ascii
+            $apis += "vulkan"
+        } else { "SKIP vulkan limiter bench (not built)" }
+        foreach ($api in $apis) {
+            $dir = switch ($api) { "d3d11" { $run } "d3d12" { $proxy } default { $vk } }
+            $env:TESSERA_DATA_DIR = Join-Path $dir "data-bench-$api"
+            if ($api -eq "d3d11") { Set-Content "$run\tessera.ini" -Value "[tessera]`nfps_limit=60`nlimiter_mode=1" -Encoding ascii }
+            if ($api -eq "vulkan") { & "$vk\tessera_vulkan_present.exe" 60 "$env:TESSERA_DATA_DIR.csv" | Write-Host }
+            else { & "$dir\d3d11_smoke.exe" --limiter-bench 60 "$env:TESSERA_DATA_DIR.csv" $api | Write-Host }
+            $out = & "$run\d3d11_smoke.exe" --limiter-report "$env:TESSERA_DATA_DIR\sessions" "$env:TESSERA_DATA_DIR.csv" 60
+            $out | Write-Host
+            $ok = "$out" -match 'latency mean=([0-9.]+) .*short after stutter=([0-9]+), misses=([0-9]+)/' -and
+                [double]$Matches[1] -lt 13.5 -and [int]$Matches[2] -eq 0 -and [int]$Matches[3] -le 15
+            Check "$api low-latency limiter: latency, no catch-up after stutters, cadence" $ok
+        }
     } finally { $env:TESSERA_DATA_DIR = $previousDataDir }
 }
 

@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Export forwarding. Every export is an asm stub (exports_d3d11.asm) that
+// Export forwarding. Every export is an asm stub (exports_<proxy>.asm) that
 // jumps through tessera_real[]; the first call lands in tessera_resolve,
 // which loads the real DLL lazily (never in DllMain): the DLL named by
-// tessera.ini `next=` (chained proxy) or the system d3d11.dll.
+// tessera.ini `next=` (chained proxy) or the system DLL of the same name
+// (d3d11.dll; dxgi.dll for D3D12 games with TESSERA_PROXY_DXGI; vulkan-1.dll
+// with TESSERA_PROXY_VULKAN, whose present hook is in vk_present.cpp).
+#if !defined(TESSERA_PROXY_DXGI) && !defined(TESSERA_PROXY_VULKAN)
+#define TESSERA_PROXY_D3D11
+#endif
 #include <windows.h>
 #include <intrin.h>
 
@@ -10,7 +15,13 @@
 #include <cwchar>
 
 #include "config.h"
+#if defined(TESSERA_PROXY_DXGI)
+#include "exports_dxgi_gen.h"
+#elif defined(TESSERA_PROXY_VULKAN)
+#include "exports_vulkan_gen.h"
+#else
 #include "exports_d3d11_gen.h"
+#endif
 #include "flip.h"
 #include "hooks.h"
 #include "log.h"
@@ -49,7 +60,14 @@ void* resolve_export(unsigned idx);
 namespace {
 INIT_ONCE g_load_once = INIT_ONCE_STATIC_INIT;
 HMODULE g_next = nullptr;    // chained proxy from tessera.ini, if any
-HMODULE g_system = nullptr;  // System32\d3d11.dll
+HMODULE g_system = nullptr;  // the system DLL we stand in for
+#if defined(TESSERA_PROXY_DXGI)
+constexpr wchar_t kSystemDll[] = L"\\dxgi.dll";
+#elif defined(TESSERA_PROXY_VULKAN)
+constexpr wchar_t kSystemDll[] = L"\\vulkan-1.dll";
+#else
+constexpr wchar_t kSystemDll[] = L"\\d3d11.dll";
+#endif
 
 HMODULE load_checked(const wchar_t* path) {
     HMODULE m = LoadLibraryW(path);
@@ -78,8 +96,8 @@ BOOL CALLBACK load_real(PINIT_ONCE, void*, void**) {
     }
     // Always loaded: a chained proxy may export only the functions it wraps.
     UINT len = GetSystemDirectoryW(path, MAX_PATH);
-    if (len > 0 && len < MAX_PATH - 12) {
-        wcscat_s(path, L"\\d3d11.dll");
+    if (len > 0 && len + wcslen(kSystemDll) < MAX_PATH) {
+        wcscat_s(path, kSystemDll);
         g_system = load_checked(path);
     }
     return TRUE;
@@ -90,6 +108,7 @@ void* real(int idx) {
     return p ? p : resolve_export(static_cast<unsigned>(idx));
 }
 
+#ifdef TESSERA_PROXY_D3D11
 bool prefer_11_1(void* caller, IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, const D3D_FEATURE_LEVEL* levels,
                  UINT count, ID3D11Device** device) {
     if (!device || type != (adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE)) return false;
@@ -128,6 +147,7 @@ void log_11_1_trial(HRESULT hr) {
     if (SUCCEEDED(hr)) tessera::logf("d3d11: optional feature level 11_1 request succeeded");
     else tessera::logf("d3d11: optional feature level 11_1 request failed 0x%x; used original feature levels", hr);
 }
+#endif
 }  // namespace
 
 void* resolve_export(unsigned idx) {
@@ -147,6 +167,7 @@ extern "C" void* tessera_resolve(unsigned idx) {
     return p ? p : fail_stub(idx);
 }
 
+#ifdef TESSERA_PROXY_D3D11
 extern "C" HRESULT WINAPI Tessera_D3D11CreateDevice(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, HMODULE software,
                                                     UINT flags, const D3D_FEATURE_LEVEL* levels, UINT nlevels,
                                                     UINT sdk, ID3D11Device** dev, D3D_FEATURE_LEVEL* level,
@@ -210,3 +231,30 @@ extern "C" HRESULT WINAPI Tessera_D3D11CreateDeviceAndSwapChain(
     if (trial) log_11_1_trial(trial_hr);
     return hr;
 }
+#elif defined(TESSERA_PROXY_DXGI)
+// dxgi.dll proxy, for D3D12 games (no d3d11.dll in play): swap chains come
+// from the factories, so each new factory gets the swap chain hooks. Nothing
+// is hooked before the session runs (safe mode checked, log open).
+namespace {
+using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+using CreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
+
+HRESULT on_factory(HRESULT hr, void** out) {
+    if (SUCCEEDED(hr) && out && *out && tessera::session_init()) tessera::on_dxgi_factory(static_cast<IUnknown*>(*out));
+    return hr;
+}
+}  // namespace
+
+extern "C" HRESULT WINAPI Tessera_CreateDXGIFactory(REFIID riid, void** out) {
+    auto fn = reinterpret_cast<CreateFactory>(real(tessera::exports::kCreateDXGIFactory));
+    return fn ? on_factory(fn(riid, out), out) : E_NOTIMPL;
+}
+extern "C" HRESULT WINAPI Tessera_CreateDXGIFactory1(REFIID riid, void** out) {
+    auto fn = reinterpret_cast<CreateFactory>(real(tessera::exports::kCreateDXGIFactory1));
+    return fn ? on_factory(fn(riid, out), out) : E_NOTIMPL;
+}
+extern "C" HRESULT WINAPI Tessera_CreateDXGIFactory2(UINT flags, REFIID riid, void** out) {
+    auto fn = reinterpret_cast<CreateFactory2>(real(tessera::exports::kCreateDXGIFactory2));
+    return fn ? on_factory(fn(flags, riid, out), out) : E_NOTIMPL;
+}
+#endif

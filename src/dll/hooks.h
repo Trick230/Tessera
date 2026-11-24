@@ -13,6 +13,8 @@ void rehook_context_flush(ID3D11DeviceContext* ctx);
 // Called after the real D3D11CreateDevice* succeeded.
 void on_device(ID3D11Device* dev, UINT create_flags);
 void on_swapchain(IDXGISwapChain* sc);
+// dxgi.dll proxy: a factory the game created (after session_init succeeded).
+void on_dxgi_factory(IUnknown* factory);
 
 // P2: true while the swapchain hooks flip model relies on can still be installed.
 bool flip_hooks_ready();

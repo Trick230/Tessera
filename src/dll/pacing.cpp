@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Frame pacing for DXGI: precise low-latency limiter (P1, timing in
+// Frame pacing for DXGI and Vulkan: precise low-latency limiter (P1, timing in
 // limiter.cpp), frame latency (P3), back-off when the game or a driver SDK
 // paces frames itself (P6).
 #include "pacing.h"
@@ -21,7 +21,7 @@ std::atomic<IDXGISwapChain*> g_checked{nullptr};
 std::atomic<unsigned> g_seen_revision{0};
 std::atomic<bool> g_driver_pacing{false};
 std::atomic<unsigned> g_pacing_revision{0};
-std::atomic<bool> g_smooth_motion{false};
+std::atomic<bool> g_smooth_motion{false};  // a frame generation runtime is loaded
 // NVAPI pacing on a non-D3D11 device. A D3D12 swap chain reports its queue, not the
 // device, so it cannot be matched per device: all non-D3D11 swap chains yield.
 std::atomic<bool> g_other_paced{false};
@@ -76,6 +76,29 @@ uint32_t pace_after_present(IDXGISwapChain* sc) {
     return limiter::after_present(sc, fps, config().limiter_mode);
 }
 
+uint32_t pace_before_present_any(const void* chain) {
+    const int fps = active_limit();
+    if (!fps) return 0;
+    if (g_other_paced.load(std::memory_order_relaxed) || g_smooth_motion.load(std::memory_order_relaxed)) {
+        limiter::reset();
+        return 0;
+    }
+    return limiter::before_present(chain, fps, config().limiter_mode);
+}
+
+uint32_t pace_after_present_any(const void* chain) {
+    const int fps = active_limit();
+    if (!fps || g_other_paced.load(std::memory_order_relaxed) || g_smooth_motion.load(std::memory_order_relaxed))
+        return 0;
+    return limiter::after_present(chain, fps, config().limiter_mode);
+}
+
+void pacing_set_external_pacing(bool active) {
+    if (config().fps_limit <= 0) return;
+    if (g_other_paced.exchange(active, std::memory_order_relaxed) != active)
+        logf("limiter: %s", active ? "yielding to the driver low-latency mode" : "driver low-latency mode off, resuming");
+}
+
 void pacing_set_driver_mode(IUnknown* device, bool active) {
     if (!device || config().fps_limit <= 0) return;
     ID3D11Device* dev = nullptr;
@@ -90,11 +113,25 @@ void pacing_set_driver_mode(IUnknown* device, bool active) {
 }
 void pacing_background_tick() {
     if (config().fps_limit <= 0) return;
-    // Smooth Motion is a D3D11 driver runtime. It has no public state query
-    // here. Leave its cadence alone while its presentation hook is loaded.
-    const bool loaded = GetModuleHandleW(L"nvpresent64.dll") != nullptr;
-    if (g_smooth_motion.exchange(loaded, std::memory_order_relaxed) != loaded)
-        logf("limiter: %s", loaded ? "yielding to NVIDIA Smooth Motion runtime" : "Smooth Motion runtime unloaded, resuming");
+    // Frame generation runtimes present generated frames from their own
+    // thread and pace them themselves: NVIDIA Smooth Motion (no public state
+    // query), XeSS-FG and the FidelityFX frame interpolation DLLs. Leave the
+    // cadence alone while one is loaded (DLSS-FG runs with Reflex: NVAPI path).
+    static constexpr const wchar_t* kFrameGen[] = {
+        L"nvpresent64.dll", L"nvpresent32.dll", L"libxess_fg.dll",
+        L"ffx_frameinterpolation_x64.dll", L"amd_fidelityfx_framegeneration_dx12.dll",
+        L"amd_fidelityfx_framegeneration_vk.dll"};
+    const wchar_t* found = nullptr;
+    for (const wchar_t* m : kFrameGen)
+        if (GetModuleHandleW(m)) {
+            found = m;
+            break;
+        }
+    const bool loaded = found != nullptr;
+    if (g_smooth_motion.exchange(loaded, std::memory_order_relaxed) != loaded) {
+        if (loaded) logf("limiter: yielding to the frame generation runtime %ls", found);
+        else logf("limiter: frame generation runtime unloaded, resuming");
+    }
 }
 
 void pacing_on_swapchain(IDXGISwapChain* sc) {

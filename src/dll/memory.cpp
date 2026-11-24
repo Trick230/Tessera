@@ -99,6 +99,14 @@ HRESULT STDMETHODCALLTYPE hk_GetDesc2(IDXGIAdapter2* self, DXGI_ADAPTER_DESC2* d
     return hr;
 }
 
+// The dxgi.dll and vulkan-1.dll builds serve D3D12 and Vulkan games: M1 never
+// changes their memory figures, not even before the device is created.
+#if defined(TESSERA_PROXY_DXGI) || defined(TESSERA_PROXY_VULKAN)
+constexpr bool kD3D11Layer = false;
+#else
+constexpr bool kD3D11Layer = true;
+#endif
+
 // LUID and vendor of the first device's adapter; written once before the hooks go in.
 LUID g_luid = {};
 std::atomic<uint32_t> g_vendor{0};
@@ -141,6 +149,7 @@ std::atomic<bool> g_early_done{false};
 std::atomic<int> g_early_ok{-1};  // -1 not tried, 0 failed, 1 on; logged with the device
 
 void on_factory(IUnknown* f) {
+    if (!kD3D11Layer) return;
     if (g_early_done.load(std::memory_order_acquire) || g_adapter.load(std::memory_order_acquire) ||
         g_other_api.load(std::memory_order_relaxed))
         return;
@@ -231,6 +240,7 @@ void* memory_import_hook(const char* name, void* current) {
 }
 
 uint64_t memory_reported_for(uint32_t vendor, uint64_t real) {
+    if (!kD3D11Layer) return real;
     // Before the first device the adapter is unknown: the cap as in the
     // adapter descriptions (NVAPI only knows NVIDIA GPUs).
     const uint32_t v = g_vendor.load(std::memory_order_acquire);

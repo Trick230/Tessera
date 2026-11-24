@@ -242,7 +242,7 @@ BOOL CALLBACK init_once(PINIT_ONCE, void*, void**) {
     wchar_t p[MAX_PATH];
     swprintf_s(p, L"%s\\logs\\%s.log", g_dir, g_exe_name);
     log_open(p);
-    logf("tessera d3d11 layer, exe %ls", g_exe_path);
+    logf("tessera layer, exe %ls", g_exe_path);
 
     // _snwprintf_s: swprintf_s would kill the game on an over-long path.
     if (_snwprintf_s(g_safe_path, _TRUNCATE, L"%s\\safemode\\%s-%016llx.count", g_dir, g_exe_name,

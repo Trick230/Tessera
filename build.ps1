@@ -20,6 +20,8 @@ try {
     & $cmake --build build --config Release
     if ($LASTEXITCODE) { throw "cmake build failed" }
     Copy-Item build\src\dll\Release\tessera_d3d11.dll target\release\tessera_d3d11.dll -Force
+    Copy-Item build\src\dll\Release\tessera_dxgi.dll target\release\tessera_dxgi.dll -Force
+    Copy-Item build\src\dll\Release\tessera_vulkan.dll target\release\tessera_vulkan.dll -Force
     Copy-Item build\src\warm\Release\tessera_warm.exe target\release\tessera_warm.exe -Force
     Copy-Item build\src\d3d12_capture\Release\tessera_d3d12_capture.dll target\release\tessera_d3d12_capture.dll -Force
     if (-not (Test-Path build\win32\CMakeCache.txt)) {
@@ -29,6 +31,8 @@ try {
     & $cmake --build build/win32 --config Release
     if ($LASTEXITCODE) { throw "Win32 cmake build failed" }
     Copy-Item build\win32\src\dll\Release\tessera_d3d11.dll target\release\tessera_d3d11_x86.dll -Force
+    Copy-Item build\win32\src\dll\Release\tessera_dxgi.dll target\release\tessera_dxgi_x86.dll -Force
+    Copy-Item build\win32\src\dll\Release\tessera_vulkan.dll target\release\tessera_vulkan_x86.dll -Force
     Copy-Item build\win32\src\warm\Release\tessera_warm.exe target\release\tessera_warm_x86.exe -Force
     if ($Quality) {
         & $cmake -S . -B build/quality -G "Visual Studio 17 2022" -A x64 -DTESSERA_BUILD_QUALITY=ON

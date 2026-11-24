@@ -14,9 +14,15 @@ uint32_t pace_before_present(IDXGISwapChain* sc);
 // low-latency mode, holds the start of the next frame until its predicted
 // work fits before the next deadline. Returns the time waited in microseconds.
 uint32_t pace_after_present(IDXGISwapChain* sc);
+// The same for a present path without DXGI (Vulkan): `chain` identifies the
+// swap chain; the limiter yields to Reflex (pacing_set_external_pacing).
+uint32_t pace_before_present_any(const void* chain);
+uint32_t pace_after_present_any(const void* chain);
+// P6 outside DXGI: a driver low-latency mode (Vulkan Reflex) is pacing frames.
+void pacing_set_external_pacing(bool active);
 
 // P6: polled from the session writer thread (never the frame path): looks
-// for the NVIDIA Smooth Motion runtime.
+// for a loaded frame generation runtime (Smooth Motion, XeSS-FG, FidelityFX).
 void pacing_background_tick();
 
 // P6: track a successful NVAPI pacing change for the corresponding device.

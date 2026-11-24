@@ -782,4 +782,11 @@ void on_device(ID3D11Device* dev, UINT create_flags) {
         dxgi->Release();
     }
 }
+
+void on_dxgi_factory(IUnknown* factory) {
+    IDXGIFactory* f = nullptr;
+    if (FAILED(factory->QueryInterface(IID_PPV_ARGS(&f)))) return;
+    hook_factory(f);
+    f->Release();
+}
 }  // namespace tessera

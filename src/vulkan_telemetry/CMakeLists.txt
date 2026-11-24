@@ -14,3 +14,7 @@ add_custom_command(TARGET tessera_vulkan_telemetry POST_BUILD
 add_executable(tessera_vulkan_device_fixture ${PROJECT_SOURCE_DIR}/tests/vulkan_device/main.cpp)
 target_include_directories(tessera_vulkan_device_fixture PRIVATE ${TESSERA_VULKAN_HEADERS})
 target_compile_definitions(tessera_vulkan_device_fixture PRIVATE VK_NO_PROTOTYPES)
+# Frame limiter bench on Vulkan, run with tessera_vulkan.dll as vulkan-1.dll.
+add_executable(tessera_vulkan_present ${PROJECT_SOURCE_DIR}/tests/vulkan_present/main.cpp)
+target_include_directories(tessera_vulkan_present PRIVATE ${TESSERA_VULKAN_HEADERS})
+target_compile_definitions(tessera_vulkan_present PRIVATE VK_NO_PROTOTYPES)
