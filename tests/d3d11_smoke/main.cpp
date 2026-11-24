@@ -4,6 +4,7 @@
 //   d3d11_smoke --crash    create a device and die without DLL detach
 //   d3d11_smoke --tiled    mip residency (M3-M5), with mip_residency=1 and mip_force_evict=1
 //   d3d11_smoke --pacing [driver]   measure recovery after a late frame or verify driver handoff
+//   d3d11_smoke --limiter-bench / --limiter-report   frame limiter latency and cadence (limiter_bench.cpp)
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
 #include <d3d11_3.h>
@@ -21,6 +22,8 @@
 
 #include "tessera/session_format.h"
 #include "tessera/shader_store_format.h"
+int limiter_bench(int fps, const wchar_t* csv);
+int limiter_report(const wchar_t* dir, const wchar_t* csv, int fps);
 
 namespace {
 int fail(const char* what, HRESULT hr = S_OK) {
@@ -1483,6 +1486,8 @@ int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--recycle") == 0) return recycle_mode();
     if (argc >= 2 && wcscmp(argv[1], L"--tiled") == 0) return tiled();
     if (argc >= 2 && wcscmp(argv[1], L"--nvapi") == 0) return nvapi_mode();
+    if (argc >= 4 && wcscmp(argv[1], L"--limiter-bench") == 0) return limiter_bench(_wtoi(argv[2]), argv[3]);
+    if (argc >= 5 && wcscmp(argv[1], L"--limiter-report") == 0) return limiter_report(argv[2], argv[3], _wtoi(argv[4]));
     if (argc >= 2 && wcscmp(argv[1], L"--pacing") == 0) return pacing_mode(argc >= 3 && wcscmp(argv[2], L"driver") == 0);
     if (argc >= 2 && wcscmp(argv[1], L"--d3d11-calls") == 0)
         return d3d11_calls_mode(argc >= 3 && wcscmp(argv[2], L"bench") == 0);

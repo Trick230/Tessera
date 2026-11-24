@@ -21,6 +21,7 @@ add_library(tessera_d3d11 SHARED
   module.cpp
   process.cpp
   pacing.cpp
+  limiter.cpp
   prediction.cpp
   memory.cpp
   mip_feedback.cpp

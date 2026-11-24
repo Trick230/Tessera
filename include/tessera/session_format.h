@@ -31,7 +31,8 @@
 
 enum TesseraRecordKind {
     TESSERA_REC_FRAME = 1,      // a = CPU frame time in us (0 on the first frame),
-                                // b = frame limiter wait before this Present in us
+                                // b = frame limiter wait before this Present in us,
+                                // c = limiter wait at the start of this frame in us
     TESSERA_REC_TEXTURE2D = 2,  // a = width, b = height, c = mips | array << 8,
                                 // d = usage | misc << 8, flags = bind, bytes = estimate
     TESSERA_REC_BUFFER = 3,     // a = byte width, d = usage | misc << 8, flags = bind, bytes = a

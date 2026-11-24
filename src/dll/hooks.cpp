@@ -64,6 +64,7 @@ uint64_t now_qpc() {
 }
 
 std::atomic<DWORD> g_present_tid{0};  // last thread that presented
+std::atomic<uint32_t> g_start_wait{0};    // P1: limiter wait after the last Present, us
 
 uint32_t elapsed_us(uint64_t start, uint64_t end) {
     static const uint64_t freq = [] {
@@ -542,13 +543,14 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
         if (ff.skip) return S_OK;
     }
     using F = decltype(&hk_Present);
-    if (frame) session_frame(pace_before_present(self));
+    if (frame) session_frame(pace_before_present(self), g_start_wait.exchange(0, std::memory_order_relaxed));
     const HRESULT hr = orig<F>(g_present, self)(self, sync, flags);
     flip_after_present(ff);
     if (managed) residency_after_present();
     else if (frame) workset_after_present(self);
     if (config().mip_feedback) feedback_after_present(self);
     if (config().texture_quality == 2) quality_after_present(self);
+    if (frame && SUCCEEDED(hr)) g_start_wait.store(pace_after_present(self), std::memory_order_relaxed);
     return hr;
 }
 
@@ -570,13 +572,14 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
         if (ff.skip) return S_OK;
     }
     using F = decltype(&hk_Present1);
-    if (frame) session_frame(pace_before_present(self));
+    if (frame) session_frame(pace_before_present(self), g_start_wait.exchange(0, std::memory_order_relaxed));
     const HRESULT hr = orig<F>(g_present1, self)(self, sync, flags, params);
     flip_after_present(ff);
     if (managed) residency_after_present();
     else if (frame) workset_after_present(self);
     if (config().mip_feedback) feedback_after_present(self);
     if (config().texture_quality == 2) quality_after_present(self);
+    if (frame && SUCCEEDED(hr)) g_start_wait.store(pace_after_present(self), std::memory_order_relaxed);
     return hr;
 }
 

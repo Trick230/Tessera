@@ -14,8 +14,9 @@ bool session_safe_mode();
 
 // Lock-free; callable from any thread. Never blocks, never allocates.
 void session_push(TesseraRecord& r);
-// wait_us: time the frame limiter waited before this Present.
-void session_frame(uint32_t wait_us);
+// wait_us: time the frame limiter waited before this Present; start_wait_us:
+// time it held the start of this frame, after the previous Present.
+void session_frame(uint32_t wait_us, uint32_t start_wait_us);
 
 // Per-game data file: <data dir>\<sub>\<exe name>-<path key>.<ext> (same key as
 // the safe-mode counter); creates <sub>. out holds MAX_PATH. After session_init.

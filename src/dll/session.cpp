@@ -331,7 +331,7 @@ void session_push(TesseraRecord& r) {
     s.seq.store(i + 1, std::memory_order_release);
 }
 
-void session_frame(uint32_t wait_us) {
+void session_frame(uint32_t wait_us, uint32_t start_wait_us) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     const int64_t prev = g_last_present.exchange(now.QuadPart, std::memory_order_relaxed);
@@ -339,6 +339,7 @@ void session_frame(uint32_t wait_us) {
     r.qpc = static_cast<uint64_t>(now.QuadPart);
     r.kind = TESSERA_REC_FRAME;
     r.b = wait_us;
+    r.c = start_wait_us;
     // prev > now: two threads presenting (secondary swapchain); report 0.
     if (prev && prev <= now.QuadPart) {
         const uint64_t us = static_cast<uint64_t>(now.QuadPart - prev) * 1000000u / static_cast<uint64_t>(g_freq.QuadPart);

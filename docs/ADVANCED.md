@@ -42,6 +42,13 @@ Always on unless set to 0: `process` (timer resolution, EcoQoS off), `workset` (
 values: `fps_limit`, `max_frame_latency`, `vram_budget_mb`, `mip_ram_mb`. The app turns the `ue_*` keys into
 `cvar.*` lines (one value slot per variable, checked by the layer before each write).
 
+Frame limiter (`fps_limit`): `limiter_mode=1` (default) holds the start of each frame for the time its work is
+predicted not to need, then aligns the present to the cadence, so input is sampled shortly before the frame is
+shown. A late frame (stutter) is presented at once and the cadence restarts from it, without a burst of short
+frames. `limiter_mode=0` waits just before the present (steady, up to one interval of added latency);
+`limiter_mode=2` waits only at the frame start (lowest latency, uneven cadence). `d3d11_smoke --limiter-bench`
+measures all three.
+
 ## Command line
 
 - `tessera.exe --scan <game-exe> <install-folder>` writes a `*.scan.zip` shader export under

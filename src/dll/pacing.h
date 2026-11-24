@@ -10,6 +10,10 @@ namespace tessera {
 // primary one and neither an external cap nor driver pacing takes precedence.
 // Returns the time waited in microseconds. The timer is created once per thread.
 uint32_t pace_before_present(IDXGISwapChain* sc);
+// P1: called by the outermost Present hook after the real Present. In the
+// low-latency mode, holds the start of the next frame until its predicted
+// work fits before the next deadline. Returns the time waited in microseconds.
+uint32_t pace_after_present(IDXGISwapChain* sc);
 
 // P6: polled from the session writer thread (never the frame path): looks
 // for the NVIDIA Smooth Motion runtime.
