@@ -43,4 +43,14 @@ $before = (Get-FileHash -LiteralPath $recordPath).Hash
 $alias = Join-Path (Split-Path $recordPath -Parent) ('.\' + (Split-Path $recordPath -Leaf))
 Replay alias $recordPath "$run/alias.bin" $alias 1
 if ((Get-FileHash -LiteralPath $recordPath).Hash -ne $before) { throw 'Checkpoint modified the recording' }
+# A pipeline the driver cannot build must not discard the ones that were built.
+if ([Text.Encoding]::ASCII.GetString($bytes, 0, 7) -eq "TSRVKC3") {
+    $bad = [byte[]]::new($bytes.Length + 12)
+    [Array]::Copy($bytes, $bad, $bytes.Length)
+    [BitConverter]::GetBytes([uint32]8).CopyTo($bad, $bytes.Length)
+    [BitConverter]::GetBytes([uint32]99).CopyTo($bad, $bytes.Length + 4)
+    [IO.File]::WriteAllBytes("$run/partial.tvc", $bad)
+    Replay partial "$run/partial.tvc" "$run/partial.bin" "$run/partial-checkpoint.bin" 0
+    if (-not (Test-Path "$run/partial.bin")) { throw "Partial replay did not save the pipelines it built" }
+}
 "PASS Vulkan replay interruption, resume, corrupt/foreign seeds and path alias ($run)"

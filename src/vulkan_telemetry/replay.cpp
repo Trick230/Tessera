@@ -306,6 +306,7 @@ int run(const wchar_t* recording, const wchar_t* output, const wchar_t* checkpoi
         return 1;
     }
     size_t total = sizeof(header), prepared[2]{}, failed = 0;
+    bool lost = false;
     const auto attempted = [&] { return prepared[0] + prepared[1] + failed; };
     std::vector<uint8_t> packet;
     while (true) {
@@ -349,12 +350,17 @@ int run(const wchar_t* recording, const wchar_t* output, const wchar_t* checkpoi
         else {
             ++failed;
             fprintf(stderr, "Vulkan pipeline %zu failed (%d)\n", attempted(), result);
-            if (result == VK_ERROR_DEVICE_LOST) break;
+            if (result == VK_ERROR_DEVICE_LOST) {
+                lost = true;
+                break;
+            }
         }
     }
     if (prepared[1]) printf("Vulkan pipelines prepared: %zu compute, %zu graphics, %zu failed\n", prepared[0], prepared[1], failed);
     else printf("Vulkan compute pipelines prepared: %zu, %zu failed\n", prepared[0], failed);
-    if (failed || !attempted()) return 1;
+    // A pipeline the driver rejects fails again on every run; keep what was built.
+    // A lost device leaves the cache unreadable: the last checkpoint resumes next run.
+    if (lost || !(prepared[0] + prepared[1])) return 1;
     if (checkpoint && !save_cache(context, checkpoint, true)) {
         fprintf(stderr, "cannot save Vulkan replay checkpoint\n");
         return 1;
