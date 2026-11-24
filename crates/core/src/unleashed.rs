@@ -53,6 +53,32 @@ pub struct Inventory {
     pub vertex_declarations: BTreeMap<u64, Vec<u8>>,
 }
 
+/// Input for the native Vulkan converter. Its packed state stays specific to
+/// the identified executable; the converter emits ordinary Tessera recipes.
+pub fn write_vulkan_inputs(exe: &Path, mut out: impl io::Write, samples: u8, bicubic: bool, transparency_aa: bool) -> io::Result<()> {
+    if !matches!(samples, 1 | 2 | 4 | 8) {
+        return Err(io::Error::other("expected 1, 2, 4 or 8 MSAA samples"));
+    }
+    let inventory = inventory(exe)?;
+    out.write_all(b"TSRURV1\0")?;
+    out.write_all(&[samples, u8::from(bicubic), u8::from(transparency_aa), 0])?;
+    out.write_all(&(inventory.pipelines.len() as u32).to_le_bytes())?;
+    for pipeline in &inventory.pipelines {
+        let vertex = &inventory.referenced_shaders[&pipeline.vertex_shader];
+        let pixel = pipeline.pixel_shader.map(|hash| &inventory.referenced_shaders[&hash]);
+        let mask = vertex.specialization_mask | pixel.map_or(0, |shader| shader.specialization_mask);
+        out.write_all(&pipeline.state)?;
+        out.write_all(&mask.to_le_bytes())?;
+        let declaration = &inventory.vertex_declarations[&pipeline.vertex_declaration];
+        let fragment = pixel.map_or(&[][..], |shader| shader.spirv.as_slice());
+        for bytes in [declaration.as_slice(), vertex.spirv.as_slice(), fragment] {
+            out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            out.write_all(bytes)?;
+        }
+    }
+    out.flush()
+}
+
 fn u64_at(bytes: &[u8], pos: usize) -> u64 {
     u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap())
 }

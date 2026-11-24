@@ -2,6 +2,7 @@
 #include <windows.h>
 
 #include "device_recipe.h"
+#include "unleashed_recipe.h"
 
 #include <algorithm>
 #include <chrono>
@@ -45,6 +46,7 @@ struct Context {
     PFN_vkGetDeviceProcAddr get_device{};
     bool descriptor_indexing{};
     bool graphics{};
+    VkPhysicalDeviceProperties selected{};
 
     ~Context() {
         if (cache) fn<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(device, cache, nullptr);
@@ -93,7 +95,7 @@ struct Context {
         return true;
     }
 
-    bool initialize(const Header& header, const wchar_t* checkpoint, DeviceRecipe* recorded) {
+    bool initialize(const Header& header, const wchar_t* checkpoint, DeviceRecipe* recorded, bool automatic = false) {
         loader = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!loader) return false;
         get_instance = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(loader, "vkGetInstanceProcAddr"));
@@ -115,10 +117,16 @@ struct Context {
         for (const auto found : physical_devices) {
             VkPhysicalDeviceProperties props{};
             properties(found, &props);
-            if (props.apiVersion >= header.api && props.vendorID == header.vendor && props.deviceID == header.device
-                && std::memcmp(props.pipelineCacheUUID, header.cache_uuid, VK_UUID_SIZE) == 0) {
+            if (props.apiVersion >= header.api && ((automatic && props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU)
+                || (props.vendorID == header.vendor && props.deviceID == header.device
+                    && std::memcmp(props.pipelineCacheUUID, header.cache_uuid, VK_UUID_SIZE) == 0))) {
+                if (automatic && physical) {
+                    fprintf(stderr, "cannot select the Unleashed graphics adapter automatically on this system\n");
+                    return false;
+                }
                 physical = found;
-                break;
+                selected = props;
+                if (!automatic) break;
             }
         }
         if (!physical) {
@@ -304,22 +312,85 @@ VkResult replay_graphics(const Context& context, std::vector<uint8_t>& bytes) {
         context.device, context.cache, 1, &wire.pipeline, nullptr, &objects.pipeline);
 }
 
+bool save_bytes(const wchar_t* filename, const void* bytes, size_t size, bool replace = false) {
+    const std::wstring temporary = std::wstring(filename) + L".tmp";
+    const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
+        replace ? CREATE_ALWAYS : CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool complete = WriteFile(file, bytes, static_cast<DWORD>(size), &written, nullptr) && written == size;
+    CloseHandle(file);
+    return complete && MoveFileExW(temporary.c_str(), filename,
+        MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0));
+}
+
 bool save_cache(const Context& context, const wchar_t* filename, bool replace = false) {
     const auto read = context.fn<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     size_t size = 0;
     if (read(context.device, context.cache, &size, nullptr) != VK_SUCCESS
         || size < sizeof(VkPipelineCacheHeaderVersionOne) || size > file_limit) return false;
     std::vector<char> cache(size);
-    if (read(context.device, context.cache, &size, cache.data()) != VK_SUCCESS) return false;
-    const std::wstring temporary = std::wstring(filename) + L".tmp";
-    const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
-        replace ? CREATE_ALWAYS : CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    const bool complete = WriteFile(file, cache.data(), static_cast<DWORD>(size), &written, nullptr) && written == size;
-    CloseHandle(file);
-    return complete && MoveFileExW(temporary.c_str(), filename,
-        MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0));
+    return read(context.device, context.cache, &size, cache.data()) == VK_SUCCESS
+        && save_bytes(filename, cache.data(), size, replace);
+}
+
+int convert_unleashed(const wchar_t* input_path, const wchar_t* output) {
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, input_path, L"rb") || !file) return 1;
+    const std::unique_ptr<FILE, decltype(&fclose)> guard(file, fclose);
+    char tag[8];
+    unleashed::Settings settings{};
+    uint32_t count;
+    if (fread(tag, sizeof(tag), 1, file) != 1 || std::memcmp(tag, unleashed::magic, sizeof(tag))
+        || fread(&settings, sizeof(settings), 1, file) != 1
+        || (settings.samples != 1 && settings.samples != 2 && settings.samples != 4 && settings.samples != 8)
+        || settings.bicubic > 1 || settings.transparency > 1 || settings.reserved
+        || fread(&count, sizeof(count), 1, file) != 1 || count != 217) {
+        fprintf(stderr, "invalid Unleashed Vulkan inputs\n");
+        return 1;
+    }
+    Header header{};
+    std::memcpy(header.tag, mixed_magic, sizeof(header.tag));
+    header.api = VK_API_VERSION_1_2;
+    Context context;
+    if (!context.initialize(header, nullptr, nullptr, true)) return 1;
+    header.vendor = context.selected.vendorID;
+    header.device = context.selected.deviceID;
+    std::memcpy(header.cache_uuid, context.selected.pipelineCacheUUID, VK_UUID_SIZE);
+
+    std::vector<uint8_t> recording(sizeof(header));
+    std::memcpy(recording.data(), &header, sizeof(header));
+    size_t recipes = 0;
+    unleashed::Input input;
+    std::vector<uint8_t> packet;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!unleashed::read(file, input)) {
+            fprintf(stderr, "invalid Unleashed pipeline input %u\n", i + 1);
+            return 1;
+        }
+        const bool has_msaa = settings.samples != 1 && input.field(68) == 10 && input.field(72) == 32;
+        for (uint32_t variant = 0; variant <= uint32_t(has_msaa); ++variant) {
+            if (!unleashed::packet(input, settings, variant != 0, packet)
+                || packet.size() > packet_limit - 4 || recording.size() + packet.size() + 8 > file_limit) {
+                fprintf(stderr, "unsupported Unleashed pipeline input %u (variant %u)\n", i + 1, variant);
+                return 1;
+            }
+            const uint32_t size = static_cast<uint32_t>(packet.size()) + 4;
+            const auto pos = recording.size();
+            recording.resize(pos + 8 + packet.size());
+            std::memcpy(recording.data() + pos, &size, sizeof(size));
+            constexpr uint32_t kind = graphics_packet;
+            std::memcpy(recording.data() + pos + 4, &kind, sizeof(kind));
+            std::memcpy(recording.data() + pos + 8, packet.data(), packet.size());
+            ++recipes;
+        }
+    }
+    if (fgetc(file) != EOF || ferror(file) || !save_bytes(output, recording.data(), recording.size())) {
+        fprintf(stderr, "cannot save Unleashed Vulkan recipes\n");
+        return 1;
+    }
+    printf("Unleashed Vulkan recipes: %u base, %zu MSAA variants\n", count, recipes - count);
+    return 0;
 }
 
 int run(const wchar_t* recording, const wchar_t* output, const wchar_t* checkpoint = nullptr) {
@@ -431,8 +502,13 @@ int run(const wchar_t* recording, const wchar_t* output, const wchar_t* checkpoi
 }  // namespace
 
 int wmain(int count, wchar_t** args) {
+    if (count == 4 && !wcscmp(args[1], L"--convert-unleashed")) {
+        try { return convert_unleashed(args[2], args[3]); }
+        catch (const std::exception& error) { fprintf(stderr, "%s\n", error.what()); return 1; }
+    }
     if (count != 3 && (count != 5 || wcscmp(args[3], L"--checkpoint"))) {
         fprintf(stderr, "usage: tessera_vulkan_replay <recording> <new cache file> [--checkpoint <cache file>]\n");
+        fprintf(stderr, "       tessera_vulkan_replay --convert-unleashed <inputs> <new recording>\n");
         return 1;
     }
     try {
