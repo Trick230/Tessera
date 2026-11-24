@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "graphics_recipe.h"
+#include "device_recipe.h"
 
 #include <windows.h>
 
@@ -30,6 +30,13 @@ public:
 
     ~Capture() { if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_); }
     bool available() const { return file_ != INVALID_HANDLE_VALUE; }
+
+    // Written first, before any pipeline, so the replay can create a matching device.
+    void device(const VkDeviceCreateInfo& info) {
+        if (!graphics_) return;
+        const std::lock_guard guard(lock_);
+        write_packet(device_packet, encode_device(info));
+    }
 
     void shader(VkShaderModule module, const VkShaderModuleCreateInfo& info) {
         if (info.flags || info.pNext || info.codeSize % sizeof(uint32_t)) return;

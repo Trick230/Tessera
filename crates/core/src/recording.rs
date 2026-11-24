@@ -70,6 +70,12 @@ impl Format {
         Ok(records)
     }
 
+    /// The Vulkan layer's device-state packet (kind 2 in mixed recordings): not a pipeline,
+    /// and the replay reads it only as the first record.
+    fn is_device(&self, header: &[u8], record: &[u8]) -> bool {
+        !self.d3d12 && header.starts_with(b"TSRVKC3\0") && record.len() >= 8 && read_u32(record, 4) == 2
+    }
+
     fn key<'a>(&self, bytes: &'a [u8]) -> (&'a [u8], &'a [u8]) {
         if self.d3d12 { (&bytes[..24], &bytes[32..]) } else { (&[], bytes) }
     }
@@ -186,10 +192,11 @@ pub fn import(exe: &Path, api: ShaderApi, path: &Path) -> io::Result<u64> {
     let _lock = scan::lock(exe)?;
     let new = open_capture(path)?;
     let format = format(api, &new)?;
-    let incoming = format.records(&new)?;
+    let header = &new[..format.header];
+    let (devices, incoming): (Vec<&[u8]>, Vec<&[u8]>) =
+        format.records(&new)?.into_iter().partition(|record| format.is_device(header, record));
     if incoming.is_empty() { return Err(io::Error::other("the recording has no pipelines")); }
     let old = active(&dir).map(|active| open_capture(&active.file)).transpose()?;
-    let header = &new[..format.header];
     let mut unique = HashMap::<u128, Vec<&[u8]>>::new();
     let mut records = Vec::new();
     let mut size = header.len();
@@ -197,8 +204,16 @@ pub fn import(exe: &Path, api: ShaderApi, path: &Path) -> io::Result<u64> {
         Some(bytes) if bytes.starts_with(header) => format.records(bytes)?,
         _ => Vec::new(),
     };
+    // The newest session's device state goes first; older ones are dropped.
+    let (old_devices, existing): (Vec<&[u8]>, Vec<&[u8]>) =
+        existing.into_iter().partition(|record| format.is_device(header, record));
+    let device = devices.last().or(old_devices.last()).copied();
     let mut hash = Xxh3::new();
     hash.update(header);
+    if let Some(device) = device {
+        size += device.len();
+        hash.update(device);
+    }
     for record in existing.into_iter().chain(incoming) {
         let key = format.key(record);
         let identity = xxh3_128(key.1) ^ xxh3_128(key.0).rotate_left(53);
@@ -220,6 +235,7 @@ pub fn import(exe: &Path, api: ShaderApi, path: &Path) -> io::Result<u64> {
         let temporary = dir.join("import.tmp");
         let mut out = BufWriter::new(File::create(&temporary)?);
         out.write_all(header)?;
+        if let Some(device) = device { out.write_all(device)?; }
         for record in records { out.write_all(record)?; }
         out.flush()?;
         drop(out);
@@ -275,4 +291,30 @@ pub fn prepare(exe: &Path, api: ShaderApi, helper_dir: &Path) -> io::Result<Stri
         "capture": active.key, "environment": scope, "summary": summary, "saved_cache": saved_cache,
     }))?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vulkan_device_state_is_not_a_pipeline() {
+        let mut bytes = b"TSRVKC3\0".to_vec();
+        bytes.resize(36, 0);
+        for kind in [2u32, 1] {
+            bytes.extend_from_slice(&8u32.to_le_bytes());
+            bytes.extend_from_slice(&kind.to_le_bytes());
+            bytes.extend_from_slice(&[0; 4]);
+        }
+        let format = format(ShaderApi::Vulkan, &bytes).unwrap();
+        let records = format.records(&bytes).unwrap();
+        let header = &bytes[..36];
+        assert_eq!(records.len(), 2);
+        assert!(format.is_device(header, records[0]));
+        assert!(!format.is_device(header, records[1]));
+        // Older compute-only recordings have no packet kinds.
+        let mut legacy = bytes.clone();
+        legacy[6] = b'2';
+        assert!(!format.is_device(&legacy[..36], records[0]));
+    }
 }

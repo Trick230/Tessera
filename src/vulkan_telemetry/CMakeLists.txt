@@ -11,3 +11,6 @@ target_compile_options(tessera_vulkan_replay PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/
 add_custom_command(TARGET tessera_vulkan_telemetry POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/TesseraTelemetry.json"
           "$<TARGET_FILE_DIR:tessera_vulkan_telemetry>/TesseraTelemetry.json")
+add_executable(tessera_vulkan_device_fixture ${PROJECT_SOURCE_DIR}/tests/vulkan_device/main.cpp)
+target_include_directories(tessera_vulkan_device_fixture PRIVATE ${TESSERA_VULKAN_HEADERS})
+target_compile_definitions(tessera_vulkan_device_fixture PRIVATE VK_NO_PROTOTYPES)

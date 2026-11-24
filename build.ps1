@@ -42,7 +42,7 @@ try {
     if ($Vulkan) {
         & $cmake -S . -B build/vulkan-telemetry -G "Visual Studio 17 2022" -A x64 -DTESSERA_BUILD_VULKAN_TELEMETRY=ON
         if ($LASTEXITCODE) { throw "Vulkan configure failed" }
-        & $cmake --build build/vulkan-telemetry --config Release --target tessera_vulkan_telemetry tessera_vulkan_replay
+        & $cmake --build build/vulkan-telemetry --config Release --target tessera_vulkan_telemetry tessera_vulkan_replay tessera_vulkan_device_fixture
         if ($LASTEXITCODE) { throw "Vulkan tools build failed" }
         $vk = "build/vulkan-telemetry/src/vulkan_telemetry/Release"
         Copy-Item "$vk/tessera_vulkan_telemetry.dll","$vk/tessera_vulkan_replay.exe",

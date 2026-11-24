@@ -241,7 +241,7 @@ void destroy_cache(VkDevice device, const Device& d) {
     if (d.cache && destroy) destroy(device, d.cache, nullptr);
 }
 
-void create_recipe_capture(const Instance& parent, VkPhysicalDevice physical, Device& d) {
+void create_recipe_capture(const Instance& parent, VkPhysicalDevice physical, const VkDeviceCreateInfo& info, Device& d) {
     auto path = environment_path(L"TESSERA_VULKAN_PIPELINE_CAPTURE");
     const bool graphics = !path.empty();
     if (!graphics) path = environment_path(L"TESSERA_VULKAN_COMPUTE_CAPTURE");
@@ -253,7 +253,9 @@ void create_recipe_capture(const Instance& parent, VkPhysicalDevice physical, De
     get(physical, &properties);
     const auto api = parent.api < properties.apiVersion ? parent.api : properties.apiVersion;
     auto capture = std::make_shared<tessera::vulkan_recipe::Capture>(path, api, properties, graphics);
-    if (capture->available()) d.recipes = std::move(capture);
+    if (!capture->available()) return;
+    capture->device(info);
+    d.recipes = std::move(capture);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
@@ -291,7 +293,7 @@ VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice physical, const Vk
         reinterpret_cast<PFN_vkQueuePresentKHR>(get_device(*result, "vkQueuePresentKHR")),
         feedback, *result};
     try { create_cache(parent, physical, *result, device); } catch (...) {}
-    try { create_recipe_capture(parent, physical, device); } catch (...) {}
+    try { create_recipe_capture(parent, physical, *info, device); } catch (...) {}
     try {
         const std::lock_guard lock(dispatch_lock);
         devices.emplace(dispatch_key(*result), device);

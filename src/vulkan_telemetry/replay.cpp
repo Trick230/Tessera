@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <windows.h>
 
-#include "graphics_recipe.h"
+#include "device_recipe.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -58,7 +58,41 @@ struct Context {
     template<class T>
     T fn(const char* name) const { return reinterpret_cast<T>(get_device(device, name)); }
 
-    bool initialize(const Header& header, const wchar_t* checkpoint) {
+    // Creates the device with the extensions and features the game enabled. Extensions the
+    // driver does not list (layer-provided ones) and presentation extensions are left out.
+    bool create_recorded(VkPhysicalDevice physical, PFN_vkCreateDevice make_device,
+            const VkDeviceQueueCreateInfo& queue, DeviceRecipe& recorded) {
+        const auto list = instance_fn<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
+        uint32_t count = 0;
+        if (!list || list(physical, nullptr, &count, nullptr) != VK_SUCCESS || count > 4096) return false;
+        std::vector<VkExtensionProperties> supported(count);
+        if (list(physical, nullptr, &count, supported.data()) != VK_SUCCESS) return false;
+        std::vector<const char*> names;
+        size_t dropped = 0;
+        for (const auto& name : recorded.extensions) {
+            const bool listed = std::any_of(supported.begin(), supported.begin() + count,
+                [&](const VkExtensionProperties& p) { return name == p.extensionName; });
+            if (listed && replayable_extension(name.c_str())) names.push_back(name.c_str());
+            else if (listed) continue;
+            else ++dropped;
+        }
+        void* chain = nullptr;
+        for (auto it = recorded.structs.rbegin(); it != recorded.structs.rend(); ++it) {
+            reinterpret_cast<VkBaseOutStructure*>(it->data())->pNext = static_cast<VkBaseOutStructure*>(chain);
+            chain = it->data();
+        }
+        if (dropped || recorded.unknown)
+            fprintf(stderr, "Vulkan device state: %zu unavailable extension(s), %u unrecorded feature structure(s)\n",
+                dropped, recorded.unknown);
+        const VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, chain, 0, 1, &queue, 0, nullptr,
+            static_cast<uint32_t>(names.size()), names.data(), recorded.core ? &recorded.features : nullptr};
+        if (make_device(physical, &info, nullptr, &device) != VK_SUCCESS) return false;
+        fprintf(stderr, "replaying with the recorded Vulkan device state (%zu extension(s), %zu feature structure(s))\n",
+            names.size(), recorded.structs.size());
+        return true;
+    }
+
+    bool initialize(const Header& header, const wchar_t* checkpoint, DeviceRecipe* recorded) {
         loader = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!loader) return false;
         get_instance = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(loader, "vkGetInstanceProcAddr"));
@@ -129,10 +163,13 @@ struct Context {
         const VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             descriptor_indexing ? &features11 : nullptr, 0, 1, &queue, 0,
             nullptr, 0, nullptr, &available};
+        // Features such as robustness change driver codegen and cache keys: replay the game's own set.
+        if (recorded && create_recorded(physical, make_device, queue, *recorded)) descriptor_indexing = true;
+        else if (recorded) fprintf(stderr, "the recorded Vulkan device state was rejected; replaying with all features\n");
         const auto seed = read_checkpoint(checkpoint, header);
         const VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0,
             seed.size(), seed.empty() ? nullptr : seed.data()};
-        return make_device(physical, &info, nullptr, &device) == VK_SUCCESS
+        return (device || make_device(physical, &info, nullptr, &device) == VK_SUCCESS)
             && fn<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(device, &cache_info, nullptr, &cache) == VK_SUCCESS;
     }
 };
@@ -301,7 +338,21 @@ int run(const wchar_t* recording, const wchar_t* output, const wchar_t* checkpoi
         return 1;
     }
     Context context;
-    if (!context.initialize(header, checkpoint)) {
+    // Recordings since the device packet start with the game's device state.
+    DeviceRecipe recorded;
+    bool has_device = false;
+    if (mixed) {
+        uint32_t size = 0, kind = 0;
+        std::vector<uint8_t> bytes;
+        if (fread(&size, 1, sizeof(size), file) == sizeof(size) && size > sizeof(kind) && size <= packet_limit
+            && fread(&kind, 1, sizeof(kind), file) == sizeof(kind) && kind == device_packet) {
+            bytes.resize(size - sizeof(kind));
+            has_device = fread(bytes.data(), 1, bytes.size(), file) == bytes.size() && decode_device(bytes, recorded);
+            if (!has_device) fprintf(stderr, "invalid Vulkan device state; replaying with all features\n");
+        }
+        if (_fseeki64(file, sizeof(header), SEEK_SET)) return 1;
+    }
+    if (!context.initialize(header, checkpoint, has_device ? &recorded : nullptr)) {
         fprintf(stderr, "cannot create a compatible Vulkan device or pipeline cache\n");
         return 1;
     }

@@ -53,4 +53,29 @@ if ([Text.Encoding]::ASCII.GetString($bytes, 0, 7) -eq "TSRVKC3") {
     Replay partial "$run/partial.tvc" "$run/partial.bin" "$run/partial-checkpoint.bin" 0
     if (-not (Test-Path "$run/partial.bin")) { throw "Partial replay did not save the pipelines it built" }
 }
+# The device state recorded by the layer is replayed in place of "every available feature".
+$fixture = Join-Path (Split-Path $helperPath -Parent) "tessera_vulkan_device_fixture.exe"
+if ((Test-Path $fixture) -and [Text.Encoding]::ASCII.GetString($bytes, 0, 7) -eq "TSRVKC3") {
+    $env:VK_LAYER_PATH = Split-Path $helperPath -Parent
+    $env:TESSERA_VULKAN_PIPELINE_CAPTURE = "$run/device.tvc"
+    try { & $fixture } finally { Remove-Item Env:TESSERA_VULKAN_PIPELINE_CAPTURE, Env:VK_LAYER_PATH }
+    if ($LASTEXITCODE) { throw "Vulkan device fixture failed ($LASTEXITCODE)" }
+    $device = [IO.File]::ReadAllBytes("$run/device.tvc")
+    if ($device.Length -lt 44 -or [BitConverter]::ToUInt32($device, 40) -ne 2) { throw "Capture did not start with the device state" }
+    if ([Convert]::ToBase64String($device, 12, 24) -ne [Convert]::ToBase64String($bytes, 12, 24)) {
+        "SKIP recorded device state: the recording comes from another device or driver"
+    } else {
+        $spliced = [byte[]]::new($device.Length + $bytes.Length - 36)
+        # The recording's header (its API version), then the fixture's device state, then its pipelines.
+        [Array]::Copy($bytes, $spliced, 36)
+        [Array]::Copy($device, 36, $spliced, 36, $device.Length - 36)
+        [Array]::Copy($bytes, 36, $spliced, $device.Length, $bytes.Length - 36)
+        [IO.File]::WriteAllBytes("$run/with-device.tvc", $spliced)
+        Replay with-device "$run/with-device.tvc" "$run/with-device.bin" "$run/with-device-checkpoint.bin" 0
+        if (-not (Select-String -Quiet -LiteralPath "$run/with-device.err" -SimpleMatch -Pattern "recorded Vulkan device state (0 extension")) {
+            throw "Replay did not use the recorded device state without the swapchain extension; see $run/with-device.err"
+        }
+        "PASS recorded Vulkan device state"
+    }
+}
 "PASS Vulkan replay interruption, resume, corrupt/foreign seeds and path alias ($run)"
