@@ -74,6 +74,7 @@ export struct ShaderRow {
 // The Shaders tab receives the completed check with the game details.
 export struct ShaderState {
     present: bool,
+    recording: bool,
     rows: [ShaderRow],
 }
 
@@ -753,6 +754,7 @@ component Detail inherits Rectangle {
     in property <SessionInfo> session;
     in property <GameSettings> settings;
     in property <ShaderState> shaders;
+    in property <bool> can-link-pipelines;
     in property <bool> busy;
     in-out property <int> tab;
     property <bool> entering-page;
@@ -771,6 +773,7 @@ component Detail inherits Rectangle {
     }
     callback reset-safe-mode();
     callback clear-shaders();
+    callback link-pipelines();
     callback settings-changed(bool, bool, bool, bool, bool, int, int);
     callback advanced-changed(string, int);
     callback prepare-quality();
@@ -936,6 +939,11 @@ component Detail inherits Rectangle {
                             text: "Clear shader cache";
                             enabled: !root.busy;
                             clicked => { root.clear-shaders(); }
+                        }
+                        if root.can-link-pipelines: Btn {
+                            text: root.shaders.recording ? "Change pipeline recording" : "Link pipeline recording";
+                            enabled: !root.busy;
+                            clicked => { root.link-pipelines(); }
                         }
                     }
                     if !root.shaders.present: Text { text: "No game executable found."; color: Theme.dim; font-size: 14px; }
@@ -1187,6 +1195,7 @@ export component MainWindow inherits Window {
     callback reset-safe-mode(int);
     callback warm-shaders(int, string);
     callback clear-shaders(int);
+    callback link-pipelines(int, string);
     callback add-folder(bool);
     callback remove-folder(FolderSource, int);
     callback app-theme-changed(AppTheme);
@@ -1207,8 +1216,9 @@ export component MainWindow inherits Window {
     property <int> shader-api-index: 0;
     property <string> shader-api: root.has-sel && root.shader-api-index < root.shader-api-count
         ? root.cur.shader-apis[root.shader-api-index] : "";
-    property <bool> prepare-shaders: (root.shader-api == "D3D11" && root.cur.d3d11) || root.shader-api == "D3D12";
-    property <bool> scan-shaders: root.shader-api == "Vulkan" || root.shader-api == "OpenGL";
+    property <bool> prepare-shaders: (root.shader-api == "D3D11" && root.cur.d3d11) || root.shader-api == "D3D12"
+        || (root.shader-api == "Vulkan" && root.shader-states.vulkan.recording);
+    property <bool> scan-shaders: (root.shader-api == "Vulkan" && !root.shader-states.vulkan.recording) || root.shader-api == "OpenGL";
     changed shader-game => { root.shader-api-index = 0; }
     changed shader-api-count => {
         if root.shader-api-index >= root.shader-api-count { root.shader-api-index = 0; }
@@ -1351,9 +1361,11 @@ export component MainWindow inherits Window {
                                 : root.shader-api == "Vulkan" ? root.shader-states.vulkan
                                 : root.shader-api == "OpenGL" ? root.shader-states.opengl
                                 : root.shader-states.d3d11;
+                            can-link-pipelines: root.shader-api == "D3D12" || root.shader-api == "Vulkan";
                             tab <=> root.tab;
                             reset-safe-mode => { root.reset-safe-mode(root.selected); }
                             clear-shaders => { root.clear-shaders(root.selected); }
+                            link-pipelines => { root.link-pipelines(root.selected, root.shader-api); }
                             settings-changed(p, r, fl, rc, u, f, v) => { root.settings-changed(root.selected, p, r, fl, rc, u, f, v); }
                             advanced-changed(key, value) => { root.advanced-changed(root.selected, key, value); }
                             prepare-quality => { root.prepare-quality(root.selected); }

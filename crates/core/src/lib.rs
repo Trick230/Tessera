@@ -29,6 +29,7 @@ pub mod streams;
 pub mod uecvars;
 mod unity;
 pub mod warm;
+pub mod pipeline_warm;
 
 pub use game::{analyze, analyze_all, GameInfo};
 pub use library::{discover, GameEntry, Store};
