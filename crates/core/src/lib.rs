@@ -30,6 +30,7 @@ pub mod shaders;
 pub mod streams;
 pub mod uecvars;
 mod unity;
+pub mod unleashed;
 pub mod warm;
 pub mod pipeline_warm;
 

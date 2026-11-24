@@ -76,6 +76,11 @@ If an Oodle-compressed Unreal build ships without a separate decoder, set
 The scan reads precompiled shaders embedded in recomp executables and disk
 caches, including Unleashed Recompiled's Zstandard and SMOL-V libraries,
 Savage Wind's `SPZ1` files, and Skate 3's per-user `nrhi_shaders` cache.
+For the supported Windows x64 build of Unleashed Recompiled 1.0.3,
+`cargo run -p tessera-core --example unleashed_inventory -- <game-exe>`
+reads the embedded pipeline list, resolves vertex declarations and decodes
+the referenced DXIL and SPIR-V without launching the game. This reports
+the available inputs; it does not create pipelines or a driver cache.
 
 The x64 D3D12 capture DLL records compute and graphics pipelines created
 through the corresponding `ID3D12Device` methods. It observes devices
