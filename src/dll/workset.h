@@ -16,7 +16,8 @@ namespace tessera {
 void workset_on_device(ID3D11Device* dev);
 // Every new deferred context: each has a vtable of its own.
 void workset_on_context(ID3D11DeviceContext* ctx);
-// Recheck bind hooks on a live immediate context previously adopted.
+// Recheck bind hooks on a live immediate context previously adopted. False also
+// once a deferred context could not be hooked: some binds go unseen.
 bool workset_check_hooks(ID3D11DeviceContext* imm);
 // Attach bind hooks to a device's immediate context. False if the meter is
 // off or a hook failed.

@@ -96,6 +96,8 @@ std::atomic<uint32_t> g_frame{1};
 std::atomic<uint32_t> g_view_revision{0};
 std::atomic<uint32_t> g_untracked{0};
 std::atomic<bool> g_on{false};
+// A deferred context whose bind hooks failed: its binds go unseen, so use data is incomplete.
+std::atomic<bool> g_blind{false};
 constexpr GUID kSwapContext = {0x35e23f2c, 0x6e32, 0x455b, {0x93, 0x8a, 0x50, 0xcb, 0xb2, 0x03, 0x2c, 0xf1}};
 
 uint32_t hash(const void* p, int bits) {
@@ -290,7 +292,7 @@ bool workset_check_hooks(ID3D11DeviceContext* imm) {
     for (VtHook& h : g_set) ok = vt_rehook(h, imm) && ok;
     static std::atomic<bool> s_logged{false};
     if (!ok && !s_logged.exchange(true)) logf("workset: bind hooks overwritten, binds go uncounted");
-    return ok;
+    return ok && !g_blind.load(std::memory_order_acquire);
 }
 
 void workset_on_swapchain(IDXGISwapChain* sc, ID3D11DeviceContext* imm) {
@@ -312,6 +314,7 @@ void workset_on_context(ID3D11DeviceContext* ctx) {
     bool ok = true;
     for (VtHook& h : g_set) ok = vt_hook(h, ctx, true) && ok;
     static std::atomic<bool> s_logged{false};
+    if (!ok) g_blind.store(true, std::memory_order_release);
     if (!ok && !s_logged.exchange(true)) logf("workset: deferred context hooks FAILED, its binds go uncounted");
 }
 
