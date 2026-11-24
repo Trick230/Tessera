@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Read-only Unreal PAK input for the shader scan. The legacy package
-//! selection follows SCSKiller's UnrealReader/InlineShaders (GPL-3.0-or-later).
+//! Read-only Unreal PAK input for the shader scan.
 
 use std::io::Read;
 use std::path::Path;
@@ -9,7 +8,7 @@ use aes::cipher::{BlockDecrypt, KeyInit};
 use sha1::{Digest, Sha1};
 
 use crate::oodle::Oodle;
-use crate::unreal_shader::{is_library, Payload};
+use crate::unreal_shader::{pak_payload, Payload};
 
 const MAX_INDEX: usize = 64 << 20;
 const REUSABLE_PACKAGE: usize = 64 << 20;
@@ -301,28 +300,15 @@ fn frozen_entries<'a>(index: &[u8], pak: &'a [u8], footer: &Footer<'_>,
     Some(unreadable)
 }
 
-fn shader_path(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    [".uexp", ".uasset", ".umap", ".ushaderbytecode", ".spv"].iter().any(|ext| name.ends_with(ext))
-        || (name.ends_with(".bin") && name.contains("globalshadercache"))
-}
-
-fn payload(name: &str) -> Payload {
-    if is_library(name) {
-        Payload::Library
-    } else {
-        Payload::Package
-    }
-}
-
 fn legacy_entries<'a>(mut data: &'a [u8], footer: &Footer<'_>, count: usize,
                       entries: &mut Vec<Entry<'a>>) -> Option<usize> {
     let original = data.len();
     for _ in 0..count {
         let name = path(&mut data)?;
         let mut entry = entry(&mut data, footer, None)?;
-        if !entry.deleted && shader_path(&name) {
-            entry.payload = payload(&name);
+        if entry.deleted { continue; }
+        if let Some(payload) = pak_payload(&name) {
+            entry.payload = payload;
             entries.push(entry);
         }
     }
@@ -356,7 +342,7 @@ fn directory_locations(mut data: &[u8], mut visit: impl FnMut(i32, Payload)) -> 
             let end = number(&mut offsets)? as usize;
             let name = std::str::from_utf8(names.get(start..end)?).ok()?;
             let location = number(&mut locations)? as i32;
-            if shader_path(name) { visit(location, payload(name)); }
+            if let Some(payload) = pak_payload(name) { visit(location, payload); }
             start = end;
         }
         return Some(());
@@ -367,7 +353,7 @@ fn directory_locations(mut data: &[u8], mut visit: impl FnMut(i32, Payload)) -> 
         for _ in 0..count {
             let name = path(&mut data)?;
             let location = number(&mut data)? as i32;
-            if shader_path(&name) { visit(location, payload(&name)); }
+            if let Some(payload) = pak_payload(&name) { visit(location, payload); }
         }
     }
     Some(())

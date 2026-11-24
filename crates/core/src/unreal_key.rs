@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Finds standard Unreal AES keys in installed PE executables. The
-//! instruction patterns follow SCSKiller's UnrealKeys (GPL-3.0-or-later).
+//! Reconstructs possible archive keys from constants stored by game code.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use object::{Object, ObjectSection, SectionFlags};
 use sha1::{Digest, Sha1};
 
@@ -152,56 +152,106 @@ fn validate_io_directory(mut data: &[u8]) -> Option<()> {
     (data.len() < 16).then_some(())
 }
 
-#[derive(Clone, Copy)]
-struct Store {
-    at: usize,
-    base: u8,
-    offset: i32,
-    width: usize,
-    value: [u8; 32],
+struct Write {
+    ip: u64,
+    base: Register,
+    offset: i64,
+    bytes: [u8; 32],
+    size: usize,
 }
 
-/// ModRM for a simple base register and optional displacement.
-fn memory(code: &[u8], extra_base: u8) -> Option<(u8, i32, usize)> {
-    let mode = code[0] >> 6;
-    let base = code[0] & 7;
-    if mode == 3 || base == 5 && mode == 0 { return None; }
-    let mut used = 1;
-    if base == 4 {
-        if code[1] & 0x3f != 0x24 { return None; }
-        used += 1;
-    }
-    let (displacement, size) = match mode {
-        0 => (0, 0),
-        1 => (i32::from(code[used] as i8), 1),
-        2 => (u32_at(code, used)? as i32, 4),
-        _ => return None,
-    };
-    Some((base | extra_base, displacement, used + size))
-}
-
-fn make_store(at: usize, operand: &[u8], base_bit: u8, value: impl FnOnce(usize) -> Option<[u8; 32]>, width: usize) -> Option<Store> {
-    let (base, offset, length) = memory(operand, base_bit)?;
-    Some(Store { at, base, offset, width, value: value(length)? })
-}
-
-fn expanded(bytes: &[u8]) -> Option<[u8; 32]> {
+fn constant(bytes: &[u8]) -> Option<[u8; 32]> {
     let mut value = [0; 32];
     value.get_mut(..bytes.len())?.copy_from_slice(bytes);
     Some(value)
 }
 
-fn store_candidates<'a>(recent: &'a VecDeque<Store>, store: Store) -> impl Iterator<Item = [u8; 32]> + 'a {
-    (0..32 / store.width).filter_map(move |i| {
-        let start = store.offset.checked_sub((i * store.width) as i32)?;
-        let mut key = [0; 32];
-        for (part, chunk) in key.chunks_exact_mut(store.width).enumerate() {
-            let offset = start.checked_add((part * store.width) as i32)?;
-            let item = recent.iter().rev().find(|s| s.base == store.base && s.offset == offset && s.width == store.width)?;
-            chunk.copy_from_slice(&item.value[..store.width]);
+fn move_size(instruction: &Instruction) -> Option<usize> {
+    use Mnemonic::*;
+    match instruction.mnemonic() {
+        Mov | Movaps | Movups | Movapd | Movupd | Movdqa | Movdqu | Vmovaps | Vmovups |
+        Vmovapd | Vmovupd | Vmovdqa | Vmovdqu => {
+            let size = instruction.memory_size().size();
+            matches!(size, 4 | 8 | 16 | 32).then_some(size)
         }
-        Some(key)
-    })
+        _ => None,
+    }
+}
+
+fn assembled_key(writes: &VecDeque<Write>, newest: &Write, start: i64) -> Option<[u8; 32]> {
+    let end = start.checked_add(32)?;
+    if !(start..end).contains(&newest.offset) { return None; }
+    let mut occupied = 0u32;
+    let mut key = [0; 32];
+    for write in std::iter::once(newest).chain(writes.iter().rev()) {
+        if write.base != newest.base { continue; }
+        for (index, byte) in write.bytes[..write.size].iter().enumerate() {
+            let address = write.offset.checked_add(index as i64)?;
+            if !(start..end).contains(&address) { continue; }
+            let slot = (address - start) as usize;
+            let bit = 1 << slot;
+            if occupied & bit == 0 {
+                key[slot] = *byte;
+                occupied |= bit;
+            }
+        }
+        if occupied == u32::MAX { return Some(key); }
+    }
+    None
+}
+
+fn scan_code(bitness: u32, address: u64, code: &[u8], load: impl Fn(u64, usize) -> Option<[u8; 32]>,
+             mut candidate: impl FnMut([u8; 32]) -> bool) -> bool {
+    let mut decoder = Decoder::with_ip(bitness, code, address, DecoderOptions::NONE);
+    let mut registers = HashMap::new();
+    let mut writes: VecDeque<Write> = VecDeque::new();
+    while decoder.can_decode() {
+        let ins = decoder.decode();
+        let ip = ins.ip();
+        if ins.op_count() != 2 { continue; }
+        if ins.op0_kind() == OpKind::Register {
+            let dst = ins.op0_register();
+            registers.remove(&dst);
+            let value = match ins.op1_kind() {
+                OpKind::Immediate64 if ins.mnemonic() == Mnemonic::Mov =>
+                    constant(&ins.immediate64().to_le_bytes()).map(|value| (8, value)),
+                OpKind::Memory if ins.is_ip_rel_memory_operand() => move_size(&ins)
+                    .and_then(|size| load(ins.ip_rel_memory_address(), size).map(|value| (size, value))),
+                _ => None,
+            };
+            if let Some((size, value)) = value { registers.insert(dst, (ip, size, value)); }
+            continue;
+        }
+        if ins.op0_kind() != OpKind::Memory || ins.memory_index() != Register::None
+            || ins.is_ip_rel_memory_operand() || ins.memory_base() == Register::None
+        {
+            continue;
+        }
+        let Some(size) = move_size(&ins) else { continue };
+        let bytes = match ins.op1_kind() {
+            OpKind::Immediate32 if size == 4 => constant(&ins.immediate32().to_le_bytes()),
+            OpKind::Register => registers.get(&ins.op1_register())
+                .filter(|(loaded_at, width, _)| ip - loaded_at < 64 && *width == size)
+                .map(|&(_, _, bytes)| bytes),
+            _ => None,
+        };
+        let Some(bytes) = bytes else { continue };
+        let offset = if bitness == 32 {
+            i64::from(ins.memory_displacement32() as i32)
+        } else {
+            ins.memory_displacement64() as i64
+        };
+        let newest = Write { ip, base: ins.memory_base(), offset, bytes, size };
+        while writes.front().is_some_and(|write| ip - write.ip > 160) { writes.pop_front(); }
+        let starts = writes.iter().filter(|write| write.base == newest.base).map(|write| write.offset);
+        if std::iter::once(newest.offset).chain(starts).filter_map(|start| assembled_key(&writes, &newest, start))
+            .any(&mut candidate)
+        {
+            return true;
+        }
+        writes.push_back(newest);
+    }
+    false
 }
 
 fn scan_pe(exe: &Path, mut candidate: impl FnMut([u8; 32]) -> bool) -> Option<()> {
@@ -210,80 +260,24 @@ fn scan_pe(exe: &Path, mut candidate: impl FnMut([u8; 32]) -> bool) -> Option<()
     // SAFETY: read-only view of the on-disk game executable.
     let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
     let pe = object::File::parse(&*map).ok()?;
-    let is_64 = pe.architecture() == object::Architecture::X86_64;
-    if !matches!(pe.architecture(), object::Architecture::X86_64 | object::Architecture::I386) { return None; }
+    let bitness = match pe.architecture() {
+        object::Architecture::X86_64 => 64,
+        object::Architecture::I386 => 32,
+        _ => return None,
+    };
     let sections: Vec<_> = pe.sections().filter_map(|s| Some((s.address(), s.data().ok()?, s.flags()))).collect();
-    let load = |address: u64, width| sections.iter().find_map(|&(base, bytes, _)| {
-        let at = usize::try_from(address.checked_sub(base)?).ok()?;
-        expanded(bytes.get(at..at.checked_add(width)?)?)
+    let load = |address: u64, size| sections.iter().find_map(|&(base, bytes, _)| {
+        let start = usize::try_from(address.checked_sub(base)?).ok()?;
+        constant(bytes.get(start..start.checked_add(size)?)?)
     });
     for &(address, code, flags) in &sections {
-        if !matches!(flags, SectionFlags::Coff { characteristics } if characteristics.0 & object::pe::IMAGE_SCN_MEM_EXECUTE.0 != 0) {
-            continue;
-        }
-        let mut recent = VecDeque::<Store>::new();
-        let mut gprs = [None; 16];
-        let mut vectors = [None; 16];
-        for (at, b) in code.windows(16).enumerate() {
-            let mut stores = [None; 2];
-            match b[0] {
-                0xc7 if (b[1] >> 3) & 7 == 0 => {
-                    let store = |extra| make_store(at, &b[1..], extra, |n| expanded(&b[1+n..5+n]), 4);
-                    stores[0] = store(0);
-                    if is_64 && at > 0 && code[at - 1] == 0x41 { stores[1] = store(8); }
-                }
-                rex @ (0x48 | 0x49) if is_64 && (0xb8..=0xbf).contains(&b[1]) => {
-                    gprs[usize::from((b[1] - 0xb8) | (rex & 1) * 8)] = Some((at, expanded(&b[2..10])?));
-                }
-                rex @ (0x48 | 0x49 | 0x4c | 0x4d) if is_64 && b[1] == 0x89 => {
-                    let register = usize::from(((b[2] >> 3) & 7) | ((rex & 4) << 1));
-                    if let Some((_, value)) = gprs[register].filter(|(p, _)| at - p < 48) {
-                        stores[0] = make_store(at, &b[2..], (rex & 1) * 8, |_| Some(value), 8);
-                    }
-                }
-                0x0f | 0x40..=0x4f | 0xc4 | 0xc5 if is_64 => {
-                    if let Some((op, modrm, offset, r, base, width)) = vector_instruction(b) {
-                        let register = usize::from(((modrm >> 3) & 7) | r);
-                        if matches!(op, 0x10 | 0x28 | 0x6f) && modrm & 0xc7 == 5 {
-                            let next = address + (at + offset + 5) as u64;
-                            let displacement = i64::from(u32_at(b, offset + 1)? as i32);
-                            vectors[register] = next.checked_add_signed(displacement)
-                                .and_then(|src| load(src, width)).map(|value| (at, width, value));
-                        } else if matches!(op, 0x11 | 0x29 | 0x7f) {
-                            if let Some((_, _, value)) = vectors[register].filter(|(p, w, _)| at - p < 64 && *w == width) {
-                                stores[0] = make_store(at, &b[offset..], base, |_| Some(value), width);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            for store in stores.into_iter().flatten() {
-                while recent.front().is_some_and(|s| at - s.at > 160) { recent.pop_front(); }
-                recent.push_back(store);
-                if store_candidates(&recent, store).any(&mut candidate) { return Some(()); }
-            }
+        if matches!(flags, SectionFlags::Coff { characteristics } if characteristics.0 & object::pe::IMAGE_SCN_MEM_EXECUTE.0 != 0)
+            && scan_code(bitness, address, code, load, &mut candidate)
+        {
+            break;
         }
     }
     Some(())
-}
-
-/// Opcode, ModRM, its offset, register/base extensions and vector width.
-fn vector_instruction(b: &[u8]) -> Option<(u8, u8, usize, u8, u8, usize)> {
-    let (at, r, base, width) = match b[0] {
-        0x0f => (2, 0, 0, 16),
-        rex @ 0x40..=0x4f if b[1] == 0x0f => (3, (rex & 4) << 1, (rex & 1) * 8, 16),
-        0xc4 | 0xc5 => {
-            let three = b[0] == 0xc4;
-            if three && b[1] & 0x1f != 1 { return None; }
-            let prefix = b[if three { 2 } else { 1 }];
-            if prefix & 0x78 != 0x78 { return None; }
-            (if three { 4 } else { 3 }, (!b[1] >> 4) & 8,
-                if three { (!b[1] >> 2) & 8 } else { 0 }, if prefix & 4 == 0 { 16 } else { 32 })
-        }
-        _ => return None,
-    };
-    Some((b[at - 1], b[at], at, r, base, width))
 }
 
 pub(crate) fn detect(exe: &Path, paths: &[PathBuf]) -> DetectedKeys {
@@ -313,6 +307,19 @@ pub(crate) fn detect(exe: &Path, paths: &[PathBuf]) -> DetectedKeys {
 mod tests {
     use super::*;
     use aes::cipher::{BlockEncrypt, KeyInit};
+
+    #[test]
+    fn reconstructs_mixed_width_constant_writes() {
+        let mut code = vec![0x48, 0xb8]; // mov rax, imm64
+        let key = std::array::from_fn(|i| i as u8);
+        code.extend_from_slice(&key[..8]);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x10]); // mov [rsp+16], rax
+        for (i, bytes) in key[8..].chunks_exact(4).enumerate() {
+            code.extend_from_slice(&[0xc7, 0x44, 0x24, 0x18 + 4 * i as u8]);
+            code.extend_from_slice(bytes);
+        }
+        assert!(scan_code(64, 0x1000, &code, |_, _| None, |candidate| candidate == key));
+    }
 
     #[test]
     fn validates_legacy_and_guid_paks_and_iostore_with_their_own_keys() {

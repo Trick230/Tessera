@@ -17,6 +17,18 @@ pub(crate) fn is_library(name: &str) -> bool {
     name.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("ushaderbytecode"))
 }
 
+pub(crate) fn pak_payload(name: &str) -> Option<Payload> {
+    if is_library(name) { return Some(Payload::Library); }
+    let (stem, extension) = name.rsplit_once('.')?;
+    if ["uasset", "uexp", "umap", "spv"].iter().any(|ext| extension.eq_ignore_ascii_case(ext))
+        || (extension.eq_ignore_ascii_case("bin")
+            && memchr::memmem::find(stem.to_ascii_lowercase().as_bytes(), b"globalshadercache").is_some())
+    {
+        return Some(Payload::Package);
+    }
+    None
+}
+
 fn array<'a>(data: &mut &'a [u8], width: usize) -> Option<&'a [u8]> {
     let count = number(data)? as usize;
     take(data, count.checked_mul(width)?)

@@ -347,21 +347,23 @@ impl Found {
         }
     }
 
-    // Legacy Unreal FShaderResource layout adapted from SCSKiller's
-    // InlineShaders 'Z' reader (05205ef1f6c3914b1f1245d133ebc710e2d30b52):
-    // the serialized length immediately before the zlib stream bounds it.
     fn search_unreal_package(&mut self, data: &[u8]) {
         self.search(data, MAX_DEPTH);
         let mut decoded = Vec::new();
+        let mut end_of_stream = 4;
         for at in memchr::memchr_iter(0x78, data) {
-            if at < 4 || at + 2 > data.len() || !is_zlib_header(&data[at..]) { continue; }
-            let size = u32_at(data, at - 4) as usize;
-            let Some(stream) = (size >= 3 && size <= data.len() - at).then(|| &data[at..at + size]) else {
+            if at < end_of_stream || data.len() - at < 2 || !is_zlib_header(&data[at..]) {
                 continue;
-            };
+            }
+            // The package serializes this compressed shader as a byte array.
+            // Require one complete zlib stream that fills the declared array.
+            let size = u32_at(data, at - 4) as usize;
+            if !(6..=data.len() - at).contains(&size) { continue; }
             decoded.clear();
-            if inflate(stream, &mut decoded) == Some(Some(size)) {
+            let end = at + size;
+            if inflate(&data[at..end], &mut decoded) == Some(Some(size)) {
                 self.stats.zlib += self.search(&decoded, MAX_DEPTH);
+                end_of_stream = end;
             }
         }
     }
