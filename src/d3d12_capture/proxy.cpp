@@ -9,6 +9,7 @@
 
 #include "exports_d3d12_gen.h"
 #include "tessera/d3d12_capture_format.h"
+#include "tessera/d3d12_raytracing.h"
 #include "tessera/d3d12_stream.h"
 #include "vtable.h"
 
@@ -71,12 +72,14 @@ HRESULT STDMETHODCALLTYPE record_root(ID3D12Device*, UINT, const void*, SIZE_T, 
 HRESULT STDMETHODCALLTYPE record_compute(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE record_graphics(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE record_stream(ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE record_raytracing(ID3D12Device5*, const D3D12_STATE_OBJECT_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE factory_device(ID3D12DeviceFactory*, IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 HRESULT STDMETHODCALLTYPE sdk_factory(ID3D12SDKConfiguration1*, UINT, LPCSTR, REFIID, void**);
 tessera::VtHook root_hook{16, reinterpret_cast<void*>(&record_root)};
 tessera::VtHook compute_hook{11, reinterpret_cast<void*>(&record_compute)};
 tessera::VtHook graphics_hook{10, reinterpret_cast<void*>(&record_graphics)};
 tessera::VtHook stream_hook{47, reinterpret_cast<void*>(&record_stream)};
+tessera::VtHook raytracing_hook{62, reinterpret_cast<void*>(&record_raytracing)};
 tessera::VtHook factory_hook{9, reinterpret_cast<void*>(&factory_device)};
 tessera::VtHook sdk_hook{4, reinterpret_cast<void*>(&sdk_factory)};
 
@@ -98,27 +101,31 @@ HRESULT STDMETHODCALLTYPE record_root(ID3D12Device* device, UINT nodes, const vo
     return hr;
 }
 
+bool read_root_signature(ID3D12RootSignature* root, std::vector<uint8_t>& signature, uint32_t& root_nodes) {
+    if (!root) return true;
+    UINT size = 0;
+    root->GetPrivateData(root_data, &size, nullptr);
+    if (size <= sizeof(root_nodes) || size > max_root_bytes + sizeof(root_nodes)) return false;
+    signature.resize(size);
+    if (FAILED(root->GetPrivateData(root_data, &size, signature.data())) || size != signature.size()) return false;
+    std::memcpy(&root_nodes, signature.data(), sizeof(root_nodes));
+    signature.erase(signature.begin(), signature.begin() + sizeof(root_nodes));
+    return true;
+}
+
 void append_pipeline(const void* payload, uint32_t payload_size, ID3D12RootSignature* root,
                      UINT nodes, D3D12_PIPELINE_STATE_FLAGS flags, uint32_t kind, uint64_t create_ns) {
     std::vector<uint8_t> signature;
     uint32_t root_nodes = 0;
-    if (root) {
-        UINT size = 0;
-        root->GetPrivateData(root_data, &size, nullptr);
-        if (size <= sizeof(root_nodes) || size > max_root_bytes + sizeof(root_nodes)) return;
-        signature.resize(size);
-        if (FAILED(root->GetPrivateData(root_data, &size, signature.data()))
-            || size != signature.size()) return;
-        std::memcpy(&root_nodes, signature.data(), sizeof(root_nodes));
-    }
-    const auto root_size = static_cast<uint32_t>(signature.empty() ? 0 : signature.size() - sizeof(root_nodes));
+    if (!read_root_signature(root, signature, root_nodes)) return;
+    const auto root_size = static_cast<uint32_t>(signature.size());
     const Record entry{payload_size, root_size, nodes, root_nodes, static_cast<uint32_t>(flags), kind, create_ns};
     const uint64_t size = sizeof(entry) + entry.payload_size + entry.root_size;
     AcquireSRWLockExclusive(&capture_lock);
     if (recorded_bytes <= max_capture_bytes - size) {
         const bool complete = write_bytes(capture, &entry, sizeof(entry))
             && write_bytes(capture, payload, entry.payload_size)
-            && (!root_size || write_bytes(capture, signature.data() + sizeof(root_nodes), root_size));
+            && (!root_size || write_bytes(capture, signature.data(), root_size));
         recorded_bytes = complete ? recorded_bytes + size : max_capture_bytes;
     }
     ReleaseSRWLockExclusive(&capture_lock);
@@ -227,6 +234,24 @@ HRESULT STDMETHODCALLTYPE record_stream(ID3D12Device2* device, const D3D12_PIPEL
     return hr;
 }
 
+HRESULT STDMETHODCALLTYPE record_raytracing(ID3D12Device5* device, const D3D12_STATE_OBJECT_DESC* desc,
+                                            REFIID iid, void** result) {
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device5*, const D3D12_STATE_OBJECT_DESC*, REFIID, void**);
+    const auto start = Clock::now();
+    const HRESULT hr = reinterpret_cast<Fn>(tessera::vt_orig(raytracing_hook, device))(device, desc, iid, result);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+    if (SUCCEEDED(hr) && desc && result && *result && desc->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE) {
+        try {
+            D3D12_STATE_OBJECT_DESC unused{};
+            std::vector<uint8_t> payload;
+            if (relocate_raytracing<true>(payload, *desc, unused, read_root_signature))
+                append_pipeline(payload.data(), static_cast<uint32_t>(payload.size()), nullptr, 0,
+                    D3D12_PIPELINE_STATE_FLAG_NONE, raytracing_kind, elapsed);
+        } catch (...) {}
+    }
+    return hr;
+}
+
 bool arm_capture() {
     if (!capture_enabled()) return false;
     static const bool pinned = [] {
@@ -248,6 +273,11 @@ void hook_device(void* result) {
     if (SUCCEEDED(static_cast<IUnknown*>(result)->QueryInterface(IID_PPV_ARGS(&device2)))) {
         tessera::vt_hook(root_hook, device2.Get());
         tessera::vt_hook(stream_hook, device2.Get());
+    }
+    ComPtr<ID3D12Device5> device5;
+    if (SUCCEEDED(static_cast<IUnknown*>(result)->QueryInterface(IID_PPV_ARGS(&device5)))) {
+        tessera::vt_hook(root_hook, device5.Get());
+        tessera::vt_hook(raytracing_hook, device5.Get());
     }
 }
 

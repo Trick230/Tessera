@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <span>
 #include <string>
@@ -33,6 +34,7 @@
 #include <vector>
 
 #include "tessera/d3d12_capture_format.h"
+#include "tessera/d3d12_raytracing.h"
 #include "tessera/d3d12_stream.h"
 #include "tessera/shader_store_format.h"
 
@@ -619,6 +621,40 @@ HRESULT replay_stream(ID3D12Device* device, ID3D12RootSignature* root, std::vect
     return device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline));
 }
 
+HRESULT replay_raytracing(ID3D12Device* device, std::vector<uint8_t>& payload) {
+    using namespace tessera::d3d12_capture;
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D12Device5> device5;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device5)))) return E_NOINTERFACE;
+    struct RootSlot {
+        ComPtr<ID3D12RootSignature> signature;
+        D3D12_GLOBAL_ROOT_SIGNATURE global{};
+        D3D12_LOCAL_ROOT_SIGNATURE local{};
+    };
+    std::deque<RootSlot> roots;
+    HRESULT root_result = S_OK;
+    const auto create_root = [&](D3D12_STATE_SUBOBJECT& sub, const RayRoot& root) {
+        auto& slot = roots.emplace_back();
+        if (root.size) {
+            root_result = device->CreateRootSignature(root.node_mask, root.bytes, root.size, IID_PPV_ARGS(&slot.signature));
+            if (FAILED(root_result)) return false;
+        }
+        if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE) {
+            slot.global.pGlobalRootSignature = slot.signature.Get();
+            sub.pDesc = &slot.global;
+        } else {
+            slot.local.pLocalRootSignature = slot.signature.Get();
+            sub.pDesc = &slot.local;
+        }
+        return true;
+    };
+    D3D12_STATE_OBJECT_DESC desc{};
+    if (!relocate_raytracing<false>(payload, {}, desc, create_root))
+        return FAILED(root_result) ? root_result : E_INVALIDARG;
+    ComPtr<ID3D12StateObject> state;
+    return device5->CreateStateObject(&desc, IID_PPV_ARGS(&state));
+}
+
 int replay_d3d12(const wchar_t* path, bool warp) {
     using namespace tessera::d3d12_capture;
     using Microsoft::WRL::ComPtr;
@@ -640,15 +676,15 @@ int replay_d3d12(const wchar_t* path, bool warp) {
     }
     std::vector<uint8_t> payload, root;
     uint64_t total_bytes = sizeof(header);
-    size_t prepared[3]{}, failed = 0;
-    const auto completed = [&] { return prepared[0] + prepared[1] + prepared[2] + failed; };
+    size_t prepared[4]{}, failed = 0;
+    const auto completed = [&] { return prepared[0] + prepared[1] + prepared[2] + prepared[3] + failed; };
     while (true) {
         Record record{};
         const size_t received = fread(&record, 1, sizeof(record), file.get());
         if (received == 0 && feof(file.get())) break;
         const uint64_t size = sizeof(record) + uint64_t{record.payload_size} + record.root_size;
         const uint32_t max_payload = record.kind == compute_kind ? max_shader_bytes : max_graphics_bytes;
-        if (received != sizeof(record) || record.kind > stream_kind || !record.payload_size || record.payload_size > max_payload
+        if (received != sizeof(record) || record.kind > raytracing_kind || !record.payload_size || record.payload_size > max_payload
             || record.root_size > max_root_bytes || total_bytes > max_capture_bytes - size) {
             fprintf(stderr, "invalid D3D12 capture record after %zu pipelines\n", completed());
             return 1;
@@ -670,6 +706,8 @@ int replay_d3d12(const wchar_t* path, bool warp) {
             hr = replay_graphics(device.dev.Get(), signature.Get(), record, payload);
         } else if (SUCCEEDED(hr) && record.kind == stream_kind) {
             hr = replay_stream(device.dev.Get(), signature.Get(), payload);
+        } else if (SUCCEEDED(hr) && record.kind == raytracing_kind) {
+            hr = replay_raytracing(device.dev.Get(), payload);
         } else if (SUCCEEDED(hr)) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
             desc.pRootSignature = signature.Get();
@@ -687,8 +725,8 @@ int replay_d3d12(const wchar_t* path, bool warp) {
             if (device.removed()) break;
         }
     }
-    printf("D3D12 pipelines prepared: %zu compute, %zu graphics, %zu streams, %zu failed%s\n",
-           prepared[0], prepared[1], prepared[2], failed, warp ? " (WARP)" : "");
+    printf("D3D12 pipelines prepared: %zu compute, %zu graphics, %zu streams, %zu ray tracing, %zu failed%s\n",
+           prepared[0], prepared[1], prepared[2], prepared[3], failed, warp ? " (WARP)" : "");
     return failed != 0 || completed() == 0 ? 1 : 0;
 }
 
