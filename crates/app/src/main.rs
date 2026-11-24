@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tessera_core::install::{self, InstallState};
 use tessera_core::pe::Architecture;
-use tessera_core::shader_check::ShaderCheck;
+use tessera_core::scan::{self, ShaderApi};
+use tessera_core::shader_check::{self, ShaderCheck};
 use tessera_core::{paths, session, GameInfo};
 
 slint::include_modules!();
@@ -458,7 +459,7 @@ fn shader_state(
     c: &ShaderCheck,
     run: Option<(u64, u64)>,
     can_prepare: bool,
-    apis: tessera_core::pe::ApiSet,
+    api: ShaderApi,
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<&tessera_core::driver::NvidiaGameCache>,
 ) -> ShaderState {
@@ -474,10 +475,7 @@ fn shader_state(
         tone: if c.stored == 0 && tone == OK { NEUTRAL } else { tone },
     };
     let mut rows = Vec::new();
-    let scan_gl = apis.has(tessera_core::pe::ApiSet::OPENGL);
-    let scan_vulkan = apis.has(tessera_core::pe::ApiSet::VULKAN);
-    let scan_dxil = apis.has(tessera_core::pe::ApiSet::D3D12);
-    let scan_only = !can_prepare && (scan_gl || scan_vulkan || scan_dxil);
+    let scan_only = api != ShaderApi::D3d11;
 
     if c.auto_key_archives > 0 && c.scan_outdated == Some(false) {
         rows.push(line("Unreal archive keys", "Detected".to_string(), vec![
@@ -495,13 +493,13 @@ fn shader_state(
                 ("Available", source, OK)
             }
             Some((_, false)) => ("Unavailable", "The configured key file is unreadable or invalid.", WARN),
-            None => ("Not found", "Prepare shaders checks the game executable when it finds encrypted archives.", NEUTRAL),
+            None => ("Not found", "The shader scan checks the game executable when it finds encrypted archives.", NEUTRAL),
         };
         rows.push(line("Unreal PAK key", value.to_string(), vec![detail.to_string()], tone));
     }
 
-    if scan_gl {
-        let (value, detail) = if c.scan_outdated.is_some() {
+    if api == ShaderApi::OpenGl {
+        let (value, detail) = if c.scan_outdated == Some(false) {
             (c.glsl.to_string(), "Embedded GLSL sources recorded by the last scan.")
         } else {
             ("Scan available".to_string(), "Scan shaders checks the game files for embedded GLSL sources.")
@@ -509,14 +507,14 @@ fn shader_state(
         rows.push(line("OpenGL shaders", value, vec![detail.to_string()], NEUTRAL));
     }
 
-    if scan_vulkan || c.spirv.is_some_and(|n| n > 0) {
+    if api == ShaderApi::Vulkan {
         let (value, detail) = match c.spirv.filter(|_| c.scan_outdated == Some(false)) {
             Some(n) => (format!("{} extracted", count(n)), "Distinct SPIR-V modules in the shader export."),
             None => ("Scan available".to_string(), "Search the game files for SPIR-V shader modules."),
         };
         rows.push(line("Vulkan shaders", value, vec![detail.to_string()], NEUTRAL));
     }
-    if scan_dxil || c.unsupported_in_install.is_some_and(|n| n > 0) {
+    if api == ShaderApi::D3d12 {
         let (value, detail) = match c.unsupported_in_install.filter(|_| c.scan_outdated == Some(false)) {
             Some(n) => (format!("{} extracted", count(n)), "DXIL and Shader Model 5.1 bytecode in the shader export."),
             None => ("Scan available".to_string(), "Scan shaders searches for D3D12 bytecode."),
@@ -561,25 +559,8 @@ fn shader_state(
                 format!("{} of {} objects read", count(decoded), count(c.unity_shader_objects)),
                 Vec::new(), if failed > 0 { WARN } else { OK }));
         }
-        if c.unreal_shaders_expected > 0 || c.unreal_libraries_unreadable > 0 {
-            let decoded = c.unreal_shaders_decoded;
-            let expected = c.unreal_shaders_expected;
-            let other = decoded.saturating_sub(c.unreal_shaders_dxbc + c.unreal_shaders_dxil + c.unreal_shaders_spirv);
-            let mut formats = Vec::new();
-            for (n, name) in [(c.unreal_shaders_dxbc, "DXBC"), (c.unreal_shaders_dxil, "DXIL"),
-                              (c.unreal_shaders_spirv, "SPIR-V"), (other, "unclassified")] {
-                if n > 0 { formats.push(format!("{} {name}", count(n))); }
-            }
-            let mut details = Vec::new();
-            if !formats.is_empty() { details.push(format!("Decoded {}.", formats.join(", "))); }
-            if c.unreal_libraries_unreadable > 0 {
-                details.push(format!("{} library headers could not be read.", count(c.unreal_libraries_unreadable)));
-            }
-            let tone = if decoded < expected || c.unreal_libraries_unreadable > 0 { WARN } else { OK };
-            rows.push(line("Unreal shader libraries", format!("{} of {} entries decoded", count(decoded), count(expected)), details, tone));
-        }
-        if let Some(n) = c.unsupported_in_install.filter(|&n| n > 0) {
-            d.push(format!("The file scan also found {n} containers outside D3D11 warm-up support."));
+        if c.unreal_libraries_unreadable > 0 {
+            rows.push(line("Unreal shader libraries", format!("{} unreadable", count(c.unreal_libraries_unreadable)), Vec::new(), WARN));
         }
         if c.unreal_packages > 0 {
             d.push(format!("Searched {} Unreal packages.", count(c.unreal_packages)));
@@ -633,7 +614,7 @@ fn shader_state(
     let tone = if c.damaged > 0 { BAD } else if d.is_empty() { OK } else { WARN };
     let value = if d.is_empty() { "None".to_string() } else { (c.damaged + c.failed + bad_files).to_string() };
     if d.is_empty() {
-        d.push(if c.stored == 0 { "Nothing to check yet." } else { "All bytecode entries passed validation." }.to_string());
+        d.push(if c.stored > 0 || c.scan_outdated == Some(false) { "No damaged bytecode entries recorded." } else { "Nothing to check yet." }.to_string());
     }
     rows.push(line("Damaged", value, d, tone));
 
@@ -762,7 +743,7 @@ struct GameView {
     budget: (u32, Option<u32>),
     run: Option<(u64, u64)>,
     facts: Option<advanced::Facts>,
-    shader_check: Option<ShaderCheck>,
+    shader_checks: Option<[ShaderCheck; 4]>,
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<tessera_core::driver::NvidiaGameCache>,
 }
@@ -782,9 +763,10 @@ impl GameView {
         let drivers: Vec<_> = gpus.iter()
             .filter_map(|g| tessera_core::driver::umd_version(&g.driver_version))
             .collect();
+        let key = shader_check::has_scan(exe).then(|| scan::current_key(exe, &game.entry.root));
         Self {
             session, budget, run, facts,
-            shader_check: Some(tessera_core::shader_check::check(exe, root, &drivers)),
+            shader_checks: Some(ShaderApi::SELECTABLE.map(|api| shader_check::check_for(exe, api, key.as_deref(), &drivers))),
             pak_key: is_unreal(game).then(|| tessera_core::scan::unreal_key_status(exe)),
             disk_cache: tessera_core::driver::nvidia_game_cache(exe),
         }
@@ -810,8 +792,12 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
         }
         _ => (GameSettings::default(), None),
     };
-    let shaders = view.shader_check.as_ref().map_or_else(ShaderState::default, |check| {
-        shader_state(check, view.run, can_prepare(game), game.graphics_apis(), view.pak_key, view.disk_cache.as_ref())
+    let shaders = view.shader_checks.as_ref().map_or_else(ShaderStates::default, |checks| {
+        let render = |api, check| {
+            shader_state(check, view.run, can_prepare(game), api, view.pak_key, view.disk_cache.as_ref())
+        };
+        let [d3d11, d3d12, vulkan, opengl] = std::array::from_fn(|i| render(ShaderApi::SELECTABLE[i], &checks[i]));
+        ShaderStates { d3d11, d3d12, vulkan, opengl }
     });
 
     // Publish the models and selection together before the next frame.
@@ -819,7 +805,7 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
     *SETTINGS.lock().unwrap() = lists;
     ui.set_session(view.session.clone());
     ui.set_settings(settings);
-    ui.set_shader_state(shaders);
+    ui.set_shader_states(shaders);
     ui.set_selected(index);
     st.shown_root = st.requested_root.take();
     st.settings_sync = game.install.is_installed().then(|| (game.clone(), view.budget.0));
@@ -1005,23 +991,24 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
     if ui.get_busy() {
         return;
     }
-    let Some((exe, root, prepare, architecture, vulkan)) = ({
+    let Some((exe, root, scope, architecture)) = ({
         let st = state.lock().unwrap();
         st.view.get(view_idx as usize).and_then(|&gi| {
             let g = &st.games[gi];
             let apis = g.graphics_apis();
-            let prepare = match api.as_str() {
-                "D3D11" if can_prepare(g) => true,
-                "D3D12" if apis.has(ApiSet::D3D12) => false,
-                "Vulkan" if apis.has(ApiSet::VULKAN) => false,
-                "OpenGL" if apis.has(ApiSet::OPENGL) => false,
+            let scope = match api.as_str() {
+                "D3D11" if can_prepare(g) => ShaderApi::D3d11,
+                "D3D12" if apis.has(ApiSet::D3D12) => ShaderApi::D3d12,
+                "Vulkan" if apis.has(ApiSet::VULKAN) => ShaderApi::Vulkan,
+                "OpenGL" if apis.has(ApiSet::OPENGL) => ShaderApi::OpenGl,
                 _ => return None,
             };
-            g.exe.clone().map(|e| (e, g.entry.root.clone(), prepare, g.scan.architecture, apis.has(ApiSet::VULKAN)))
+            g.exe.clone().map(|e| (e, g.entry.root.clone(), scope, g.scan.architecture))
         })
     }) else {
         return;
     };
+    let prepare = scope == ShaderApi::D3d11;
     ui.set_busy(true);
     ui.set_shader_progress_active(true);
     ui.set_shader_progress(-1.0);
@@ -1034,9 +1021,9 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
             let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
         };
         let running = tessera_core::warm::is_running(&exe);
-        let scan_error = if !running && (!prepare || !tessera_core::scan::up_to_date(&exe, &root, vulkan)) {
+        let scan_error = if !running && (!prepare || !scan::up_to_date_for(&exe, &root, scope)) {
             status("Searching the game files for shaders (read only)…");
-            scan_isolated(&exe, &root).err()
+            scan_isolated(&exe, &root, scope).err()
         } else {
             None
         };
@@ -1047,7 +1034,7 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
         let msg = if !prepare {
             if running { "Close the game before scanning shaders.".to_string() }
             else if let Some(e) = scan_error { format!("{api} shader scan failed ({e}).") }
-            else if let Some(path) = tessera_core::scan::export_path(&exe) {
+            else if let Some(path) = scan::export_path_for(&exe, scope) {
                 format!("{api} shader scan complete. Export saved to {}.", path.display())
             } else {
                 format!("{api} shader scan complete.")
@@ -1226,7 +1213,7 @@ fn quality_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
 /// Runs the install scan (S1) in a child `tessera.exe --scan`, so a crash in
 /// the game's own Oodle DLL cannot take the app down. The scan writes its
 /// store whole (temp file, then rename), so a crash leaves the old one.
-fn scan_isolated(exe: &Path, root: &Path) -> Result<u64, String> {
+fn scan_isolated(exe: &Path, root: &Path, api: ShaderApi) -> Result<u64, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -1234,6 +1221,7 @@ fn scan_isolated(exe: &Path, root: &Path) -> Result<u64, String> {
         .arg("--scan")
         .arg(exe)
         .arg(root)
+        .arg(api.slug())
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| e.to_string())?;
@@ -1245,10 +1233,20 @@ fn scan_isolated(exe: &Path, root: &Path) -> Result<u64, String> {
     }
 }
 
-/// `tessera.exe --scan <game exe> <install folder>`: the child side of
+/// `tessera.exe --scan <game exe> <install folder> [api]`: the child side of
 /// scan_isolated. Prints the total of extracted bytecode and detected GLSL sources.
 fn scan_child(args: &[String]) -> i32 {
-    match tessera_core::scan::scan_game(Path::new(&args[0]), Path::new(&args[1])) {
+    let api = match args.get(2).map(String::as_str) {
+        None => ShaderApi::All,
+        Some(slug) => match ShaderApi::SELECTABLE.into_iter().find(|api| api.slug() == slug) {
+            Some(api) => api,
+            None => {
+                eprintln!("unknown shader API: {slug}");
+                return 1;
+            }
+        },
+    };
+    match scan::scan_game_for(Path::new(&args[0]), Path::new(&args[1]), api) {
         Ok(st) => {
             println!("{}", st.usable + st.skipped + st.glsl + st.spirv);
             0
@@ -1262,7 +1260,7 @@ fn scan_child(args: &[String]) -> i32 {
 
 fn main() -> Result<(), slint::PlatformError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() == 3 && args[0] == "--scan" {
+    if matches!(args.len(), 3 | 4) && args[0] == "--scan" {
         std::process::exit(scan_child(&args[1..]));
     }
     if args.len() == 2 && args[0] == "--prepare-quality" {

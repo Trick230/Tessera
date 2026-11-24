@@ -77,6 +77,13 @@ export struct ShaderState {
     rows: [ShaderRow],
 }
 
+export struct ShaderStates {
+    d3d11: ShaderState,
+    d3d12: ShaderState,
+    vulkan: ShaderState,
+    opengl: ShaderState,
+}
+
 export struct AdvancedOptions {
     max-frame-latency: int,
     d3d11-call-diagnostics: bool,
@@ -1157,7 +1164,7 @@ export component MainWindow inherits Window {
     in property <string> shader-progress-label;
     in property <SessionInfo> session;
     in property <GameSettings> settings;
-    in property <ShaderState> shader-state;
+    in property <ShaderStates> shader-states;
     in property <AppTheme> app-theme;
     in property <[string]> game-folders;
     in property <[string]> library-folders;
@@ -1340,7 +1347,10 @@ export component MainWindow inherits Window {
                             session: root.session;
                             settings: root.settings;
                             busy: root.busy;
-                            shaders: root.shader-state;
+                            shaders: root.shader-api == "D3D12" ? root.shader-states.d3d12
+                                : root.shader-api == "Vulkan" ? root.shader-states.vulkan
+                                : root.shader-api == "OpenGL" ? root.shader-states.opengl
+                                : root.shader-states.d3d11;
                             tab <=> root.tab;
                             reset-safe-mode => { root.reset-safe-mode(root.selected); }
                             clear-shaders => { root.clear-shaders(root.selected); }

@@ -66,6 +66,10 @@ pub fn clear_shader_cache(exe: &Path) -> io::Result<usize> {
 fn clear_shader_files(data: &Path, key: &str) -> io::Result<usize> {
     let base = data.join("shaders").join(key);
     let mut removed = 0;
+    let scoped = crate::scan::ShaderApi::SELECTABLE.into_iter().flat_map(|api| {
+        let prefix = format!(".scan-{}", api.slug());
+        [".key", ".zip"].map(|suffix| with_suffix(&base, &format!("{prefix}{suffix}")))
+    });
     for path in [
         with_suffix(&base, ".scan.key"),
         with_suffix(&base, ".scan.tshi"),
@@ -75,7 +79,7 @@ fn clear_shader_files(data: &Path, key: &str) -> io::Result<usize> {
         with_suffix(&base, ".tshd"),
         with_suffix(&base, ".twarm"),
         data.join("feedback").join(format!("{key}.tmip")),
-    ] {
+    ].into_iter().chain(scoped) {
         match fs::remove_file(&path) {
             Ok(()) => removed += 1,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
@@ -370,7 +374,8 @@ mod tests {
         fs::create_dir(data.join("feedback")).unwrap();
         let files = ["shaders/game-a.tshd", "shaders/game-a.tshi", "shaders/game-a.twarm",
             "shaders/game-a.scan.tshd", "shaders/game-a.scan.tshi", "shaders/game-a.scan.twarm",
-            "shaders/game-a.scan.key", "feedback/game-a.tmip"];
+            "shaders/game-a.scan.key", "shaders/game-a.scan-d3d11.key",
+            "shaders/game-a.scan-d3d12.zip", "shaders/game-a.scan-vulkan.key", "feedback/game-a.tmip"];
         let other = data.join("shaders/game-b.tshd");
         fs::write(&other, b"keep").unwrap();
         for file in files {

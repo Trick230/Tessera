@@ -251,7 +251,7 @@ fn bundle_managers(file: impl Read + Seek) -> Option<Vec<u8>> {
     Some(output)
 }
 
-pub(crate) fn scan_bundle(data: &[u8], mut visit: impl FnMut(&[u8], bool))
+pub(crate) fn scan_bundle(data: &[u8], decode_spirv: bool, mut visit: impl FnMut(&[u8], bool))
     -> Option<(u64, u64, u64, u64)>
 {
     let mut bundle = Bundle::open(std::io::Cursor::new(data))?;
@@ -272,7 +272,7 @@ pub(crate) fn scan_bundle(data: &[u8], mut visit: impl FnMut(&[u8], bool))
             bundle.read(start + offset, size, &mut object)?;
             consume(&object);
             Some(())
-        }, &mut decoded, &mut visit) {
+        }, decode_spirv, &mut decoded, &mut visit) {
             shaders += found;
             unreadable_shaders += failed;
         }
@@ -294,17 +294,18 @@ pub(crate) fn scan_bundle(data: &[u8], mut visit: impl FnMut(&[u8], bool))
     Some((read, unreadable, shaders, unreadable_shaders))
 }
 
-pub(crate) fn scan_serialized_slice(data: &[u8], mut visit: impl FnMut(&[u8], bool)) -> Option<(u64, u64)> {
+pub(crate) fn scan_serialized_slice(data: &[u8], decode_spirv: bool, mut visit: impl FnMut(&[u8], bool)) -> Option<(u64, u64)> {
     scan_serialized(data.len() as u64, |offset, size, consume| {
         let start = usize::try_from(offset).ok()?;
         consume(data.get(start..start.checked_add(size)?)?);
         Some(())
-    }, &mut Vec::new(), &mut visit)
+    }, decode_spirv, &mut Vec::new(), &mut visit)
 }
 
 fn scan_serialized(
     length: u64,
     mut read: impl FnMut(u64, usize, &mut dyn FnMut(&[u8])) -> Option<()>,
+    decode_spirv: bool,
     decoded: &mut Vec<u8>,
     visit: &mut impl FnMut(&[u8], bool),
 ) -> Option<(u64, u64)> {
@@ -328,6 +329,7 @@ fn scan_serialized(
         read(object.offset, object.size, &mut |bytes| {
             let mut program = |code: &[u8]| {
                 visit(code, true);
+                if !decode_spirv { return; }
                 for start in memchr::memmem::find_iter(code, smolv::MAGIC) {
                     if smolv::decode(&code[start..], layout.legacy_smolv(), &mut spirv).is_some() {
                         visit(&spirv, true);

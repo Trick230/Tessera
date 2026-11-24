@@ -261,8 +261,41 @@ pub fn container_at(b: &[u8]) -> Option<Container> {
     Some(Container { len, hash: hash_of(code), stage, flags, major, minor })
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShaderApi {
+    #[default]
+    All,
+    D3d11,
+    D3d12,
+    Vulkan,
+    OpenGl,
+}
+
+impl ShaderApi {
+    pub const SELECTABLE: [Self; 4] = [Self::D3d11, Self::D3d12, Self::Vulkan, Self::OpenGl];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::D3d11 => "d3d11",
+            Self::D3d12 => "d3d12",
+            Self::Vulkan => "vulkan",
+            Self::OpenGl => "opengl",
+        }
+    }
+
+    fn includes(self, api: Self) -> bool {
+        self == Self::All || self == api
+    }
+
+    fn direct3d(self) -> bool {
+        matches!(self, Self::All | Self::D3d11 | Self::D3d12)
+    }
+}
+
 #[derive(Default)]
 struct Found {
+    api: ShaderApi,
     shaders: HashMap<u64, Shader>,
     d3d12: HashMap<u64, Shader>,
     glsl: HashMap<u128, Vec<u8>>,
@@ -294,7 +327,8 @@ impl Found {
 
     fn record_unreal_shader(&mut self, data: &[u8]) {
         self.stats.unreal_shaders_decoded += 1;
-        for start in memchr::memmem::find_iter(data, b"DXBC") {
+        let direct3d = self.api.direct3d();
+        for start in memchr::memmem::find_iter(data, b"DXBC").filter(|_| direct3d) {
             let Some(c) = container_at(&data[start..]) else { continue };
             let code = &data[start..start + c.len];
             let valid = self.record(&c, code)
@@ -307,7 +341,8 @@ impl Found {
             }
             return;
         }
-        if self.record_spirv(data) || counted_spirv(data).any(|code| self.record_spirv(code)) {
+        if self.api.includes(ShaderApi::Vulkan)
+            && (self.record_spirv(data) || counted_spirv(data).any(|code| self.record_spirv(code))) {
             self.stats.unreal_shaders_spirv += 1;
         }
     }
@@ -442,6 +477,7 @@ impl Found {
     }
 
     fn search_glsl_source(&mut self, data: &[u8], unity: bool) {
+        if !self.api.includes(ShaderApi::OpenGl) { return; }
         let mut versions = memchr::memmem::find_iter(data, b"#version ").peekable();
         while let Some(at) = versions.next() {
             let guarded = unity && unity_glsl_guard(&data[..at]).is_some();
@@ -472,6 +508,7 @@ impl Found {
     }
 
     fn record_spirv(&mut self, bytes: &[u8]) -> bool {
+        if !self.api.includes(ShaderApi::Vulkan) { return false; }
         let Some(big_endian) = spirv_byte_order(bytes) else { return false };
         let mut code = std::borrow::Cow::Borrowed(bytes);
         if big_endian {
@@ -526,18 +563,21 @@ impl Found {
 
     fn unity_payload(&mut self, bytes: &[u8], shader_data: bool) {
         self.record_spirv(bytes);
-        if shader_data {
+        if shader_data && self.api.includes(ShaderApi::Vulkan) {
             for code in counted_spirv(bytes) {
                 self.record_spirv(code);
             }
+        }
+        if shader_data {
             self.search_glsl_source(bytes, true);
         }
         self.search(bytes, 0);
     }
 
     fn search_unity(&mut self, bytes: &[u8]) -> bool {
+        let decode_spirv = self.api.includes(ShaderApi::Vulkan);
         if [b"UnityFS\0".as_slice(), b"UnityWeb\0", b"UnityRaw\0"].iter().any(|s| bytes.starts_with(s)) {
-            let Some((entries, unreadable, shaders, failed)) = crate::unity::scan_bundle(bytes,
+            let Some((entries, unreadable, shaders, failed)) = crate::unity::scan_bundle(bytes, decode_spirv,
                 |bytes, shader| self.unity_payload(bytes, shader)) else { return false };
             self.stats.unity_entries += entries;
             self.stats.unreadable_unity_entries += unreadable;
@@ -545,7 +585,7 @@ impl Found {
             self.stats.unreadable_unity_shader_objects += failed;
             return unreadable == 0;
         }
-        if let Some((shaders, failed)) = crate::unity::scan_serialized_slice(bytes,
+        if let Some((shaders, failed)) = crate::unity::scan_serialized_slice(bytes, decode_spirv,
             |bytes, shader| self.unity_payload(bytes, shader)) {
             self.stats.unity_shader_objects += shaders;
             self.stats.unreadable_unity_shader_objects += failed;
@@ -580,6 +620,8 @@ impl Found {
     }
 
     fn record(&mut self, c: &Container, code: &[u8]) -> bool {
+        let api = if c.d3d11() { ShaderApi::D3d11 } else { ShaderApi::D3d12 };
+        if !self.api.includes(api) { return false; }
         let entries = if c.d3d11() { &mut self.shaders } else { &mut self.d3d12 };
         if entries.contains_key(&c.hash) {
             return false;
@@ -614,7 +656,9 @@ impl Found {
             let end = (start + CHUNK).min(b.len());
             let w = &b[start..(end + 3).min(b.len())]; // patterns may start up to the chunk's last byte
             cand.clear();
-            cand.extend(dxbc.find_iter(w).map(|i| (start + i, DXBC)));
+            if self.api.direct3d() {
+                cand.extend(dxbc.find_iter(w).map(|i| (start + i, DXBC)));
+            }
             if depth < MAX_DEPTH {
                 cand.extend(gzip.find_iter(w).map(|i| (start + i, GZIP)));
                 cand.extend(zstd.find_iter(w).map(|i| (start + i, 1)));
@@ -665,10 +709,12 @@ impl Found {
                 if out.len() < 32 {
                     continue;
                 }
-                if kind == 1 && out.starts_with(crate::unity::smolv::MAGIC) {
-                    self.search_smolv_cache(&out);
-                } else {
-                    self.record_spirv(&out);
+                if self.api.includes(ShaderApi::Vulkan) {
+                    if kind == 1 && out.starts_with(crate::unity::smolv::MAGIC) {
+                        self.search_smolv_cache(&out);
+                    } else {
+                        self.record_spirv(&out);
+                    }
                 }
                 let inner = std::mem::take(&mut out);
                 let n = self.search(&inner, depth + 1);
@@ -873,9 +919,9 @@ fn counted_spirv(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
-fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
+fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>, api: ShaderApi,
              read_group: impl FnMut(&[u8], &mut Vec<u8>) -> Option<()>) -> Found {
-    let mut f = Found { oodle, ..Found::default() };
+    let mut f = Found { oodle, api, ..Found::default() };
     let Ok(file) = fs::File::open(path) else { return f };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     if len < MIN_FILE {
@@ -887,7 +933,7 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
     f.stats.files = 1;
     f.stats.bytes = len;
     if map.starts_with(b"SPZ1") {
-        f.search_spz(&map);
+        if api.includes(ShaderApi::Vulkan) { f.search_spz(&map); }
         return f;
     }
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
@@ -921,10 +967,10 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
         f.search_dcx(&map);
     }
     if extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll") {
-        f.search_glsl(&map);
-        f.search_executable_spirv(&map);
+        if api.includes(ShaderApi::OpenGl) { f.search_glsl(&map); }
+        if api.includes(ShaderApi::Vulkan) { f.search_executable_spirv(&map); }
     }
-    if len <= STREAM_CAP && ["glsl", "vert", "frag", "comp", "geom", "tesc", "tese"]
+    if api.includes(ShaderApi::OpenGl) && len <= STREAM_CAP && ["glsl", "vert", "frag", "comp", "geom", "tesc", "tese"]
         .iter().any(|suffix| extension.eq_ignore_ascii_case(suffix))
         && map.iter().all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
         && memchr::memmem::find(&map, b"#version ").is_some()
@@ -949,14 +995,14 @@ pub fn files(dir: &Path) -> Vec<PathBuf> {
 
 /// Scans `dir`; returns the D3D11-creatable shaders (sorted by hash) and stats.
 pub fn scan_dir(dir: &Path) -> (Vec<Shader>, ScanStats) {
-    let found = scan_paths(dir, &files(dir), None, None);
+    let found = scan_paths(dir, &files(dir), None, None, ShaderApi::All);
     let mut shaders: Vec<_> = found.shaders.into_values().collect();
     shaders.sort_unstable_by_key(|s| s.hash);
     (shaders, found.stats)
 }
 
 fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
-              detected: Option<&crate::unreal_key::DetectedKeys>) -> Found {
+              detected: Option<&crate::unreal_key::DetectedKeys>, api: ShaderApi) -> Found {
     let oodle = oodle::find(dir).and_then(|p| oodle::load(&p))
         .or_else(|| external_oodle().and_then(|p| oodle::load(&p)));
     // Each thread may hold a few STREAM_CAP buffers (a stream and the streams
@@ -965,7 +1011,7 @@ fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
     let catalog = std::sync::OnceLock::new();
     let archive_key = |p: &Path| detected.and_then(|keys| keys.for_archive(p)).or(key);
     let scan = || paths.par_iter().map(|p| {
-        scan_file(p, oodle, archive_key(p), |id, out| {
+        scan_file(p, oodle, archive_key(p), api, |id, out| {
             catalog.get_or_init(|| crate::unreal_io::Catalog::new(paths, archive_key))
                 .read_group(id, p, oodle, out)
         })
@@ -984,14 +1030,23 @@ fn scan_paths(dir: &Path, paths: &[PathBuf], key: Option<&PakKey>,
 
 /// `<data>\shaders\<exe>-<key>.scan`: the scan store's base path (.tshd/.tshi).
 pub fn scan_base(exe: &Path) -> Option<PathBuf> {
+    scan_base_for(exe, ShaderApi::All)
+}
+
+pub fn scan_base_for(exe: &Path, api: ShaderApi) -> Option<PathBuf> {
     let mut s = crate::warm::store_base(exe)?.into_os_string();
     s.push(".scan");
+    if api != ShaderApi::All { s.push(format!("-{}", api.slug())); }
     Some(PathBuf::from(s))
 }
 
 /// The extracted shader archive for an installation.
 pub fn export_path(exe: &Path) -> Option<PathBuf> {
-    scan_base(exe).map(|base| base.with_extension("scan.zip"))
+    export_path_for(exe, ShaderApi::All)
+}
+
+pub fn export_path_for(exe: &Path, api: ShaderApi) -> Option<PathBuf> {
+    scan_base_for(exe, api).map(|base| crate::warm::with_suffix(&base, ".zip"))
 }
 
 fn write_export(file: fs::File, found: &Found) -> io::Result<()> {
@@ -1177,15 +1232,27 @@ pub fn current_key(exe: &Path, root: &Path) -> String {
     install_key(exe, root)
 }
 
+pub fn up_to_date_for(exe: &Path, root: &Path, api: ShaderApi) -> bool {
+    export_path_for(exe, api).is_some_and(|path| path.is_file())
+        && scan_base_for(exe, api).and_then(|base| record_at(&base))
+            .is_some_and(|record| record.key == install_key(exe, root))
+}
+
 /// Scans the install and exports the bytecode. The D3D11 warm-up store only
 /// needs entries the layer has yet to capture.
 pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
-    let base = scan_base(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
-    let export = base.with_extension("scan.zip");
+    scan_game_for(exe, root, ShaderApi::All)
+}
+
+pub fn scan_game_for(exe: &Path, root: &Path, api: ShaderApi) -> io::Result<ScanStats> {
+    use crate::warm::with_suffix;
+    let store = scan_base(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
+    let base = scan_base_for(exe, api).ok_or_else(|| io::Error::other("invalid game path"))?;
+    let export = with_suffix(&base, ".zip");
     fs::create_dir_all(base.parent().unwrap())?;
     // Serialize scans of the same game, including scans launched from another app instance.
     let _lock = fs::OpenOptions::new().write(true).create(true).truncate(false)
-        .share_mode(0).open(base.with_extension("scan.lock"))?;
+        .share_mode(0).open(with_suffix(&store, ".lock"))?;
     let key = install_key(exe, root);
     let pak_key = unreal_key_file(exe).and_then(|(p, _)| PakKey::from_file(&p));
     let mut paths = files(root);
@@ -1193,21 +1260,23 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
         paths.extend(files(&cache));
     }
     let detected = crate::unreal_key::detect(exe, &paths);
-    let found = scan_paths(root, &paths, pak_key.as_ref(), Some(&detected));
-    let export_temp = base.with_extension("scan.zip.tmp");
+    let found = scan_paths(root, &paths, pak_key.as_ref(), Some(&detected), api);
+    let export_temp = with_suffix(&base, ".zip.tmp");
     write_export(fs::File::create(&export_temp)?, &found)?;
     let stats = found.stats;
-    let mut shaders: Vec<_> = found.shaders.into_values().collect();
-    let stored: HashSet<u64> = crate::shaders::store_paths(exe).map(|(store, index)| {
-        crate::shaders::with_entries_at(&store, &index, |entries| {
-            entries.iter().map(|entry| entry.hash).collect()
-        })
-    }).unwrap_or_default();
-    shaders.retain(|s| !stored.contains(&s.hash));
-    shaders.sort_unstable_by_key(|s| s.hash);
-    crate::shaders::write_base(&base, &shaders)?;
+    if api.includes(ShaderApi::D3d11) {
+        let mut shaders: Vec<_> = found.shaders.into_values().collect();
+        let stored: HashSet<u64> = crate::shaders::store_paths(exe).map(|(store, index)| {
+            crate::shaders::with_entries_at(&store, &index, |entries| {
+                entries.iter().map(|entry| entry.hash).collect()
+            })
+        }).unwrap_or_default();
+        shaders.retain(|s| !stored.contains(&s.hash));
+        shaders.sort_unstable_by_key(|s| s.hash);
+        crate::shaders::write_base(&store, &shaders)?;
+    }
     fs::rename(export_temp, export)?;
-    let key_temp = base.with_extension("scan.key.tmp");
+    let key_temp = with_suffix(&base, ".key.tmp");
     fs::write(&key_temp, format!(
         "{key}\ninvalid {}\nunsupported {}\nunreal_packages {}\nunreadable_unreal_packages {}\nlocked_unreal_paks {}\nauto_key_archives {}\nglsl {}\nspirv {}\ndxil {}\ncpk_entries {}\ndcx_entries {}\nzip_entries {}\napk_entries {}\nunity_entries {}\nunreadable_unity_entries {}\nunity_shader_objects {}\nunreadable_unity_shader_objects {}\nunreal_libraries_unreadable {}\nunreal_shaders_expected {}\nunreal_shaders_decoded {}\nunreal_shaders_dxbc {}\nunreal_shaders_dxil {}\nunreal_shaders_spirv {}\n",
         stats.invalid, stats.skipped, stats.unreal_packages, stats.unreadable_unreal_packages, stats.locked_unreal_paks,
@@ -1226,7 +1295,11 @@ mod tests {
     use super::*;
 
     fn exported(dir: &Path) -> (Found, HashMap<String, Vec<u8>>) {
-        let found = scan_paths(dir, &files(dir), None, None);
+        exported_for(dir, ShaderApi::All)
+    }
+
+    fn exported_for(dir: &Path, api: ShaderApi) -> (Found, HashMap<String, Vec<u8>>) {
+        let found = scan_paths(dir, &files(dir), None, None, api);
         let file = tempfile::tempfile().unwrap();
         write_export(file.try_clone().unwrap(), &found).unwrap();
         let mut zip = zip::ZipArchive::new(file).unwrap();
@@ -1237,6 +1310,36 @@ mod tests {
             (entry.name().to_owned(), bytes)
         }).collect();
         (found, entries)
+    }
+
+    #[test]
+    fn exports_only_the_selected_api_from_a_mixed_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let d3d11 = signed(0x0000_0050);
+        let d3d12 = signed(0x0005_0051);
+        let mut dxil = container(0x0006_0060, 9);
+        dxil[36..40].copy_from_slice(b"DXIL");
+        let spirv: Vec<_> = spirv_compute_fixture().into_iter().flat_map(u32::to_le_bytes).collect();
+        let glsl = b"#version 330\nvoid main() { gl_Position = vec4(0); }\n";
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive.start_file("shader.bin", zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)).unwrap();
+        archive.write_all(&[d3d11.as_slice(), &d3d12, &dxil].concat()).unwrap();
+        fs::write(dir.path().join("shaders.zip"), archive.finish().unwrap().into_inner()).unwrap();
+        fs::write(dir.path().join("shader.spv"), &spirv).unwrap();
+        fs::write(dir.path().join("shader.vert"), glsl).unwrap();
+
+        for (api, expected) in [
+            (ShaderApi::D3d11, vec![d3d11.as_slice()]),
+            (ShaderApi::D3d12, vec![d3d12.as_slice(), &dxil]),
+            (ShaderApi::Vulkan, vec![spirv.as_slice()]),
+            (ShaderApi::OpenGl, vec![glsl.as_slice()]),
+        ] {
+            let (_, entries) = exported_for(dir.path(), api);
+            assert_eq!(entries.len(), expected.len());
+            assert!(entries.keys().all(|entry| entry.starts_with(api.slug())));
+            assert!(expected.iter().all(|code| entries.values().any(|entry| entry == code)));
+        }
     }
 
     #[test]
@@ -1713,8 +1816,8 @@ mod tests {
         let key_path = dir.path().join("test.key");
         fs::write(&key_path, "07".repeat(32)).unwrap();
         let key = PakKey::from_file(&key_path).unwrap();
-        assert_eq!(scan_file(&package_path, None, None, |_, _| None).stats.locked_unreal_paks, 1);
-        let f = scan_file(&package_path, None, Some(&key), |_, _| None);
+        assert_eq!(scan_file(&package_path, None, None, ShaderApi::All, |_, _| None).stats.locked_unreal_paks, 1);
+        let f = scan_file(&package_path, None, Some(&key), ShaderApi::All, |_, _| None);
         assert_eq!((f.stats.unreal_packages, f.stats.locked_unreal_paks, f.stats.unreadable_unreal_packages), (1, 0, 0));
         assert_eq!(f.shaders[&hash_of(&shader)].code, shader);
     }

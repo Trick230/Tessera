@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 use rayon::prelude::*;
 
+use crate::scan::{self, ShaderApi};
 use crate::shaders::{ShaderEntry, FLAG_DXBC, FLAG_DXIL};
 use crate::warm::{settle, with_suffix, Outcome};
 
@@ -94,15 +95,29 @@ fn intact_entries(entries: &[ShaderEntry<'_>]) -> Vec<bool> {
 /// freshness), `drivers` the installed drivers' UMD versions (any GPU may
 /// have run the warm-up; empty means no current driver could be verified).
 pub fn check(exe: &Path, root: Option<&Path>, drivers: &[u64]) -> ShaderCheck {
-    let layer = crate::warm::store_base(exe);
-    let scan = crate::scan::scan_base(exe);
-    let key = match (&scan, root) {
-        (Some(b), Some(r)) if crate::scan::record_at(b).is_some() => Some(crate::scan::current_key(exe, r)),
-        _ => None,
-    };
-    let mut coverage = check_at(layer.as_deref(), scan.as_deref(), key.as_deref(), drivers);
+    let key = root.filter(|_| has_scan(exe)).map(|root| scan::current_key(exe, root));
+    check_for(exe, ShaderApi::D3d11, key.as_deref(), drivers)
+}
+
+pub fn has_scan(exe: &Path) -> bool {
+    [ShaderApi::All].into_iter().chain(ShaderApi::SELECTABLE)
+        .filter_map(|api| scan::scan_base_for(exe, api))
+        .any(|base| scan::record_at(&base).is_some())
+}
+
+pub fn check_for(exe: &Path, api: ShaderApi, install_key: Option<&str>, drivers: &[u64]) -> ShaderCheck {
+    let scoped = scan::scan_base_for(exe, api).filter(|base| scan::record_at(base).is_some());
+    let legacy = scoped.is_none();
+    let base = scoped.or_else(|| scan::scan_base(exe));
+    let d3d11 = api == ShaderApi::D3d11;
+    let layer = d3d11.then(|| crate::warm::store_base(exe)).flatten();
+    let store = d3d11.then(|| scan::scan_base(exe)).flatten();
+    let mut coverage = check_sources([layer.as_deref(), store.as_deref()], base.as_deref(), install_key, drivers);
+    if legacy && !d3d11 {
+        coverage.bad_in_install = None;
+    }
     if coverage.scan_outdated == Some(false)
-        && !crate::scan::export_path(exe).is_some_and(|path| path.is_file()) {
+        && !scan::export_path_for(exe, if legacy { ShaderApi::All } else { api }).is_some_and(|path| path.is_file()) {
         coverage.scan_outdated = Some(true);
     }
     coverage
@@ -110,8 +125,12 @@ pub fn check(exe: &Path, root: Option<&Path>, drivers: &[u64]) -> ShaderCheck {
 
 /// `check` on explicit store bases and the install key as it is now.
 pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&str>, drivers: &[u64]) -> ShaderCheck {
+    check_sources([layer, scan], scan, install_key, drivers)
+}
+
+fn check_sources(stores: [Option<&Path>; 2], scan: Option<&Path>, install_key: Option<&str>, drivers: &[u64]) -> ShaderCheck {
     let mut c = ShaderCheck::default();
-    let bases: Vec<&Path> = [layer, scan].into_iter().flatten().collect();
+    let bases: Vec<&Path> = stores.into_iter().flatten().collect();
 
     let mut stored: HashMap<u64, u16> = HashMap::new();
     for b in &bases {
