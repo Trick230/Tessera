@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <vulkan/vk_layer.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +47,12 @@ struct Device {
 std::mutex dispatch_lock;
 std::unordered_map<void*, Instance> instances;
 std::unordered_map<void*, Device> devices;
+// Bumped on every device create and destroy: invalidates the per-thread present cache.
+std::atomic<uint32_t> device_generation{0};
+// Some device still counts presentations down to its cache checkpoint.
+std::atomic<bool> checkpoint_pending{false};
+// Serializes a background cache save with the device's destruction.
+std::mutex save_lock;
 
 template<typename Map, typename Handle>
 auto dispatch(const Map& map, Handle handle) {
@@ -297,6 +305,8 @@ VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice physical, const Vk
     try {
         const std::lock_guard lock(dispatch_lock);
         devices.emplace(dispatch_key(*result), device);
+        device_generation.fetch_add(1, std::memory_order_release);
+        if (device.presentations_to_checkpoint) checkpoint_pending.store(true, std::memory_order_release);
     } catch (...) {
         destroy_cache(*result, device);
         const auto destroy = reinterpret_cast<PFN_vkDestroyDevice>(get_device(*result, "vkDestroyDevice"));
@@ -310,13 +320,16 @@ VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice physical, const Vk
 VKAPI_ATTR void VKAPI_CALL destroy_device(VkDevice device, const VkAllocationCallbacks* allocator) {
     const auto d = dispatch(devices, device);
     if (!d.get) return;
-    if (d.cache) {
-        try { save_cache(device, d); } catch (...) {}
-        destroy_cache(device, d);
-    }
     {
+        // Waits for a checkpoint save running in the background on this device.
+        const std::lock_guard saving(save_lock);
+        if (d.cache) {
+            try { save_cache(device, d); } catch (...) {}
+            destroy_cache(device, d);
+        }
         const std::lock_guard lock(dispatch_lock);
         devices.erase(dispatch_key(device));
+        device_generation.fetch_add(1, std::memory_order_release);
     }
     const auto next = reinterpret_cast<PFN_vkDestroyDevice>(d.get(device, "vkDestroyDevice"));
     if (next) next(device, allocator);
@@ -477,23 +490,61 @@ VKAPI_ATTR void VKAPI_CALL destroy_pipeline_layout(VkDevice device, VkPipelineLa
         &RecipeCapture::remove_layout);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL present(VkQueue queue, const VkPresentInfoKHR* info) {
-    const auto d = dispatch(devices, queue);
-    if (!d.present) return VK_ERROR_EXTENSION_NOT_PRESENT;
-    const auto start = Clock::now();
-    const VkResult status = d.present(queue, info);
-    telemetry().record("present", start, Clock::now(), 0, 0, 0, status);
-    if ((status == VK_SUCCESS || status == VK_SUBOPTIMAL_KHR) && d.cache && d.presentations_to_checkpoint) {
-        bool save = false;
-        {
-            const std::lock_guard lock(dispatch_lock);
-            const auto it = devices.find(dispatch_key(queue));
-            if (it != devices.end() && it->second.presentations_to_checkpoint)
-                save = --it->second.presentations_to_checkpoint == 0;
-        }
+// Per-thread copy of what present needs; refreshed only when a device is created or destroyed, so the
+// per-frame path takes no lock and copies no shared_ptr.
+struct PresentCache {
+    void* key{};
+    uint32_t generation{UINT32_MAX};
+    PFN_vkQueuePresentKHR present{};
+    bool checkpoint{};
+};
+thread_local PresentCache present_cache;
+
+void save_checkpoint(void* key) {
+    const std::lock_guard saving(save_lock);
+    Device d;
+    {
+        const std::lock_guard lock(dispatch_lock);
+        const auto it = devices.find(key);
+        if (it == devices.end()) return;  // destroyed before this save ran; its destroy saved instead
+        d = it->second;
+    }
+    try { save_cache(d.handle, d); } catch (...) {}
+}
+
+void count_presentation(void* key) {
+    bool save = false;
+    {
+        const std::lock_guard lock(dispatch_lock);
+        const auto it = devices.find(key);
+        if (it == devices.end() || !it->second.cache || !it->second.presentations_to_checkpoint) return;
+        save = --it->second.presentations_to_checkpoint == 0;
         if (save) {
-            try { save_cache(d.handle, d); } catch (...) {}
+            bool pending = false;
+            for (const auto& entry : devices) pending |= entry.second.presentations_to_checkpoint != 0;
+            checkpoint_pending.store(pending, std::memory_order_release);
         }
+    }
+    if (!save) return;
+    // vkGetPipelineCacheData and the file write run off the game's present thread.
+    try { std::thread(save_checkpoint, key).detach(); } catch (...) { save_checkpoint(key); }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL present(VkQueue queue, const VkPresentInfoKHR* info) {
+    void* const key = dispatch_key(queue);
+    const uint32_t generation = device_generation.load(std::memory_order_acquire);
+    auto& cached = present_cache;
+    if (cached.key != key || cached.generation != generation) {
+        const auto d = dispatch(devices, queue);
+        cached = {key, generation, d.present, d.cache && d.presentations_to_checkpoint};
+    }
+    if (!cached.present) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    const auto start = Clock::now();
+    const VkResult status = cached.present(queue, info);
+    telemetry().record("present", start, Clock::now(), 0, 0, 0, status);
+    if ((status == VK_SUCCESS || status == VK_SUBOPTIMAL_KHR) && cached.checkpoint
+        && checkpoint_pending.load(std::memory_order_acquire)) {
+        try { count_presentation(key); } catch (...) {}
     }
     return status;
 }
