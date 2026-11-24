@@ -47,6 +47,24 @@ inline bool render_pass_offsets(std::vector<uint8_t>& packet, VkRenderPassCreate
     return true;
 }
 
+// Drops state the driver ignores for this pipeline: the game may leave those pointers dangling.
+inline void drop_ignored_state(VkGraphicsPipelineCreateInfo& p, const VkSubpassDescription& subpass) {
+    VkShaderStageFlags stages = 0;
+    for (uint32_t i = 0; i < p.stageCount; ++i) stages |= p.pStages[i].stage;
+    if (!(stages & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)))
+        p.pTessellationState = nullptr;
+    if (!(stages & VK_SHADER_STAGE_VERTEX_BIT)) {
+        p.pVertexInputState = nullptr;
+        p.pInputAssemblyState = nullptr;
+    }
+    if (!subpass.pDepthStencilAttachment || subpass.pDepthStencilAttachment->attachment == VK_ATTACHMENT_UNUSED)
+        p.pDepthStencilState = nullptr;
+    bool color = false;
+    for (uint32_t i = 0; i < subpass.colorAttachmentCount; ++i)
+        color = color || subpass.pColorAttachments[i].attachment != VK_ATTACHMENT_UNUSED;
+    if (!color) p.pColorBlendState = nullptr;
+}
+
 struct GraphicsWire {
     VkGraphicsPipelineCreateInfo pipeline;
     const VkShaderModuleCreateInfo* modules;
@@ -68,8 +86,23 @@ inline bool graphics_offsets(std::vector<uint8_t>& packet, GraphicsWire& wire, b
         || p.layout || p.renderPass || p.basePipelineHandle || !p.stageCount || p.stageCount > max_stages
         || !wire.render_size || !wire.layout_size)
         return false;
+    // Dynamic viewports and scissors leave the static arrays (and with-count, the counts) ignored.
+    bool viewports = false, viewport_count = false, scissors = false, scissor_count = false;
+    if (capture && p.pDynamicState && p.pDynamicState->dynamicStateCount <= 128) {
+        for (uint32_t i = 0; i < p.pDynamicState->dynamicStateCount; ++i) {
+            const VkDynamicState s = p.pDynamicState->pDynamicStates[i];
+            viewport_count = viewport_count || s == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT;
+            scissor_count = scissor_count || s == VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT;
+            viewports = viewports || viewport_count || s == VK_DYNAMIC_STATE_VIEWPORT;
+            scissors = scissors || scissor_count || s == VK_DYNAMIC_STATE_SCISSOR;
+        }
+    }
     Offsets offsets(packet, sizeof(wire), capture);
     const auto surface = [&](VkPipelineViewportStateCreateInfo& state) {
+        if (viewports) state.pViewports = nullptr;
+        if (viewport_count) state.viewportCount = 0;
+        if (scissors) state.pScissors = nullptr;
+        if (scissor_count) state.scissorCount = 0;
         return !state.pNext && state.viewportCount <= 32 && state.scissorCount <= 32
             && (!state.pViewports || offsets.array(state.pViewports, state.viewportCount, 32))
             && (!state.pScissors || offsets.array(state.pScissors, state.scissorCount, 32));

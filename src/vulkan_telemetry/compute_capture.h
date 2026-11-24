@@ -182,6 +182,10 @@ public:
         if (layout_packet.size() > packet_limit) return;
         GraphicsWire wire{info, shaders, pass->second.data(), layout_packet.data(),
             static_cast<uint32_t>(pass->second.size()), static_cast<uint32_t>(layout_packet.size())};
+        std::vector<uint8_t> pass_copy = pass->second;
+        VkRenderPassCreateInfo pass_info{};
+        if (!render_pass_offsets(pass_copy, pass_info, false) || info.subpass >= pass_info.subpassCount) return;
+        drop_ignored_state(wire.pipeline, pass_info.pSubpasses[info.subpass]);
         wire.pipeline.pNext = nullptr;
         wire.pipeline.layout = VK_NULL_HANDLE;
         wire.pipeline.renderPass = VK_NULL_HANDLE;
