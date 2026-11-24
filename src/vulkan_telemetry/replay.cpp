@@ -4,6 +4,7 @@
 #include "device_recipe.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 
@@ -358,6 +359,8 @@ int run(const wchar_t* recording, const wchar_t* output, const wchar_t* checkpoi
     }
     size_t total = sizeof(header), prepared[2]{}, failed = 0;
     bool lost = false;
+    constexpr auto checkpoint_interval = std::chrono::seconds(2);
+    auto last_checkpoint = std::chrono::steady_clock::now();
     const auto attempted = [&] { return prepared[0] + prepared[1] + failed; };
     std::vector<uint8_t> packet;
     while (true) {
@@ -392,10 +395,15 @@ int run(const wchar_t* recording, const wchar_t* output, const wchar_t* checkpoi
         }
         if (result == VK_SUCCESS) {
             ++prepared[kind];
-            if (checkpoint && (attempted() == 1 || attempted() % 32 == 0)
-                && !save_cache(context, checkpoint, true)) {
-                fprintf(stderr, "cannot save Vulkan replay checkpoint\n");
-                return 1;
+            // Each checkpoint rewrites the whole cache: save by elapsed time rather than pipeline
+            // count, so large recordings do not pay quadratic writes. The first success saves at once.
+            if (checkpoint && (attempted() == 1
+                    || std::chrono::steady_clock::now() - last_checkpoint >= checkpoint_interval)) {
+                if (!save_cache(context, checkpoint, true)) {
+                    fprintf(stderr, "cannot save Vulkan replay checkpoint\n");
+                    return 1;
+                }
+                last_checkpoint = std::chrono::steady_clock::now();
             }
         }
         else {
