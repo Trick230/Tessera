@@ -260,8 +260,12 @@ built side by side in D3D11, with pipeline recording for D3D12 and Vulkan added 
 **Pipeline recording (towards phase 6, S2/S3):**
 - D3D12: `tessera_d3d12_capture.dll` records compute, graphics (pipeline state streams) and ray tracing state
   objects, including Agility device factories; the app imports recordings and replays them offline.
+  Recordings (format v3) carry the game build (exe size and write time): a patched game starts a new one.
+  `AddToStateObject` records name their parent by hash. Replay keeps partial results and relaunches past a
+  driver crash, skipping the pipeline that caused it.
 - Vulkan: an optional layer (`-Vulkan`) records compute and core graphics pipelines and cache feedback;
-  `tessera_vulkan_replay` rebuilds them into a driver cache with resumable checkpoints. Added for recompiled
+  `tessera_vulkan_replay` rebuilds them into a driver cache with resumable checkpoints (saved by elapsed
+  time). The layer's present hook takes no lock and saves its cache checkpoint off-thread. Added for recompiled
   games that only ship Vulkan/D3D12 renderers. Scope is recording and offline replay only — there is no
   Vulkan optimization layer, and none is planned before D3D12.
 - The app has **Record pipelines**, **Import pipeline recording** and **Play and verify cache**.
