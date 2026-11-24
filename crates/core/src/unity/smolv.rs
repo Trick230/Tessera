@@ -5,7 +5,7 @@
 use super::{MAX_BLOCK, le_u32, take};
 
 const SPIRV_MAGIC: u32 = 0x0723_0203;
-pub(super) const MAGIC: &[u8] = b"LOMS";
+pub(crate) const MAGIC: &[u8] = b"LOMS";
 const DECORATE: u32 = 71;
 const MEMBER_DECORATE: u32 = 72;
 const SHUFFLE: u32 = 79;
@@ -92,9 +92,9 @@ fn push(words: &mut Vec<u8>, word: u32) {
     words.extend_from_slice(&word.to_le_bytes());
 }
 
-/// Decode a module at the start of a Unity shader payload and return its input
-/// length. The same version tag was used by two historical encodings.
-pub(super) fn decode(data: &[u8], legacy_first: bool, words: &mut Vec<u8>) -> Option<usize> {
+/// Decode a module and return its input length. The same version tag was used
+/// by two historical encodings.
+pub(crate) fn decode(data: &[u8], legacy_first: bool, words: &mut Vec<u8>) -> Option<usize> {
     decode_variant(data, legacy_first, words).or_else(|| decode_variant(data, !legacy_first, words))
 }
 

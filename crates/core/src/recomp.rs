@@ -2,6 +2,15 @@
 //! Native ports distributed outside the storefronts.
 
 use std::path::{Path, PathBuf};
+
+pub(crate) fn shader_cache(exe: &Path, root: &Path) -> Option<PathBuf> {
+    if !exe.file_name()?.eq_ignore_ascii_case("skate3.exe") || !root.join("rexruntime.dll").is_file() {
+        return None;
+    }
+    let path = PathBuf::from(std::env::var_os("APPDATA")?)
+        .join("skate3").join("cache").join("nrhi_shaders");
+    path.is_dir().then_some(path)
+}
 use walkdir::WalkDir;
 
 use crate::library::{GameEntry, Store};

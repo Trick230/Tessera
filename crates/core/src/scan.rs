@@ -14,6 +14,7 @@ use std::io::{self, Cursor, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use object::{Object, ObjectSection, SectionFlags};
 use rayon::prelude::*;
 
 use crate::oodle::{self, Oodle};
@@ -264,7 +265,7 @@ pub fn container_at(b: &[u8]) -> Option<Container> {
 struct Found {
     shaders: HashMap<u64, Shader>,
     d3d12: HashMap<u64, Shader>,
-    glsl: HashSet<u128>,
+    glsl: HashMap<u128, Vec<u8>>,
     spirv: HashMap<u128, Vec<u8>>,
     stats: ScanStats,
     oodle: Option<Oodle>,
@@ -466,7 +467,7 @@ impl Found {
                 continue;
             }
             let bytes = if unity { source } else { &rest[..end] };
-            self.glsl.insert(xxhash_rust::xxh3::xxh3_128(bytes));
+            self.glsl.entry(xxhash_rust::xxh3::xxh3_128(bytes)).or_insert_with(|| bytes.to_vec());
         }
     }
 
@@ -481,6 +482,46 @@ impl Found {
         let hash = xxhash_rust::xxh3::xxh3_128(&code);
         self.spirv.entry(hash).or_insert_with(|| code.into_owned());
         true
+    }
+
+    fn search_executable_spirv(&mut self, data: &[u8]) {
+        let Ok(pe) = object::File::parse(data) else { return };
+        for section in pe.sections() {
+            if !matches!(section.flags(), SectionFlags::Coff { characteristics }
+                if characteristics.0 & object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA.0 != 0
+                && characteristics.0 & object::pe::IMAGE_SCN_MEM_EXECUTE.0 == 0) {
+                continue;
+            }
+            let Ok(bytes) = section.data() else { continue };
+            for start in memchr::memmem::find_iter(bytes, b"\x03\x02\x23\x07") {
+                let module = &bytes[start..];
+                if let Some(size) = embedded_spirv_size(module) {
+                    self.record_spirv(&module[..size]);
+                }
+            }
+        }
+    }
+
+    fn search_smolv_cache(&mut self, mut bytes: &[u8]) {
+        use crate::unity::smolv;
+        let mut decoded = Vec::new();
+        while let Some(size) = smolv::decode(bytes, false, &mut decoded) {
+            self.record_spirv(&decoded);
+            bytes = &bytes[size..];
+        }
+    }
+
+    fn search_spz(&mut self, bytes: &[u8]) {
+        // Savage Wind stores one zlib-compressed module per SPZ1 record.
+        let Some(header) = bytes.get(..8) else { return };
+        let size = u64::from(u32_at(header, 4)) * 4;
+        if !(20..=STREAM_CAP).contains(&size) { return; }
+        let mut decoded = Vec::new();
+        let compressed = &bytes[8..];
+        if inflate(compressed, &mut decoded) == Some(Some(compressed.len()))
+            && decoded.len() as u64 == size {
+            self.record_spirv(&decoded);
+        }
     }
 
     fn unity_payload(&mut self, bytes: &[u8], shader_data: bool) {
@@ -623,6 +664,11 @@ impl Found {
                 let Some(consumed) = consumed else { continue };
                 if out.len() < 32 {
                     continue;
+                }
+                if kind == 1 && out.starts_with(crate::unity::smolv::MAGIC) {
+                    self.search_smolv_cache(&out);
+                } else {
+                    self.record_spirv(&out);
                 }
                 let inner = std::mem::take(&mut out);
                 let n = self.search(&inner, depth + 1);
@@ -783,6 +829,37 @@ fn spirv_byte_order(bytes: &[u8]) -> Option<bool> {
     Some(u32_at(bytes, 0) != MAGIC)
 }
 
+/// A PE data section has no SPIR-V size table. Follow complete instructions
+/// and contiguous functions, then stop before alignment or the next object.
+fn embedded_spirv_size(bytes: &[u8]) -> Option<usize> {
+    const OP_FUNCTION: u32 = 0x0005_0036;
+    const OP_FUNCTION_END: u32 = 0x0001_0038;
+    let bytes = &bytes[..bytes.len().min(STREAM_CAP as usize)];
+    if bytes.len() < 20 || u32_at(bytes, 16) != 0 { return None; }
+    let mut offset = 20;
+    let mut in_function = false;
+    while offset + 4 <= bytes.len() {
+        let inst = u32_at(bytes, offset);
+        let words = (inst >> 16) as usize;
+        if words == 0 { return None; }
+        offset += 4 * words;
+        if offset > bytes.len() { return None; }
+        if inst == OP_FUNCTION {
+            if in_function { return None; }
+            in_function = true;
+        }
+        if inst == OP_FUNCTION_END {
+            if !in_function { return None; }
+            if bytes.get(offset..offset + 4)
+                .is_none_or(|word| u32_at(word, 0) != OP_FUNCTION) {
+                return Some(offset);
+            }
+            in_function = false;
+        }
+    }
+    None
+}
+
 fn counted_spirv(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     // Engine shader records can prefix a SPIR-V array with its byte or word count.
     [b"\x03\x02\x23\x07", b"\x07\x23\x02\x03"].into_iter().flat_map(|magic| {
@@ -809,6 +886,10 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
     let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { return f };
     f.stats.files = 1;
     f.stats.bytes = len;
+    if map.starts_with(b"SPZ1") {
+        f.search_spz(&map);
+        return f;
+    }
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
     let pak = if extension.eq_ignore_ascii_case("pak") {
         unreal_pak::scan(&map, key, oodle, |kind, bytes| f.unreal_payload(kind, bytes))
@@ -841,6 +922,14 @@ fn scan_file(path: &Path, oodle: Option<Oodle>, key: Option<&PakKey>,
     }
     if extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll") {
         f.search_glsl(&map);
+        f.search_executable_spirv(&map);
+    }
+    if len <= STREAM_CAP && ["glsl", "vert", "frag", "comp", "geom", "tesc", "tese"]
+        .iter().any(|suffix| extension.eq_ignore_ascii_case(suffix))
+        && map.iter().all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+        && memchr::memmem::find(&map, b"#version ").is_some()
+        && memchr::memmem::find(&map, b"void main").is_some() {
+        f.glsl.insert(xxhash_rust::xxh3::xxh3_128(&map), map.to_vec());
     }
     if is_spv_path(path) {
         f.record_spirv(&map);
@@ -922,11 +1011,13 @@ fn write_export(file: fs::File, found: &Found) -> io::Result<()> {
         zip.start_file(format!("{folder}/{:016x}.{extension}", shader.hash), options)?;
         zip.write_all(&shader.code)?;
     }
-    let mut modules: Vec<_> = found.spirv.iter().collect();
-    modules.sort_unstable_by_key(|(&hash, _)| hash);
-    for (hash, code) in modules {
-        zip.start_file(format!("vulkan/{hash:032x}.spv"), options)?;
-        zip.write_all(code)?;
+    for (folder, extension, modules) in [("vulkan", "spv", &found.spirv), ("opengl", "glsl", &found.glsl)] {
+        let mut modules: Vec<_> = modules.iter().collect();
+        modules.sort_unstable_by_key(|(&hash, _)| hash);
+        for (hash, code) in modules {
+            zip.start_file(format!("{folder}/{hash:032x}.{extension}"), options)?;
+            zip.write_all(code)?;
+        }
     }
     zip.finish()?.flush()
 }
@@ -946,6 +1037,7 @@ fn volatile(p: &Path) -> bool {
 fn install_key(exe: &Path, root: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut dirs = vec![root.to_path_buf()];
+    dirs.extend(crate::recomp::shader_cache(exe, root));
     let mut files = Vec::new();
     while let Some(dir) = dirs.pop() {
         let Ok(entries) = fs::read_dir(dir) else { continue };
@@ -980,7 +1072,7 @@ fn install_key(exe: &Path, root: &Path) -> String {
         len.hash(&mut key);
         modified.hash(&mut key);
     }
-    format!("tessera-scan 20 {:016x}", key.finish())
+    format!("tessera-scan 21 {:016x}", key.finish())
 }
 
 fn external_oodle() -> Option<PathBuf> {
@@ -1096,7 +1188,10 @@ pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
         .share_mode(0).open(base.with_extension("scan.lock"))?;
     let key = install_key(exe, root);
     let pak_key = unreal_key_file(exe).and_then(|(p, _)| PakKey::from_file(&p));
-    let paths = files(root);
+    let mut paths = files(root);
+    if let Some(cache) = crate::recomp::shader_cache(exe, root) {
+        paths.extend(files(&cache));
+    }
     let detected = crate::unreal_key::detect(exe, &paths);
     let found = scan_paths(root, &paths, pak_key.as_ref(), Some(&detected));
     let export_temp = base.with_extension("scan.zip.tmp");
@@ -1409,6 +1504,28 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[&format!("vulkan/{:032x}.spv", xxhash_rust::xxh3::xxh3_128(&bytes))], bytes);
         assert!(entries.values().all(|code| spirv_byte_order(code) == Some(false)));
+    }
+
+    #[test]
+    fn extracts_spirv_from_runtime_cache_and_bounds_embedded_arrays() {
+        let bytes: Vec<_> = spirv_compute_fixture().into_iter().flat_map(u32::to_le_bytes).collect();
+        let mut embedded = bytes.clone();
+        embedded.extend_from_slice(&bytes[26 * 4..]); // A second function.
+        let size = embedded.len();
+        embedded.extend_from_slice(&[0; 8]);
+        embedded.extend_from_slice(&bytes);
+        assert_eq!(embedded_spirv_size(&embedded), Some(size));
+        assert_eq!(embedded_spirv_size(&bytes[..bytes.len() - 4]), None);
+
+        let mut zlib = flate2::write::ZlibEncoder::new(b"SPZ1".to_vec(), flate2::Compression::fast());
+        zlib.get_mut().extend_from_slice(&((bytes.len() / 4) as u32).to_le_bytes());
+        zlib.write_all(&bytes).unwrap();
+        let cache = zlib.finish().unwrap();
+        let mut found = Found::default();
+        found.search_spz(&cache[..cache.len() - 3]);
+        assert!(found.spirv.is_empty());
+        found.search_spz(&cache);
+        assert_eq!(found.spirv.into_values().collect::<Vec<_>>(), [bytes]);
     }
 
     /// A minimal container: one SHEX part with the given version token.

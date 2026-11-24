@@ -68,9 +68,14 @@ Quality is never traded silently. Any lossy step, such as recompressing a textur
 The **Shaders** tab writes a `*.scan.zip` export under `%LOCALAPPDATA%\Tessera\shaders`
 when you scan or prepare a game. The archive contains D3D11-compatible DXBC under
 `d3d11/`, DXIL and Shader Model 5.1 DXBC under `d3d12/`, and SPIR-V under
-`vulkan/`. You can also run `tessera.exe --scan <game-exe> <install-folder>`.
+`vulkan/`. GLSL sources go under `opengl/`. You can also run
+`tessera.exe --scan <game-exe> <install-folder>`.
 If an Oodle-compressed Unreal build ships without a separate decoder, set
 `TESSERA_OODLE_DLL` to the path of a trusted, compatible 64-bit Oodle DLL.
+
+The scan reads precompiled shaders embedded in recomp executables and disk
+caches, including Unleashed Recompiled's Zstandard and SMOL-V libraries,
+Savage Wind's `SPZ1` files, and Skate 3's per-user `nrhi_shaders` cache.
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 
 **Being measured:** Unreal variants (dynamic resolution off, render targets that only grow, pool limits, shader creation on load, level streaming time limits) in Final Fantasy VII Remake.

@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 mod shader;
-mod smolv;
+pub(crate) mod smolv;
 
 pub(crate) fn graphics_apis(exe: &Path) -> Option<ApiSet> {
     let mut data_dir = exe.file_stem()?.to_os_string();
