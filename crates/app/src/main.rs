@@ -461,7 +461,7 @@ fn shader_state(
     run: Option<(u64, u64)>,
     can_prepare: bool,
     api: ShaderApi,
-    native_precompile: bool,
+    native_precompile: Option<&NativePrecompileView>,
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<&tessera_core::driver::NvidiaGameCache>,
 ) -> ShaderState {
@@ -478,10 +478,13 @@ fn shader_state(
     };
     let mut rows = Vec::new();
     let scan_only = api != ShaderApi::D3d11;
-    if native_precompile {
+    if let Some(native) = native_precompile {
         rows.push(line("Game precompiler", "Available".into(), vec![
             "Prepare shaders runs the game's offline precompiler.".into(),
         ], NEUTRAL));
+        if let Some(result) = &native.last_result {
+            rows.push(line("Last offline preparation", String::new(), vec![result.clone()], NEUTRAL));
+        }
     }
 
     if c.auto_key_archives > 0 && c.scan_outdated == Some(false) {
@@ -666,7 +669,7 @@ fn shader_state(
     }
     rows.push(line("Out of date", value.to_string(), d, tone));
 
-    ShaderState { present: true, native_precompile, rows: ModelRc::new(VecModel::from(rows)) }
+    ShaderState { present: true, native_precompile: native_precompile.is_some(), rows: ModelRc::new(VecModel::from(rows)) }
 }
 
 const FPS_CHOICES: [u32; 9] = [0, 30, 40, 60, 90, 120, 144, 165, 240];
@@ -752,6 +755,10 @@ fn game_settings(
     })
 }
 
+struct NativePrecompileView {
+    last_result: Option<String>,
+}
+
 #[derive(Default)]
 struct GameView {
     session: SessionInfo,
@@ -759,7 +766,7 @@ struct GameView {
     run: Option<(u64, u64)>,
     facts: Option<advanced::Facts>,
     shader_checks: Option<[ShaderCheck; 4]>,
-    native_precompilers: [bool; 4],
+    native_precompilers: [Option<NativePrecompileView>; 4],
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<tessera_core::driver::NvidiaGameCache>,
 }
@@ -783,7 +790,11 @@ impl GameView {
         Self {
             session, budget, run, facts,
             shader_checks: Some(ShaderApi::SELECTABLE.map(|api| shader_check::check_for(exe, api, key.as_deref(), &drivers))),
-            native_precompilers: ShaderApi::SELECTABLE.map(|api| pipeline_warm::NativePrecompiler::detect(exe, api).is_some()),
+            native_precompilers: ShaderApi::SELECTABLE.map(|api| {
+                pipeline_warm::NativePrecompiler::detect(exe, api).map(|native| NativePrecompileView {
+                    last_result: native.last_result(exe),
+                })
+            }),
             pak_key: is_unreal(game).then(|| tessera_core::scan::unreal_key_status(exe)),
             disk_cache: tessera_core::driver::nvidia_game_cache(exe),
         }
@@ -812,7 +823,7 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
     let shaders = view.shader_checks.as_ref().map_or_else(ShaderStates::default, |checks| {
         let render = |i: usize| {
             shader_state(&checks[i], view.run, can_prepare(game), ShaderApi::SELECTABLE[i],
-                view.native_precompilers[i],
+                view.native_precompilers[i].as_ref(),
                 view.pak_key, view.disk_cache.as_ref())
         };
         let [d3d11, d3d12, vulkan, opengl] = std::array::from_fn(render);

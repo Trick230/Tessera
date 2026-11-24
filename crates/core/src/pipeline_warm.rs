@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Prepare pipelines through game engine precompilers.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use crate::scan::{self, ShaderApi};
-use crate::warm;
+use crate::warm::{self, with_suffix};
 
 #[derive(Clone, Copy)]
 pub enum NativePrecompiler {
@@ -27,7 +28,7 @@ impl std::fmt::Display for NativeStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} shaders, {} translations, {} translation failures", self.shaders, self.translations, self.failed)?;
         if let Some(stats) = &self.pipelines {
-            write!(f, ". Pipeline list: {} of {} built", stats.prepared, stats.total)
+            write!(f, ". Pipeline list: {} of {} built, {} skipped", stats.prepared, stats.total, stats.failed)
         } else {
             write!(f, ". Pipeline list completion unconfirmed")
         }
@@ -47,30 +48,59 @@ impl NativePrecompiler {
     }
 
     pub fn run(self, exe: &Path) -> io::Result<NativeStats> {
+        let report = self.report_path(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
         let _lock = scan::lock(exe)?;
         if warm::is_running(exe) {
             return Err(io::Error::other("close the game before preparing pipelines"));
         }
+        let start = Instant::now();
+        let result = match self {
+            Self::SavageWind => run_savage_wind(exe),
+        };
+        let summary = match &result {
+            Ok(stats) => stats.to_string(),
+            Err(error) => format!("Preparation failed ({error})"),
+        };
+        let summary = format!("{summary} ({:.1} s).", start.elapsed().as_secs_f64());
+        if let Err(error) = write_report(&report, &summary) {
+            return Err(io::Error::other(format!("{summary} Could not save the result ({error}).")));
+        }
+        result
+    }
+
+    pub fn last_result(self, exe: &Path) -> Option<String> {
+        fs::read_to_string(self.report_path(exe)?).ok()
+    }
+
+    fn report_path(self, exe: &Path) -> Option<PathBuf> {
         match self {
-            Self::SavageWind => {
-                let exe = std::path::absolute(exe)?;
-                let root = exe.parent().ok_or_else(|| io::Error::other("missing game directory"))?;
-                let output = Command::new(&exe)
-                    .creation_flags(0x0800_0000)
-                    .current_dir(root)
-                    .arg("--precompile-shaders")
-                    .env("SAVAGEWIND_HIDDEN", "1")
-                    .env_remove("SAVAGEWIND_PRECOMPILE_NO_PIPELINES")
-                    .output()?;
-                let output_text = String::from_utf8_lossy(&output.stderr);
-                if !output.status.success() {
-                    let detail = output_text.lines().rev().find(|line| line.starts_with("[precompile] stopped:"));
-                    return Err(io::Error::other(detail.map_or_else(|| output.status.to_string(), str::to_owned)));
-                }
-                savage_wind_stats(&output_text)
-            }
+            Self::SavageWind => Some(with_suffix(&scan::scan_base_for(exe, ShaderApi::Vulkan)?, ".precompile.txt")),
         }
     }
+}
+
+fn write_report(path: &Path, summary: &str) -> io::Result<()> {
+    let temp = with_suffix(path, ".tmp");
+    fs::write(&temp, summary)?;
+    fs::rename(temp, path)
+}
+
+fn run_savage_wind(exe: &Path) -> io::Result<NativeStats> {
+    let exe = std::path::absolute(exe)?;
+    let root = exe.parent().ok_or_else(|| io::Error::other("missing game directory"))?;
+    let output = Command::new(&exe)
+        .creation_flags(0x0800_0000)
+        .current_dir(root)
+        .arg("--precompile-shaders")
+        .env("SAVAGEWIND_HIDDEN", "1")
+        .env_remove("SAVAGEWIND_PRECOMPILE_NO_PIPELINES")
+        .output()?;
+    let output_text = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        let detail = output_text.lines().rev().find(|line| line.starts_with("[precompile] stopped:"));
+        return Err(io::Error::other(detail.map_or_else(|| output.status.to_string(), str::to_owned)));
+    }
+    savage_wind_stats(&output_text)
 }
 
 fn savage_wind_stats(output: &str) -> io::Result<NativeStats> {
@@ -115,7 +145,6 @@ pub struct PipelineStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn native_precompiler_requires_the_vulkan_install_and_command() {
@@ -139,5 +168,14 @@ mod tests {
         let complete = "\r[precompile]  99%[pso] pre-warm done in 13 ms: 3 pipelines built, 0 built first by draws, 1 skipped";
         assert_eq!(savage_wind_pipelines(complete), Some(PipelineStats { prepared: 3, failed: 1, total: 4 }));
         assert!(savage_wind_pipelines(&format!("{complete}\n[pso] pre-warm: 8 pipelines on 2 threads")).is_none());
+    }
+
+    #[test]
+    fn latest_precompile_report_replaces_the_previous_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("precompile.txt");
+        write_report(&report, "Preparation failed.").unwrap();
+        write_report(&report, "Pipeline list completion unconfirmed.").unwrap();
+        assert_eq!(fs::read_to_string(report).unwrap(), "Pipeline list completion unconfirmed.");
     }
 }
