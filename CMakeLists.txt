@@ -24,6 +24,11 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
   add_subdirectory(src/d3d12_capture)
 endif()
 
+option(TESSERA_BUILD_VULKAN_TELEMETRY "Build the optional Vulkan telemetry layer" OFF)
+if(TESSERA_BUILD_VULKAN_TELEMETRY)
+  add_subdirectory(src/vulkan_telemetry)
+endif()
+
 option(TESSERA_BUILD_QUALITY "Build the offline FLIP texture tool" OFF)
 if(TESSERA_BUILD_QUALITY)
   add_subdirectory(src/texcomp)

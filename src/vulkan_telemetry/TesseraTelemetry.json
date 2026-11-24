@@ -1,0 +1,11 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_TESSERA_telemetry",
+    "type": "GLOBAL",
+    "library_path": ".\\tessera_vulkan_telemetry.dll",
+    "api_version": "1.3.0",
+    "implementation_version": "1",
+    "description": "Tessera pipeline creation and presentation telemetry"
+  }
+}

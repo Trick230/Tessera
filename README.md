@@ -87,6 +87,22 @@ The recorded duration is the time spent in the driver's pipeline creation call.
 The capture covers the entry points above and excludes graphics pipelines,
 pipeline state streams and devices created through an Agility factory.
 
+Build the Windows Vulkan layer with `-DTESSERA_BUILD_VULKAN_TELEMETRY=ON`
+and the Vulkan SDK headers. For the game process, set `VK_LAYER_PATH` to
+the directory containing the layer DLL and manifest, add
+`VK_LAYER_TESSERA_telemetry` to `VK_INSTANCE_LAYERS`, and set
+`TESSERA_VULKAN_TELEMETRY` to a new CSV path. The CSV records pipeline
+creation times, Vulkan application-cache feedback, and times between
+presentation calls. Displayed frame times and internal driver-cache hits
+require separate telemetry.
+
+`TESSERA_VULKAN_CACHE_OUTPUT` saves a driver-compatible pipeline-cache
+snapshot at the first successful presentation, or when the device is
+destroyed if it never presents. `TESSERA_VULKAN_CACHE_INPUT` seeds the cache
+on a later launch. Tessera supplies this cache only for calls where the
+game provides no cache of its own. The snapshot contains opaque driver
+data. Recreating pipeline descriptors offline requires a separate recording.
+
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 
 **Being measured:** Unreal variants (dynamic resolution off, render targets that only grow, pool limits, shader creation on load, level streaming time limits) in Final Fantasy VII Remake.
