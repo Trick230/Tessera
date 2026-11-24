@@ -789,7 +789,7 @@ fn is_unreal(game: &GameInfo) -> bool {
 }
 
 impl GameView {
-    fn read(game: &GameInfo) -> Self {
+    fn read(game: &GameInfo, nvidia: Option<&tessera_core::driver::NvidiaCacheIndex>) -> Self {
         let Some(exe) = &game.exe else { return Self::default() };
         let root = Some(game.entry.root.as_path());
         let (session, budget, run) = session_info(exe);
@@ -810,7 +810,7 @@ impl GameView {
             }),
             recordings: ShaderApi::SELECTABLE.map(|api| tessera_core::recording::status(exe, api)),
             pak_key: is_unreal(game).then(|| tessera_core::scan::unreal_key_status(exe)),
-            disk_cache: tessera_core::driver::nvidia_game_cache(exe),
+            disk_cache: nvidia.and_then(|index| index.game(exe)),
         }
     }
 }
@@ -880,6 +880,8 @@ fn start_view_worker(ui: &MainWindow, state: &Shared, st: &mut State) {
     st.view_worker_running = true;
     let weak = ui.as_weak();
     let state = state.clone();
+    // The DXCache index is rebuilt once per refresh (epoch), not once per game.
+    let mut nvidia: Option<(u64, Option<tessera_core::driver::NvidiaCacheIndex>)> = None;
     std::thread::spawn(move || loop {
         let job = {
             let mut st = state.lock().unwrap();
@@ -891,7 +893,10 @@ fn start_view_worker(ui: &MainWindow, state: &Shared, st: &mut State) {
         };
         match job {
             ViewJob::Read(game, epoch) => {
-                let view = GameView::read(&game);
+                if nvidia.as_ref().is_none_or(|(built, _)| *built != epoch) {
+                    nvidia = Some((epoch, tessera_core::driver::nvidia_cache_index()));
+                }
+                let view = GameView::read(&game, nvidia.as_ref().and_then(|(_, index)| index.as_ref()));
                 let mut st = state.lock().unwrap();
                 if epoch != st.view_epoch {
                     continue;

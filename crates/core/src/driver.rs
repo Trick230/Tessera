@@ -181,9 +181,26 @@ pub struct NvidiaGameCache {
     pub counted_files: u64,
 }
 
-/// Counts entries in supported NVIDIA DXCache files naming the executable.
-pub fn nvidia_game_cache(exe: &Path) -> Option<NvidiaGameCache> {
-    nvidia_game_cache_at(&nvidia_cache_dir()?, exe.file_name()?.to_str()?)
+/// NVIDIA DXCache files grouped by the executable name in their headers. Built
+/// once per library refresh: each file header is read once, not once per game.
+#[derive(Debug, Default)]
+pub struct NvidiaCacheIndex {
+    files: std::collections::HashMap<Vec<u8>, Vec<NvidiaCacheFile>>,
+}
+
+#[derive(Debug)]
+struct NvidiaCacheFile {
+    path: PathBuf,
+    bytes: u64,
+    countable: bool,
+}
+
+/// Indexes the NVIDIA DXCache, or None without an NVIDIA GPU or cache folder.
+pub fn nvidia_cache_index() -> Option<NvidiaCacheIndex> {
+    if !gpus().iter().any(|g| g.vendor == Vendor::Nvidia) {
+        return None;
+    }
+    nvidia_cache_index_at(&nvidia_cache_dir()?)
 }
 
 fn nvidia_cache_dir() -> Option<PathBuf> {
@@ -204,26 +221,41 @@ fn nvidia_cache_file(entry: &fs::DirEntry) -> Option<(fs::File, Vec<u8>, u64)> {
     Some((file, header, len))
 }
 
-fn nvidia_game_cache_at(dir: &Path, exe_name: &str) -> Option<NvidiaGameCache> {
-    let mut cache = NvidiaGameCache::default();
+fn nvidia_cache_index_at(dir: &Path) -> Option<NvidiaCacheIndex> {
+    let mut index = NvidiaCacheIndex::default();
     for entry in fs::read_dir(dir).ok()?.flatten() {
-        let Some((file, header, len)) = nvidia_cache_file(&entry) else { continue };
-        let Some((name, bytes)) = nvidia_cache_header(&header, len) else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case(exe_name.as_bytes()) {
+        let Some((_, header, len)) = nvidia_cache_file(&entry) else { continue };
+        let Some((name, bytes)) = nvidia_cache_header(&header, len) else { continue };
+        index.files.entry(name.to_ascii_lowercase()).or_default()
+            .push(NvidiaCacheFile { path: entry.path(), bytes, countable: header[0x10] == 1 });
+    }
+    Some(index)
+}
+
+impl NvidiaCacheIndex {
+    /// Counts entries in supported files naming the executable; only these files' records are read.
+    pub fn game(&self, exe: &Path) -> Option<NvidiaGameCache> {
+        let name = exe.file_name()?.to_str()?.to_ascii_lowercase();
+        let mut cache = NvidiaGameCache::default();
+        for file in self.files.get(name.as_bytes()).into_iter().flatten() {
             cache.files += 1;
-            cache.bytes += bytes;
-            if header[0x10] == 1 {
-                let mut reader = BufReader::with_capacity(64 * 1024, file);
-                if let Some(entries) = nvidia_cache_entries(&mut reader, bytes) {
-                    cache.entries += entries;
-                    cache.counted_files += 1;
-                }
+            cache.bytes += file.bytes;
+            if !file.countable { continue }
+            let Ok(mut handle) = fs::File::open(&file.path) else { continue };
+            if handle.seek(SeekFrom::Start(0x111)).is_err() { continue }
+            let mut reader = BufReader::with_capacity(64 * 1024, handle);
+            if let Some(entries) = nvidia_cache_entries(&mut reader, file.bytes) {
+                cache.entries += entries;
+                cache.counted_files += 1;
             }
         }
+        Some(cache)
     }
-    Some(cache)
+}
+
+#[cfg(test)]
+fn nvidia_game_cache_at(dir: &Path, exe_name: &str) -> Option<NvidiaGameCache> {
+    nvidia_cache_index_at(dir)?.game(Path::new(exe_name))
 }
 
 /// Clears NVIDIA DXCache files whose header identifies this executable name.
