@@ -19,6 +19,7 @@
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
+#include <share.h>
 #include <windows.h>
 #include <wrl/client.h>
 
@@ -785,7 +786,60 @@ HRESULT create_ray_state(ID3D12Device* device, uint32_t kind, std::span<const ui
     return device5->CreateStateObject(&desc, IID_PPV_ARGS(&state));
 }
 
-int replay_d3d12(const wchar_t* path, bool warp) {
+// Replay log: "capture <size> <write time>" then "p N" before pipeline N and
+// "d N" / "f N" after it. A relaunch skips pipelines that crashed the driver
+// (pending without a result) or failed before.
+struct ReplayLog {
+    FILE* file = nullptr;
+    std::unordered_set<size_t> skip;
+
+    bool open(const wchar_t* path, const wchar_t* capture) {
+        WIN32_FILE_ATTRIBUTE_DATA info{};
+        if (!GetFileAttributesExW(capture, GetFileExInfoStandard, &info)) return false;
+        char header[96];
+        snprintf(header, sizeof header, "capture %lu %lu %lu %lu\n", info.nFileSizeHigh, info.nFileSizeLow,
+            info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
+        std::vector<uint8_t> old;
+        if (read_file(path, &old) && old.size() > strlen(header)
+            && std::memcmp(old.data(), header, strlen(header)) == 0) {
+            std::unordered_set<size_t> pending;
+            const std::string text(old.begin() + strlen(header), old.end());
+            size_t at = 0;
+            while (at < text.size()) {
+                const size_t end = text.find('\n', at);
+                if (end == std::string::npos) break;  // A line cut by a crash.
+                char kind = 0;
+                size_t index = 0;
+                if (sscanf_s(text.c_str() + at, "%c %zu", &kind, 1, &index) == 2) {
+                    if (kind == 'p') pending.insert(index);
+                    else if (kind == 'd') pending.erase(index);
+                    else if (kind == 'f') {
+                        pending.erase(index);
+                        skip.insert(index);
+                    }
+                }
+                at = end + 1;
+            }
+            skip.insert(pending.begin(), pending.end());
+            for (const size_t index : pending) {
+                fprintf(stderr, "pipeline %zu crashed the driver before; skipping it\n", index);
+            }
+            file = _wfsopen(path, L"ab", _SH_DENYWR);
+        } else {
+            file = _wfsopen(path, L"wb", _SH_DENYWR);
+            if (file) fputs(header, file);
+        }
+        return file != nullptr;
+    }
+    void mark(char kind, size_t index) {
+        if (!file) return;
+        fprintf(file, "%c %zu\n", kind, index);
+        fflush(file);
+    }
+    ~ReplayLog() { if (file) fclose(file); }
+};
+
+int replay_d3d12(const wchar_t* path, bool warp, const wchar_t* log_path, bool progress) {
     using namespace tessera::d3d12_capture;
     using Microsoft::WRL::ComPtr;
     std::unique_ptr<FILE, decltype(&fclose)> file(_wfopen(path, L"rb"), fclose);
@@ -804,6 +858,15 @@ int replay_d3d12(const wchar_t* path, bool warp) {
         fprintf(stderr, "no D3D12 device\n");
         return 1;
     }
+    ReplayLog log;
+    if (log_path && !log.open(log_path, path)) {
+        fprintf(stderr, "cannot open the D3D12 replay log\n");
+        return 1;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    const uint64_t file_bytes = GetFileAttributesExW(path, GetFileExInfoStandard, &info)
+        ? (uint64_t{info.nFileSizeHigh} << 32) | info.nFileSizeLow : 0;
+    bool removed = false;
     std::vector<uint8_t> payload, root;
     uint64_t total_bytes = sizeof(header);
     size_t prepared[5]{}, failed = 0;
@@ -827,6 +890,17 @@ int replay_d3d12(const wchar_t* path, bool warp) {
             fprintf(stderr, "truncated D3D12 capture record after %zu pipelines\n", completed());
             return 1;
         }
+        const size_t index = completed();
+        if (progress && file_bytes) {
+            printf("tessera-progress %llu %llu\n", static_cast<unsigned long long>(total_bytes),
+                static_cast<unsigned long long>(file_bytes > total_bytes ? file_bytes : total_bytes));
+            fflush(stdout);
+        }
+        if (log.skip.count(index)) {
+            ++failed;
+            continue;
+        }
+        log.mark('p', index);
         ComPtr<ID3D12RootSignature> signature;
         HRESULT hr = S_OK;
         if (!root.empty()) {
@@ -851,15 +925,23 @@ int replay_d3d12(const wchar_t* path, bool warp) {
         }
         if (SUCCEEDED(hr)) {
             ++prepared[record.kind];
+            log.mark('d', index);
         } else {
             ++failed;
-            fprintf(stderr, "pipeline %zu: 0x%08lx\n", completed(), static_cast<unsigned long>(hr));
-            if (device.removed()) break;
+            fprintf(stderr, "pipeline %zu: 0x%08lx\n", index, static_cast<unsigned long>(hr));
+            // A removed device is a driver fault: leave it pending so the relaunch skips it.
+            if (device.removed()) {
+                removed = true;
+                break;
+            }
+            log.mark('f', index);
         }
     }
     printf("D3D12 pipelines prepared: %zu compute, %zu graphics, %zu streams, %zu ray tracing, %zu ray tracing additions, %zu failed%s\n",
            prepared[0], prepared[1], prepared[2], prepared[3], prepared[4], failed, warp ? " (WARP)" : "");
-    return failed != 0 || completed() == 0 ? 1 : 0;
+    // The driver keeps what was built in its own cache, so partial success is success.
+    if (removed) return 2;
+    return completed() == failed ? 1 : 0;
 }
 
 template<class Device>
@@ -920,9 +1002,15 @@ int run(Device& w, const std::wstring& base, const std::vector<Shader>& shaders,
 
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 3 && wcscmp(argv[1], L"--replay-d3d12") == 0) {
-        const bool warp = argc == 4 && wcscmp(argv[3], L"--warp") == 0;
-        if (argc != 3 && !warp) return 1;
-        return replay_d3d12(argv[2], warp);
+        bool warp = false, progress = false;
+        const wchar_t* log = nullptr;
+        for (int i = 3; i < argc; ++i) {
+            if (wcscmp(argv[i], L"--warp") == 0) warp = true;
+            else if (wcscmp(argv[i], L"--progress") == 0) progress = true;
+            else if (wcscmp(argv[i], L"--log") == 0 && i + 1 < argc) log = argv[++i];
+            else return 1;
+        }
+        return replay_d3d12(argv[2], warp, log, progress);
     }
     if (argc < 2) {
         fwprintf(stderr, L"usage: %ls <store base path>\n", argv[0]);

@@ -81,7 +81,7 @@ fn clear_shader_files(data: &Path, key: &str) -> io::Result<usize> {
     let mut removed = 0;
     let scoped = crate::scan::ShaderApi::SELECTABLE.into_iter().flat_map(|api| {
         let prefix = format!(".scan-{}", api.slug());
-        [".key", ".zip", ".tshi", ".tshd", ".twarm"].map(|suffix| with_suffix(&base, &format!("{prefix}{suffix}")))
+        [".key", ".zip", ".tshi", ".tshd", ".twarm", ".treplay"].map(|suffix| with_suffix(&base, &format!("{prefix}{suffix}")))
     });
     for path in [
         with_suffix(&base, ".scan.key"),
@@ -301,15 +301,25 @@ pub(crate) fn replay_d3d12_locked(exe: &Path, warm_exe: &Path, capture: &Path, b
         return Err(io::Error::other("close the game before replaying pipelines"));
     }
     let copy = stage_helper(exe, base, warm_exe)?;
-    let output = Command::new(copy).creation_flags(CREATE_NO_WINDOW)
-        .arg("--replay-d3d12").arg(capture).output()?;
-    let summary = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        let message = if detail.trim().is_empty() { summary.trim() } else { detail.trim() };
-        return Err(io::Error::other(format!("D3D12 replay failed ({}): {message}", output.status)));
+    // Per-pipeline log: a relaunch after a driver crash skips the pipeline that crashed.
+    let log = with_suffix(base, ".treplay");
+    for _ in 0..=MAX_RELAUNCHES {
+        let mut cmd = Command::new(&copy);
+        cmd.arg("--replay-d3d12").arg(capture).arg("--log").arg(&log).arg("--progress");
+        let output = wait_reporting(cmd, &log, STALL_S, &|_| {}, &|_| {})?;
+        let summary = String::from_utf8_lossy(&output.stdout);
+        match output.status.code() {
+            Some(0) => return Ok(summary.trim().to_string()),
+            Some(1) => {
+                let detail = String::from_utf8_lossy(&output.stderr);
+                let message = if detail.trim().is_empty() { summary.trim() } else { detail.trim() };
+                return Err(io::Error::other(format!("D3D12 replay failed: {message}")));
+            }
+            // Device removed (2) or a crash in the driver: relaunch past it.
+            _ => continue,
+        }
     }
-    Ok(summary.trim().to_string())
+    Err(io::Error::other("the driver failed too many times during the D3D12 replay; try again"))
 }
 
 pub fn run_d3d12(
