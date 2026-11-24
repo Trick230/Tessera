@@ -272,6 +272,29 @@ pub fn d3d12_store_exists(exe: &Path) -> bool {
         .is_some_and(|base| with_suffix(&base, ".tshi").is_file() && with_suffix(&base, ".tshd").is_file())
 }
 
+pub fn replay_d3d12_capture(exe: &Path, warm_exe: &Path, capture: &Path) -> io::Result<String> {
+    if !exe.is_file() {
+        return Err(io::Error::other("the game executable does not exist"));
+    }
+    let base = crate::scan::scan_base_for(exe, crate::scan::ShaderApi::D3d12)
+        .ok_or_else(|| io::Error::other("invalid game path"))?;
+    let capture = fs::canonicalize(capture)?;
+    let _lock = crate::scan::lock(exe)?;
+    if is_running(exe) {
+        return Err(io::Error::other("close the game before replaying pipelines"));
+    }
+    let copy = stage_helper(exe, &base, warm_exe)?;
+    let output = Command::new(copy).creation_flags(CREATE_NO_WINDOW)
+        .arg("--replay-d3d12").arg(capture).output()?;
+    let summary = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let message = if detail.trim().is_empty() { summary.trim() } else { detail.trim() };
+        return Err(io::Error::other(format!("D3D12 replay failed ({}): {message}", output.status)));
+    }
+    Ok(summary.trim().to_string())
+}
+
 pub fn run_d3d12(
     exe: &Path, warm_exe: &Path, on_stall: &dyn Fn(u64), on_progress: &dyn Fn(u64, u64),
 ) -> io::Result<WarmStats> {

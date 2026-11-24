@@ -24,12 +24,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "tessera/d3d12_capture_format.h"
 #include "tessera/shader_store_format.h"
 
 namespace {
@@ -551,6 +553,72 @@ struct WarmD3d12 {
     void finish() const {}
 };
 
+int replay_d3d12(const wchar_t* path, bool warp) {
+    using namespace tessera::d3d12_capture;
+    using Microsoft::WRL::ComPtr;
+    std::unique_ptr<FILE, decltype(&fclose)> file(_wfopen(path, L"rb"), fclose);
+    if (!file) {
+        fprintf(stderr, "cannot open the D3D12 capture\n");
+        return 1;
+    }
+    Header header{};
+    if (fread(&header, 1, sizeof(header), file.get()) != sizeof(header)
+        || std::memcmp(header.magic, magic, sizeof(magic)) != 0 || header.version != version || header.reserved) {
+        fprintf(stderr, "invalid D3D12 capture header\n");
+        return 1;
+    }
+    WarmD3d12 device;
+    if (!device.init(warp)) {
+        fprintf(stderr, "no D3D12 device\n");
+        return 1;
+    }
+    std::vector<uint8_t> shader, root;
+    uint64_t total_bytes = sizeof(header);
+    size_t prepared = 0, failed = 0;
+    while (true) {
+        ComputeRecord record{};
+        const size_t received = fread(&record, 1, sizeof(record), file.get());
+        if (received == 0 && feof(file.get())) break;
+        const uint64_t size = sizeof(record) + uint64_t{record.shader_size} + record.root_size;
+        if (received != sizeof(record) || record.reserved || !record.shader_size || record.shader_size > max_shader_bytes
+            || record.root_size > max_root_bytes || total_bytes > max_capture_bytes - size) {
+            fprintf(stderr, "invalid D3D12 capture record after %zu pipelines\n", prepared + failed);
+            return 1;
+        }
+        total_bytes += size;
+        shader.resize(record.shader_size);
+        root.resize(record.root_size);
+        if (fread(shader.data(), 1, shader.size(), file.get()) != shader.size()
+            || (!root.empty() && fread(root.data(), 1, root.size(), file.get()) != root.size())) {
+            fprintf(stderr, "truncated D3D12 capture record after %zu pipelines\n", prepared + failed);
+            return 1;
+        }
+        ComPtr<ID3D12RootSignature> signature;
+        HRESULT hr = S_OK;
+        if (!root.empty()) {
+            hr = device.dev->CreateRootSignature(record.root_node_mask, root.data(), root.size(), IID_PPV_ARGS(&signature));
+        }
+        if (SUCCEEDED(hr)) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+            desc.pRootSignature = signature.Get();
+            desc.CS = {shader.data(), shader.size()};
+            desc.NodeMask = record.node_mask;
+            desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(record.flags);
+            ComPtr<ID3D12PipelineState> pipeline;
+            hr = device.dev->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        }
+        if (SUCCEEDED(hr)) {
+            ++prepared;
+        } else {
+            ++failed;
+            fprintf(stderr, "pipeline %zu: 0x%08lx\n", prepared + failed, static_cast<unsigned long>(hr));
+            if (device.removed()) break;
+        }
+    }
+    printf("%zu D3D12 compute pipelines prepared, %zu failed%s\n", prepared, failed, warp ? " (WARP)" : "");
+    return failed != 0 || prepared == 0 ? 1 : 0;
+}
+
 template<class Device>
 int run(Device& w, const std::wstring& base, const std::vector<Shader>& shaders, const wchar_t* peer,
         bool retry, bool progress, const wchar_t* log_extension) {
@@ -602,6 +670,11 @@ int run(Device& w, const std::wstring& base, const std::vector<Shader>& shaders,
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 3 && wcscmp(argv[1], L"--replay-d3d12") == 0) {
+        const bool warp = argc == 4 && wcscmp(argv[3], L"--warp") == 0;
+        if (argc != 3 && !warp) return 1;
+        return replay_d3d12(argv[2], warp);
+    }
     if (argc < 2) {
         fwprintf(stderr, L"usage: %ls <store base path>\n", argv[0]);
         return 1;

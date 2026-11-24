@@ -21,6 +21,7 @@ try {
     if ($LASTEXITCODE) { throw "cmake build failed" }
     Copy-Item build\src\dll\Release\tessera_d3d11.dll target\release\tessera_d3d11.dll -Force
     Copy-Item build\src\warm\Release\tessera_warm.exe target\release\tessera_warm.exe -Force
+    Copy-Item build\src\d3d12_capture\Release\tessera_d3d12_capture.dll target\release\tessera_d3d12_capture.dll -Force
     if (-not (Test-Path build\win32\CMakeCache.txt)) {
         & $cmake -S . -B build/win32 -G "Visual Studio 17 2022" -A Win32
         if ($LASTEXITCODE) { throw "Win32 cmake configure failed" }

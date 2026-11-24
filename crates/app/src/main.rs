@@ -1311,6 +1311,19 @@ fn scan_child(args: &[String]) -> i32 {
 
 fn main() -> Result<(), slint::PlatformError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 3 && args[0] == "--prepare-d3d12-capture" {
+        let helper = app_dir().join(tessera_core::warm::WARM_EXE);
+        match tessera_core::warm::replay_d3d12_capture(Path::new(&args[1]), &helper, Path::new(&args[2])) {
+            Ok(summary) => {
+                println!("{summary}");
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.len() == 3 && args[0] == "--prepare-native" {
         let exe = Path::new(&args[1]);
         let result = ShaderApi::SELECTABLE.into_iter().find(|api| api.slug() == args[2])

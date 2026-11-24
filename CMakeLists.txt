@@ -20,6 +20,9 @@ add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/W4> $<$<COMPILE_LANGUAGE:C,CXX>
 add_subdirectory(src/dll)
 add_subdirectory(src/warm)
 add_subdirectory(tests/d3d11_smoke)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  add_subdirectory(src/d3d12_capture)
+endif()
 
 option(TESSERA_BUILD_QUALITY "Build the offline FLIP texture tool" OFF)
 if(TESSERA_BUILD_QUALITY)

@@ -76,6 +76,17 @@ If an Oodle-compressed Unreal build ships without a separate decoder, set
 The scan reads precompiled shaders embedded in recomp executables and disk
 caches, including Unleashed Recompiled's Zstandard and SMOL-V libraries,
 Savage Wind's `SPZ1` files, and Skate 3's per-user `nrhi_shaders` cache.
+
+The x64 D3D12 capture DLL records compute pipelines created through
+`D3D12CreateDevice` and `ID3D12Device::CreateComputePipelineState`. In an
+isolated copy of a game that uses these entry points, place
+`tessera_d3d12_capture.dll` next to its executable as `d3d12.dll` and set
+`TESSERA_D3D12_CAPTURE` to a new output file for the game process. Use
+`tessera.exe --prepare-d3d12-capture <game-exe> <capture>` once the game closes.
+The recorded duration is the time spent in the driver's pipeline creation call.
+The capture covers the entry points above and excludes graphics pipelines,
+pipeline state streams and devices created through an Agility factory.
+
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 
 **Being measured:** Unreal variants (dynamic resolution off, render targets that only grow, pool limits, shader creation on load, level streaming time limits) in Final Fantasy VII Remake.
