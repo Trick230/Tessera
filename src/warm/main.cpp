@@ -15,6 +15,7 @@
 //
 // Exit codes: 0 done, 2 device removed (relaunch to continue), 1 error.
 #include <d3d11.h>
+#include <d3d11shader.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -208,14 +210,15 @@ bool read_matching_log(const std::wstring& path, const char* header, std::vector
 
 // Replays the latest result in each log. A peer can supply a successful result
 // for a duplicate, but a refusal in one store does not block the other store.
-bool open_log(const std::wstring& path, const wchar_t* peer, unsigned long long driver, bool retry, Log* log) {
+bool open_log(const std::wstring& path, const wchar_t* peer, unsigned long long driver, bool retry,
+              const std::unordered_set<uint64_t>& retry_created, Log* log) {
     char head[64];
     snprintf(head, sizeof head, "tessera-warm 1 driver %016llx", driver);
     std::vector<uint8_t> old;
     if (read_matching_log(path, head, old)) {
         uint64_t pending;
         for (const auto& [hash, status] : outcomes(old, &pending)) {
-            if (status == 'f' && retry) continue;
+            if ((status == 'f' && retry) || (status == 'm' && retry_created.count(hash))) continue;
             log->done.insert(hash);
             ++*(status == 'f' ? &log->failed : status == 's' ? &log->skipped : &log->ok);
         }
@@ -233,7 +236,8 @@ bool open_log(const std::wstring& path, const wchar_t* peer, unsigned long long 
     if (peer && *peer && read_matching_log(std::wstring(peer) + L".twarm", head, old)) {
         uint64_t pending;
         for (const auto& [hash, status] : outcomes(old, &pending))
-            if (hash != pending && (status == 'o' || status == 'm')) log->done.insert(hash);
+            if (hash != pending && (status == 'o' || (status == 'm' && !retry_created.count(hash))))
+                log->done.insert(hash);
     }
     return log->f != nullptr;
 }
@@ -244,6 +248,7 @@ struct Warm {
     ID3D11DeviceContext* ctx = nullptr;
     ID3D11Buffer* args = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> stream_target;
     std::unordered_map<std::string, ID3D11VertexShader*> feeders;  // PS input signature -> generated VS
     struct VertexSource {
         const Shader* shader;
@@ -264,16 +269,17 @@ struct Warm {
         }
     }
 
-    bool init() {
+    bool init(bool warp = false) {
         // The high-performance GPU: on hybrid laptops adapter 0 is the iGPU,
         // and the per-app GPU choice does not follow the copied exe.
         IDXGIAdapter* adapter = nullptr;
         IDXGIFactory6* f6 = nullptr;
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f6)))) {
+        if (!warp && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f6)))) {
             f6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
             f6->Release();
         }
-        const D3D_DRIVER_TYPE type = adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
+        const D3D_DRIVER_TYPE type = warp ? D3D_DRIVER_TYPE_WARP
+            : adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
         HRESULT hr = D3D11CreateDevice(adapter, type, nullptr, 0, levels, 2, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
         if (FAILED(hr))
@@ -426,6 +432,90 @@ struct Warm {
         return false;
     }
 
+    bool exercise_geometry(const Shader& shader, ID3D11GeometryShader* raster) {
+        using Microsoft::WRL::ComPtr;
+        ComPtr<ID3D11ShaderReflection> reflection;
+        D3D11_SHADER_DESC desc{};
+        if (FAILED(D3DReflect(shader.code, shader.size, IID_PPV_ARGS(&reflection)))
+            || FAILED(reflection->GetDesc(&desc))) return false;
+        auto primitive = desc.InputPrimitive;
+        // Stripped game bytecode can retain signatures and instructions but
+        // omit STAT, leaving reflection's primitive undefined.
+        if (primitive == D3D_PRIMITIVE_UNDEFINED) {
+            ComPtr<ID3DBlob> assembly;
+            if (FAILED(D3DDisassemble(shader.code, shader.size, 0, nullptr, &assembly))) return false;
+            const std::string_view text(static_cast<const char*>(assembly->GetBufferPointer()), assembly->GetBufferSize());
+            constexpr std::string_view declaration = "\ndcl_inputprimitive ";
+            const auto at = text.find(declaration);
+            if (at == std::string_view::npos) return false;
+            const auto begin = at + declaration.size();
+            const auto token = text.substr(begin, text.find_first_of(" \r\n\0", begin) - begin);
+            if (token == "point") primitive = D3D_PRIMITIVE_POINT;
+            else if (token == "line") primitive = D3D_PRIMITIVE_LINE;
+            else if (token == "triangle") primitive = D3D_PRIMITIVE_TRIANGLE;
+            else if (token == "lineadj") primitive = D3D_PRIMITIVE_LINE_ADJ;
+            else if (token == "triangleadj") primitive = D3D_PRIMITIVE_TRIANGLE_ADJ;
+        }
+        D3D11_PRIMITIVE_TOPOLOGY topology;
+        switch (primitive) {
+            case D3D_PRIMITIVE_POINT: topology = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; break;
+            case D3D_PRIMITIVE_LINE: topology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; break;
+            case D3D_PRIMITIVE_TRIANGLE: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; break;
+            case D3D_PRIMITIVE_LINE_ADJ: topology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ; break;
+            case D3D_PRIMITIVE_TRIANGLE_ADJ: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ; break;
+            default: return false;
+        }
+        std::vector<SigElem> inputs;
+        if (!signature(shader.code, shader.size, "ISGN", "ISG1", &inputs)) return false;
+        auto* vs = feeder(inputs);
+        if (!vs) return false;
+
+        std::vector<D3D11_SO_DECLARATION_ENTRY> output;
+        UINT stride = 0;
+        bool position = false;
+        for (UINT i = 0; i < desc.OutputParameters; ++i) {
+            D3D11_SIGNATURE_PARAMETER_DESC element{};
+            if (FAILED(reflection->GetOutputParameterDesc(i, &element)) || element.Stream != 0)
+                return false;
+            position |= element.SystemValueType == D3D_NAME_POSITION;
+            const int count = components(element.Mask);
+            if (!count) continue;
+            // A stream-output declaration addresses components inside the
+            // semantic, even if the compiler packed it into a wider register.
+            output.push_back({0, element.SemanticName, element.SemanticIndex, 0, static_cast<BYTE>(count), 0});
+            stride += static_cast<UINT>(count) * sizeof(uint32_t);
+        }
+        ComPtr<ID3D11GeometryShader> stream;
+        const bool use_stream = !position || shader.stage == TESSERA_STAGE_GS_SO;
+        if (use_stream) {
+            if (!stride || !output.size()) return false;
+            if (FAILED(dev->CreateGeometryShaderWithStreamOutput(shader.code, shader.size, output.data(),
+                static_cast<UINT>(output.size()), &stride, 1, D3D11_SO_NO_RASTERIZED_STREAM, nullptr, &stream)))
+                return false;
+            if (!stream_target) {
+                D3D11_BUFFER_DESC buffer{};
+                buffer.ByteWidth = 4096;
+                buffer.BindFlags = D3D11_BIND_STREAM_OUTPUT;
+                if (FAILED(dev->CreateBuffer(&buffer, nullptr, &stream_target))) return false;
+            }
+            auto* target = stream_target.Get();
+            const UINT offset = 0;
+            ctx->SOSetTargets(1, &target, &offset);
+        } else if (!raster) {
+            return false;
+        }
+        ctx->IASetPrimitiveTopology(topology);
+        ctx->IASetInputLayout(nullptr);
+        ctx->VSSetShader(vs, nullptr, 0);
+        ctx->GSSetShader(use_stream ? stream.Get() : raster, nullptr, 0);
+        ctx->PSSetShader(nullptr, nullptr, 0);
+        draw();
+        ctx->GSSetShader(nullptr, nullptr, 0);
+        if (use_stream) ctx->SOSetTargets(0, nullptr, nullptr);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+        return true;
+    }
+
     // The log word for one shader: "ok" created and used in a draw/dispatch,
     // "made" created only (no stage to draw it with), "fail" not created,
     // "skip" not a D3D11 shader.
@@ -487,9 +577,11 @@ struct Warm {
                 break;
             }
             case TESSERA_STAGE_GS:
-            case TESSERA_STAGE_GS_SO: {  // without its SO declaration: the GS itself still compiles
+            case TESSERA_STAGE_GS_SO: {
                 ID3D11GeometryShader* gs = nullptr;
                 hr = dev->CreateGeometryShader(s.code, s.size, nullptr, &gs);
+                used = exercise_geometry(s, gs);
+                if (used) hr = S_OK;
                 if (gs) gs->Release();
                 break;
             }
@@ -774,7 +866,13 @@ template<class Device>
 int run(Device& w, const std::wstring& base, const std::vector<Shader>& shaders, const wchar_t* peer,
         bool retry, bool progress, const wchar_t* log_extension) {
     Log log;
-    if (!open_log(base + log_extension, peer, w.driver(), retry, &log)) {
+    std::unordered_set<uint64_t> geometry;
+    if (retry) {
+        for (const auto& shader : shaders)
+            if (shader.stage == TESSERA_STAGE_GS || shader.stage == TESSERA_STAGE_GS_SO)
+                geometry.insert(shader.hash);
+    }
+    if (!open_log(base + log_extension, peer, w.driver(), retry, geometry, &log)) {
         fprintf(stderr, "cannot write the warm-up log\n");
         return 1;
     }
@@ -850,10 +948,11 @@ int wmain(int argc, wchar_t** argv) {
         return run(device, base, shaders, nullptr, retry, progress, warp ? L".warp.twarm" : L".twarm");
     }
     Warm device;
-    if (!device.init()) {
+    const bool warp = argc > 5 && wcscmp(argv[5], L"--d3d11-warp") == 0;
+    if (!device.init(warp)) {
         fprintf(stderr, "no D3D11 device\n");
         return 1;
     }
     device.index_vertex_sources(shaders);
-    return run(device, base, shaders, peer, retry, progress, L".twarm");
+    return run(device, base, shaders, warp ? nullptr : peer, retry, progress, warp ? L".warp.twarm" : L".twarm");
 }
