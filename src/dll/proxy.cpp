@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <cstring>
 #include <cwchar>
 
 #include "config.h"
@@ -25,8 +26,23 @@ extern "C" __declspec(noreturn) void tessera_fail_stub() {
     RaiseFailFastException(nullptr, nullptr, 0);
     __assume(0);
 }
+// Exports whose stack size is known fail cleanly instead: the caller pops nothing itself.
+LONG WINAPI fail_kmt(void*) { return static_cast<LONG>(0xC00000BBL); }  // STATUS_NOT_SUPPORTED
+HRESULT WINAPI fail_one(void*) { return E_NOTIMPL; }
+HRESULT WINAPI fail_two(void*, void*) { return E_NOTIMPL; }
+HRESULT WINAPI fail_ten(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*) { return E_NOTIMPL; }
+
+void* fail_stub(unsigned idx) {
+    const char* name = idx < static_cast<unsigned>(tessera::exports::kCount) ? tessera::exports::kNames[idx] : "";
+    if (!strncmp(name, "D3DKMT", 6)) return reinterpret_cast<void*>(&fail_kmt);
+    if (!strncmp(name, "OpenAdapter10", 13)) return reinterpret_cast<void*>(&fail_one);
+    if (!strncmp(name, "CreateDirect3D11", 16)) return reinterpret_cast<void*>(&fail_two);
+    if (!strcmp(name, "D3D11On12CreateDevice")) return reinterpret_cast<void*>(&fail_ten);
+    return reinterpret_cast<void*>(&tessera_fail_stub);
+}
 #else
 extern "C" HRESULT tessera_fail_stub() { return E_NOTIMPL; }
+void* fail_stub(unsigned) { return reinterpret_cast<void*>(&tessera_fail_stub); }
 #endif
 void* resolve_export(unsigned idx);
 
@@ -128,7 +144,7 @@ void* resolve_export(unsigned idx) {
 
 extern "C" void* tessera_resolve(unsigned idx) {
     void* p = resolve_export(idx);
-    return p ? p : reinterpret_cast<void*>(&tessera_fail_stub);
+    return p ? p : fail_stub(idx);
 }
 
 extern "C" HRESULT WINAPI Tessera_D3D11CreateDevice(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, HMODULE software,
