@@ -520,6 +520,15 @@ fn shader_state(
             None => ("Scan available".to_string(), "Scan shaders searches for D3D12 bytecode."),
         };
         rows.push(line("D3D12 shaders", value, vec![detail.to_string()], NEUTRAL));
+        if c.scan_outdated == Some(false) {
+            let detail = "Compute pipelines with an embedded root signature.";
+            rows.push(line(
+                "D3D12 preparation",
+                format!("{} of {} prepared", count(c.compiled), count(c.stored)),
+                vec![detail.to_string()],
+                if c.compiled > 0 && c.compiled == c.stored { OK } else { NEUTRAL },
+            ));
+        }
     }
 
     let mut d = Vec::new();
@@ -1008,12 +1017,12 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
     }) else {
         return;
     };
-    let prepare = scope == ShaderApi::D3d11;
+    let prepare = matches!(scope, ShaderApi::D3d11 | ShaderApi::D3d12);
     ui.set_busy(true);
     ui.set_shader_progress_active(true);
     ui.set_shader_progress(-1.0);
     ui.set_shader_progress_label("".into());
-    ui.set_status_text(if prepare { "Preparing D3D11 shaders…" } else { "Scanning shaders…" }.into());
+    ui.set_status_text(if prepare { format!("Preparing {api} shaders…") } else { "Scanning shaders…".into() }.into());
     let (weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
@@ -1021,7 +1030,8 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
             let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
         };
         let running = tessera_core::warm::is_running(&exe);
-        let scan_error = if !running && (!prepare || !scan::up_to_date_for(&exe, &root, scope)) {
+        let missing_d3d12_store = scope == ShaderApi::D3d12 && !tessera_core::warm::d3d12_store_exists(&exe);
+        let scan_error = if !running && (!prepare || missing_d3d12_store || !scan::up_to_date_for(&exe, &root, scope)) {
             status("Searching the game files for shaders (read only)…");
             scan_isolated(&exe, &root, scope).err()
         } else {
@@ -1039,8 +1049,9 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
             } else {
                 format!("{api} shader scan complete.")
             }
+        } else if scope == ShaderApi::D3d12 && scan_error.is_some() {
+            format!("D3D12 shader scan failed ({}).", scan_error.unwrap())
         } else {
-            let scan_status = scan_error.map(|e| format!("search failed ({e}), ")).unwrap_or_default();
             status("Warming shaders (outside the game)…");
             let helper = if architecture == Some(Architecture::X86) {
                 tessera_core::warm::WARM_EXE_X86
@@ -1055,23 +1066,33 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
                     ui.set_shader_progress_label(label.into());
                 });
             };
-            match tessera_core::warm::run_with_progress(&exe, &app_dir().join(helper), &stall, &progress) {
-                Ok(_) => {
-                    let drivers: Vec<_> = tessera_core::driver::gpus()
-                        .iter()
-                        .filter_map(|gpu| tessera_core::driver::umd_version(&gpu.driver_version))
-                        .collect();
-                    let w = tessera_core::shader_check::check(&exe, None, &drivers);
-                    format!(
-                        "Shaders: {scan_status}{} exercised, {} created only, {} pending, {} failed ({:.1} s)",
-                        w.compiled,
-                        w.created_only,
-                        w.pending,
-                        w.failed,
-                        t0.elapsed().as_secs_f64()
-                    )
+            let helper = app_dir().join(helper);
+            if scope == ShaderApi::D3d12 {
+                match tessera_core::warm::run_d3d12(&exe, &helper, &stall, &progress) {
+                    Ok(stats) if stats.ok + stats.failed == 0 => "No D3D12 compute shaders with an embedded root signature found.".into(),
+                    Ok(stats) => format!("D3D12 compute pipelines: {} prepared, {} failed ({:.1} s).", stats.ok, stats.failed, t0.elapsed().as_secs_f64()),
+                    Err(e) => format!("D3D12 preparation failed ({e})."),
                 }
-                Err(e) => format!("Shaders: {scan_status}{e}"),
+            } else {
+                let scan_status = scan_error.map(|e| format!("search failed ({e}), ")).unwrap_or_default();
+                match tessera_core::warm::run_with_progress(&exe, &helper, &stall, &progress) {
+                    Ok(_) => {
+                        let drivers: Vec<_> = tessera_core::driver::gpus()
+                            .iter()
+                            .filter_map(|gpu| tessera_core::driver::umd_version(&gpu.driver_version))
+                            .collect();
+                        let w = tessera_core::shader_check::check(&exe, None, &drivers);
+                        format!(
+                            "Shaders: {scan_status}{} exercised, {} created only, {} pending, {} failed ({:.1} s)",
+                            w.compiled,
+                            w.created_only,
+                            w.pending,
+                            w.failed,
+                            t0.elapsed().as_secs_f64()
+                        )
+                    }
+                    Err(e) => format!("Shaders: {scan_status}{e}"),
+                }
             }
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {

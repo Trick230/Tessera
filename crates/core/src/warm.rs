@@ -68,7 +68,7 @@ fn clear_shader_files(data: &Path, key: &str) -> io::Result<usize> {
     let mut removed = 0;
     let scoped = crate::scan::ShaderApi::SELECTABLE.into_iter().flat_map(|api| {
         let prefix = format!(".scan-{}", api.slug());
-        [".key", ".zip"].map(|suffix| with_suffix(&base, &format!("{prefix}{suffix}")))
+        [".key", ".zip", ".tshi", ".tshd", ".twarm"].map(|suffix| with_suffix(&base, &format!("{prefix}{suffix}")))
     });
     for path in [
         with_suffix(&base, ".scan.key"),
@@ -233,11 +233,7 @@ pub fn run_with_progress(
     if is_running(exe) {
         return Err(other("close the game before warming shaders"));
     }
-    let name = exe.file_name().ok_or_else(|| other("invalid game path"))?;
-    let dir = crate::paths::data_dir().join("warm").join(base.file_name().unwrap_or_default());
-    fs::create_dir_all(&dir)?;
-    let copy = dir.join(name);
-    fs::copy(warm_exe, &copy)?;
+    let copy = stage_helper(exe, &base, warm_exe)?;
     let counts: Vec<_> = todo.iter().map(|b| {
         crate::shaders::stats_at(&with_suffix(b, ".tshd"), &with_suffix(b, ".tshi")).shaders
     }).collect();
@@ -247,7 +243,7 @@ pub fn run_with_progress(
     for (b, count) in todo.iter().zip(counts) {
         let peer = bases(exe).into_iter().find(|other| other != b);
         let latest = std::cell::Cell::new(completed);
-        lines.push(run_one(&copy, b, peer.as_deref(), on_stall, &|processed| {
+        lines.push(run_one(&copy, b, peer.as_deref(), false, on_stall, &|processed| {
             let done = completed + processed.min(count);
             if done >= latest.get() && total != 0 {
                 latest.set(done);
@@ -260,6 +256,43 @@ pub fn run_with_progress(
         }
     }
     Ok(lines.join("\n"))
+}
+
+fn stage_helper(exe: &Path, base: &Path, warm_exe: &Path) -> io::Result<PathBuf> {
+    let name = exe.file_name().ok_or_else(|| io::Error::other("invalid game path"))?;
+    let dir = crate::paths::data_dir().join("warm").join(base.file_name().unwrap_or_default());
+    fs::create_dir_all(&dir)?;
+    let copy = dir.join(name);
+    fs::copy(warm_exe, &copy)?;
+    Ok(copy)
+}
+
+pub fn d3d12_store_exists(exe: &Path) -> bool {
+    crate::scan::scan_base_for(exe, crate::scan::ShaderApi::D3d12)
+        .is_some_and(|base| with_suffix(&base, ".tshi").is_file() && with_suffix(&base, ".tshd").is_file())
+}
+
+pub fn run_d3d12(
+    exe: &Path, warm_exe: &Path, on_stall: &dyn Fn(u64), on_progress: &dyn Fn(u64, u64),
+) -> io::Result<WarmStats> {
+    let base = crate::scan::scan_base_for(exe, crate::scan::ShaderApi::D3d12)
+        .ok_or_else(|| io::Error::other("invalid game path"))?;
+    if is_running(exe) {
+        return Err(io::Error::other("close the game before warming shaders"));
+    }
+    let _lock = crate::scan::lock(exe)?;
+    let shaders = crate::shaders::hashes_at(&with_suffix(&base, ".tshd"), &with_suffix(&base, ".tshi"));
+    let total = shaders.len() as u64;
+    if total == 0 {
+        return Ok(WarmStats::default());
+    }
+    let copy = stage_helper(exe, &base, warm_exe)?;
+    run_one(&copy, &base, None, true, on_stall, &|done| on_progress(done.min(total), total))?;
+    let mut outcomes = HashMap::new();
+    let log = fs::read_to_string(with_suffix(&base, ".twarm"))?;
+    settle(&log, &mut outcomes);
+    outcomes.retain(|hash, _| shaders.binary_search(hash).is_ok());
+    Ok(count(&outcomes))
 }
 
 /// Runs one warm-up to its end, reporting (never acting on) a log that stops
@@ -341,12 +374,13 @@ fn wait_reporting(
 }
 
 fn run_one(
-    copy: &Path, base: &Path, peer: Option<&Path>, on_stall: &dyn Fn(u64), on_progress: &dyn Fn(u64),
+    copy: &Path, base: &Path, peer: Option<&Path>, d3d12: bool, on_stall: &dyn Fn(u64), on_progress: &dyn Fn(u64),
 ) -> io::Result<String> {
     for attempt in 0..=MAX_RELAUNCHES {
         let mut cmd = Command::new(copy);
         cmd.arg(base).arg(peer.unwrap_or_else(|| Path::new("")));
         cmd.arg(if attempt == 0 { "--retry-failed" } else { "" }).arg("--progress");
+        if d3d12 { cmd.arg("--d3d12"); }
         let out = wait_reporting(cmd, &with_suffix(base, ".twarm"), STALL_S, on_stall, on_progress)?;
         match out.status.code() {
             Some(0) => return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),

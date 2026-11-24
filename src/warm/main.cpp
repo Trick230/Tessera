@@ -15,9 +15,11 @@
 //
 // Exit codes: 0 done, 2 device removed (relaunch to continue), 1 error.
 #include <d3d11.h>
+#include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <windows.h>
+#include <wrl/client.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -507,32 +509,53 @@ struct Warm {
     }
 
     bool removed() const { return dev->GetDeviceRemovedReason() != S_OK; }
+    void finish() const { ctx->Flush(); }
 };
-}  // namespace
 
-int wmain(int argc, wchar_t** argv) {
-    if (argc < 2) {
-        fwprintf(stderr, L"usage: %ls <store base path>\n", argv[0]);
-        return 1;
+struct WarmD3d12 {
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    Microsoft::WRL::ComPtr<ID3D12Device> dev;
+
+    bool init(bool warp) {
+        Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+        if (warp) {
+            if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))) return false;
+        } else if (FAILED(factory->EnumAdapterByGpuPreference(
+                       0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)))) {
+            return false;
+        }
+        return SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)));
     }
-    const std::wstring base = argv[1];
-    std::vector<uint8_t> store, index;
-    if (!read_file(base + L".tshd", &store) || !read_file(base + L".tshi", &index)) {
-        fwprintf(stderr, L"no shader store at %ls\n", base.c_str());
-        return 1;
+
+    unsigned long long driver() const {
+        LARGE_INTEGER umd{};
+        adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd);
+        return static_cast<unsigned long long>(umd.QuadPart);
     }
-    const std::vector<Shader> shaders = load_store(store, index);
-    Warm w;
-    if (!w.init()) {
-        fprintf(stderr, "no D3D11 device\n");
-        return 1;
+
+    const char* warm(const Shader& shader) const {
+        if (shader.stage != TESSERA_STAGE_CS) return "skip";
+        // A null pRootSignature uses the exact signature embedded in the
+        // shader. The scan only adds compute shaders that carry one.
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+        desc.CS = {shader.code, shader.size};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+        const HRESULT hr = dev->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        if (FAILED(hr)) fprintf(stderr, "D3D12 compute pipeline %016llx: 0x%08lx\n",
+                               static_cast<unsigned long long>(shader.hash), static_cast<unsigned long>(hr));
+        return SUCCEEDED(hr) ? "ok" : "fail";
     }
-    w.index_vertex_sources(shaders);
+
+    bool removed() const { return dev->GetDeviceRemovedReason() != S_OK; }
+    void finish() const {}
+};
+
+template<class Device>
+int run(Device& w, const std::wstring& base, const std::vector<Shader>& shaders, const wchar_t* peer,
+        bool retry, bool progress, const wchar_t* log_extension) {
     Log log;
-    const wchar_t* peer = argc > 2 ? argv[2] : nullptr;
-    const bool retry = argc > 3 && wcscmp(argv[3], L"--retry-failed") == 0;
-    const bool progress = argc > 4 && wcscmp(argv[4], L"--progress") == 0;
-    if (!open_log(base + L".twarm", peer, w.driver(), retry, &log)) {
+    if (!open_log(base + log_extension, peer, w.driver(), retry, &log)) {
         fprintf(stderr, "cannot write the warm-up log\n");
         return 1;
     }
@@ -568,11 +591,45 @@ int wmain(int argc, wchar_t** argv) {
         }
         ++*(result[0] == 'f' ? &now_failed : result[0] == 's' ? &now_skipped : &now_ok);
     }
-    w.ctx->Flush();
+    w.finish();
     if (progress) report_progress();
     fclose(log.f);
     printf("stored %zu, compiled now %u, failed now %u, skipped now %u, total ok %u failed %u, %llu ms\n",
            shaders.size(), now_ok, now_failed, now_skipped, log.ok + now_ok, log.failed + now_failed,
            GetTickCount64() - t0);
     return 0;
+}
+}  // namespace
+
+int wmain(int argc, wchar_t** argv) {
+    if (argc < 2) {
+        fwprintf(stderr, L"usage: %ls <store base path>\n", argv[0]);
+        return 1;
+    }
+    const std::wstring base = argv[1];
+    std::vector<uint8_t> store, index;
+    if (!read_file(base + L".tshd", &store) || !read_file(base + L".tshi", &index)) {
+        fwprintf(stderr, L"no shader store at %ls\n", base.c_str());
+        return 1;
+    }
+    const std::vector<Shader> shaders = load_store(store, index);
+    const wchar_t* peer = argc > 2 ? argv[2] : nullptr;
+    const bool retry = argc > 3 && wcscmp(argv[3], L"--retry-failed") == 0;
+    const bool progress = argc > 4 && wcscmp(argv[4], L"--progress") == 0;
+    if (argc > 5 && wcscmp(argv[5], L"--d3d12") == 0) {
+        const bool warp = argc > 6 && wcscmp(argv[6], L"--warp") == 0;
+        WarmD3d12 device;
+        if (!device.init(warp)) {
+            fprintf(stderr, "no D3D12 device\n");
+            return 1;
+        }
+        return run(device, base, shaders, nullptr, retry, progress, warp ? L".warp.twarm" : L".twarm");
+    }
+    Warm device;
+    if (!device.init()) {
+        fprintf(stderr, "no D3D11 device\n");
+        return 1;
+    }
+    device.index_vertex_sources(shaders);
+    return run(device, base, shaders, peer, retry, progress, L".twarm");
 }

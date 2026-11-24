@@ -1238,6 +1238,21 @@ pub fn up_to_date_for(exe: &Path, root: &Path, api: ShaderApi) -> bool {
             .is_some_and(|record| record.key == install_key(exe, root))
 }
 
+fn has_embedded_root_signature(code: &[u8]) -> bool {
+    // Stored shaders have already passed container_at's part table checks.
+    (0..u32_at(code, 28) as usize).any(|i| {
+        let part = u32_at(code, 32 + 4 * i) as usize;
+        &code[part..part + 4] == b"RTS0" && u32_at(code, part + 4) > 0
+    })
+}
+
+pub(crate) fn lock(exe: &Path) -> io::Result<fs::File> {
+    let base = scan_base(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
+    fs::create_dir_all(base.parent().unwrap())?;
+    fs::OpenOptions::new().write(true).create(true).truncate(false)
+        .share_mode(0).open(crate::warm::with_suffix(&base, ".lock"))
+}
+
 /// Scans the install and exports the bytecode. The D3D11 warm-up store only
 /// needs entries the layer has yet to capture.
 pub fn scan_game(exe: &Path, root: &Path) -> io::Result<ScanStats> {
@@ -1249,10 +1264,8 @@ pub fn scan_game_for(exe: &Path, root: &Path, api: ShaderApi) -> io::Result<Scan
     let store = scan_base(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
     let base = scan_base_for(exe, api).ok_or_else(|| io::Error::other("invalid game path"))?;
     let export = with_suffix(&base, ".zip");
-    fs::create_dir_all(base.parent().unwrap())?;
     // Serialize scans of the same game, including scans launched from another app instance.
-    let _lock = fs::OpenOptions::new().write(true).create(true).truncate(false)
-        .share_mode(0).open(with_suffix(&store, ".lock"))?;
+    let _lock = lock(exe)?;
     let key = install_key(exe, root);
     let pak_key = unreal_key_file(exe).and_then(|(p, _)| PakKey::from_file(&p));
     let mut paths = files(root);
@@ -1264,6 +1277,13 @@ pub fn scan_game_for(exe: &Path, root: &Path, api: ShaderApi) -> io::Result<Scan
     let export_temp = with_suffix(&base, ".zip.tmp");
     write_export(fs::File::create(&export_temp)?, &found)?;
     let stats = found.stats;
+    if api == ShaderApi::D3d12 {
+        let mut compute: Vec<_> = found.d3d12.into_values()
+            .filter(|shader| shader.stage == STAGE_CS && has_embedded_root_signature(&shader.code))
+            .collect();
+        compute.sort_unstable_by_key(|shader| shader.hash);
+        crate::shaders::write_base(&base, &compute)?;
+    }
     if api.includes(ShaderApi::D3d11) {
         let mut shaders: Vec<_> = found.shaders.into_values().collect();
         let stored: HashSet<u64> = crate::shaders::store_paths(exe).map(|(store, index)| {

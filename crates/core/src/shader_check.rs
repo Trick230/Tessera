@@ -77,7 +77,7 @@ fn intact(code: &[u8]) -> bool {
 }
 
 fn intact_entries(entries: &[ShaderEntry<'_>]) -> Vec<bool> {
-    let intact = |entry: &ShaderEntry<'_>| entry.flags & FLAG_DXBC == 0 || intact(entry.code);
+    let intact = |entry: &ShaderEntry<'_>| entry.flags & (FLAG_DXBC | FLAG_DXIL) != FLAG_DXBC || intact(entry.code);
     // The workers share a single store buffer. Small stores stay serial.
     if entries.iter().map(|entry| entry.code.len()).sum::<usize>() >= 8 << 20 {
         static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
@@ -111,8 +111,12 @@ pub fn check_for(exe: &Path, api: ShaderApi, install_key: Option<&str>, drivers:
     let base = scoped.or_else(|| scan::scan_base(exe));
     let d3d11 = api == ShaderApi::D3d11;
     let layer = d3d11.then(|| crate::warm::store_base(exe)).flatten();
-    let store = d3d11.then(|| scan::scan_base(exe)).flatten();
-    let mut coverage = check_sources([layer.as_deref(), store.as_deref()], base.as_deref(), install_key, drivers);
+    let store = match api {
+        ShaderApi::D3d11 => scan::scan_base(exe),
+        ShaderApi::D3d12 if !legacy => base.clone(),
+        _ => None,
+    };
+    let mut coverage = check_sources([layer.as_deref(), store.as_deref()], base.as_deref(), install_key, drivers, d3d11);
     if legacy && !d3d11 {
         coverage.bad_in_install = None;
     }
@@ -125,10 +129,10 @@ pub fn check_for(exe: &Path, api: ShaderApi, install_key: Option<&str>, drivers:
 
 /// `check` on explicit store bases and the install key as it is now.
 pub fn check_at(layer: Option<&Path>, scan: Option<&Path>, install_key: Option<&str>, drivers: &[u64]) -> ShaderCheck {
-    check_sources([layer, scan], scan, install_key, drivers)
+    check_sources([layer, scan], scan, install_key, drivers, true)
 }
 
-fn check_sources(stores: [Option<&Path>; 2], scan: Option<&Path>, install_key: Option<&str>, drivers: &[u64]) -> ShaderCheck {
+fn check_sources(stores: [Option<&Path>; 2], scan: Option<&Path>, install_key: Option<&str>, drivers: &[u64], d3d11: bool) -> ShaderCheck {
     let mut c = ShaderCheck::default();
     let bases: Vec<&Path> = stores.into_iter().flatten().collect();
 
@@ -168,7 +172,7 @@ fn check_sources(stores: [Option<&Path>; 2], scan: Option<&Path>, install_key: O
             Some(Outcome::Made) => c.created_only += 1,
             Some(Outcome::Failed) => c.failed += 1,
             Some(Outcome::Skipped) => c.skipped += 1,
-            None if flags & FLAG_DXIL != 0 => c.skipped += 1,
+            None if d3d11 && flags & FLAG_DXIL != 0 => c.skipped += 1,
             None => {
                 c.pending += 1;
                 c.old_driver += (!drivers.is_empty() && before.get(h) == Some(&Outcome::Ok)) as u64;
