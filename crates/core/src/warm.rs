@@ -138,7 +138,8 @@ pub(crate) fn merge_outcome(seen: &mut HashMap<u64, Outcome>, hash: u64, outcome
 pub(crate) fn settle(text: &str, seen: &mut HashMap<u64, Outcome>) -> Option<u64> {
     let mut lines = text.lines();
     let driver = lines.next()?.strip_prefix("tessera-warm 1 driver ")?;
-    let driver = u64::from_str_radix(driver.trim(), 16).ok()?;
+    // D3D12 runs append " d3d12" after the driver; the outcomes read the same.
+    let driver = u64::from_str_radix(driver.split_whitespace().next()?, 16).ok()?;
     let mut pending = None;
     let mut latest = HashMap::new();
     for l in lines {
@@ -498,6 +499,8 @@ mod tests {
         assert_eq!(parse_log(log), WarmStats { ok: 1, created_only: 1, failed: 2, skipped: 1 });
         let retried = "tessera-warm 1 driver 0000000000000001\nfail a\ntry a\nok a\n";
         assert_eq!(parse_log(retried), WarmStats { ok: 1, ..WarmStats::default() });
+        let d3d12 = "tessera-warm 1 driver 0000000000000001 d3d12\nok a\nskip b\n";
+        assert_eq!(parse_log(d3d12), WarmStats { ok: 1, skipped: 1, ..WarmStats::default() });
         assert_eq!(parse_log("something else\nok a\n"), WarmStats::default());
     }
 }

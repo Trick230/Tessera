@@ -33,6 +33,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -211,10 +212,11 @@ bool read_matching_log(const std::wstring& path, const char* header, std::vector
 
 // Replays the latest result in each log. A peer can supply a successful result
 // for a duplicate, but a refusal in one store does not block the other store.
-bool open_log(const std::wstring& path, const wchar_t* peer, unsigned long long driver, bool retry,
+// The API tag keeps D3D11 and D3D12 runs on one base from reading each other's "skip" lines as done.
+bool open_log(const std::wstring& path, const wchar_t* peer, unsigned long long driver, const char* api, bool retry,
               const std::unordered_set<uint64_t>& retry_created, Log* log) {
     char head[64];
-    snprintf(head, sizeof head, "tessera-warm 1 driver %016llx", driver);
+    snprintf(head, sizeof head, "tessera-warm 1 driver %016llx%s", driver, api);
     std::vector<uint8_t> old;
     if (read_matching_log(path, head, old)) {
         uint64_t pending;
@@ -965,7 +967,8 @@ int run(Device& w, const std::wstring& base, const std::vector<Shader>& shaders,
             if (shader.stage == TESSERA_STAGE_GS || shader.stage == TESSERA_STAGE_GS_SO)
                 geometry.insert(shader.hash);
     }
-    if (!open_log(base + log_extension, peer, w.driver(), retry, geometry, &log)) {
+    constexpr const char* api = std::is_same_v<Device, WarmD3d12> ? " d3d12" : "";
+    if (!open_log(base + log_extension, peer, w.driver(), api, retry, geometry, &log)) {
         fprintf(stderr, "cannot write the warm-up log\n");
         return 1;
     }
