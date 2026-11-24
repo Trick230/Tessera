@@ -156,6 +156,8 @@ template <class View, class Desc>
 void view_desc(const VtHook& hook, View* view, Desc* out) {
     reinterpret_cast<void(STDMETHODCALLTYPE*)(View*, Desc*)>(vt_orig(hook, view))(view, out);
     if (!out || t_native_quality) return;
+    // The hook covers every view of the class: only BC6H/BC7 views (quality_compressed_format) can be ours.
+    if (out->Format < DXGI_FORMAT_BC6H_TYPELESS || out->Format > DXGI_FORMAT_BC7_UNORM_SRGB) return;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     UINT size = sizeof format;
     if (SUCCEEDED(view->GetPrivateData(kViewFormat, &size, &format))) out->Format = format;
