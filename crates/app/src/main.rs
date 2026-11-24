@@ -485,7 +485,9 @@ fn shader_state(
         } else {
             recording.last_result.clone().unwrap_or_default()
         };
-        rows.push(line("Pipeline recording", format!("{} pipelines", recording.count), vec![detail], NEUTRAL));
+        let mut details = vec![detail];
+        if let Some(verification) = &recording.verified { details.push(verification.clone()); }
+        rows.push(line("Pipeline recording", format!("{} pipelines", recording.count), details, NEUTRAL));
     } else if let Some(native) = native_precompile {
         rows.push(line("Game precompiler", "Available".into(), vec![
             "Prepare shaders runs the game's offline precompiler.".into(),
@@ -678,6 +680,7 @@ fn shader_state(
     rows.push(line("Out of date", value.to_string(), d, tone));
 
     ShaderState { present: true, native_precompile: native_precompile.is_some(), recording: recording.is_some(),
+        can_verify: recording.is_some_and(|status| status.can_play),
         rows: ModelRc::new(VecModel::from(rows)) }
 }
 
@@ -1191,17 +1194,59 @@ fn import_recording_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: 
             Err(error) => format!("Pipeline import failed ({error})."),
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            ui.set_busy(false);
-            ui.set_status_text(message.into());
-            let mut st = state.lock().unwrap();
-            let sel = ui.get_selected();
-            if st.view.get(sel as usize).is_some_and(|&gi| st.games[gi].exe.as_deref() == Some(&exe)) {
-                request_view(&ui, &state, &mut st, sel, true);
-            } else if let Some(game) = st.games.iter().find(|game| game.exe.as_deref() == Some(&exe)) {
-                let root = game.entry.root.clone();
-                invalidate_view(&mut st, &root);
-                start_view_worker(&ui, &state, &mut st);
-            }
+            finish_recording_action(&ui, &state, &exe, message);
+        });
+    });
+}
+
+fn finish_recording_action(ui: &MainWindow, state: &Shared, exe: &Path, message: String) {
+    ui.set_busy(false);
+    ui.set_status_text(message.into());
+    let mut st = state.lock().unwrap();
+    let sel = ui.get_selected();
+    if st.view.get(sel as usize).is_some_and(|&gi| st.games[gi].exe.as_deref() == Some(exe)) {
+        request_view(ui, state, &mut st, sel, true);
+    } else if let Some(game) = st.games.iter().find(|game| game.exe.as_deref() == Some(exe)) {
+        let root = game.entry.root.clone();
+        invalidate_view(&mut st, &root);
+        start_view_worker(ui, state, &mut st);
+    }
+}
+
+fn pipeline_session_action(ui: &MainWindow, state: &Shared, index: i32, api: SharedString, verify: bool) {
+    if ui.get_busy() { return; }
+    let Some(scope) = recording_api(api.as_str()) else { return };
+    if verify && scope != ShaderApi::Vulkan { return; }
+    let game = {
+        let st = state.lock().unwrap();
+        st.view.get(index as usize).and_then(|&i| {
+            let game = &st.games[i];
+            if !game.anticheat.is_empty() { return None; }
+            game.exe.clone().map(|exe| (exe, game.entry.root.clone()))
+        })
+    };
+    let Some((exe, root)) = game else { return };
+    if !verify && scope == ShaderApi::D3d12 {
+        let answer = rfd::MessageDialog::new()
+            .set_title("Record D3D12 pipelines")
+            .set_description("Tessera opens the game with its recorder and removes the temporary d3d12.dll when the game closes.")
+            .set_buttons(rfd::MessageButtons::OkCancel).show();
+        if answer != rfd::MessageDialogResult::Ok { return; }
+    }
+    ui.set_busy(true);
+    ui.set_status_text(if verify { "Playing with the prepared Vulkan cache…" } else { "Recording pipelines while the game is open…" }.into());
+    let (weak, state) = (ui.as_weak(), state.clone());
+    std::thread::spawn(move || {
+        use tessera_core::recording_session;
+        let result = if verify {
+            recording_session::play_vulkan(&exe, &root, &app_dir())
+        } else {
+            recording_session::record(&exe, &root, scope, &app_dir())
+                .map(|count| format!("{count} unique {api} pipelines recorded."))
+        };
+        let message = result.unwrap_or_else(|error| format!("Pipeline session failed ({error})."));
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            finish_recording_action(&ui, &state, &exe, message);
         });
     });
 }
@@ -1382,6 +1427,12 @@ fn main() -> Result<(), slint::PlatformError> {
             ("--prepare-imported-pipelines", []) => Some(recording_api(api)
                 .ok_or_else(|| std::io::Error::other("unsupported pipeline recording API"))
                 .and_then(|api| tessera_core::recording::prepare(Path::new(exe), api, &app_dir()))),
+            ("--record-pipelines", [root]) => Some(recording_api(api)
+                .ok_or_else(|| std::io::Error::other("unsupported pipeline recording API"))
+                .and_then(|api| tessera_core::recording_session::record(Path::new(exe), Path::new(root), api, &app_dir()))
+                .map(|count| format!("{count} unique pipelines recorded"))),
+            ("--verify-pipeline-cache", [root]) if recording_api(api) == Some(ShaderApi::Vulkan) =>
+                Some(tessera_core::recording_session::play_vulkan(Path::new(exe), Path::new(root), &app_dir())),
             _ => None,
         };
         if let Some(result) = action {
@@ -1548,6 +1599,10 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_import_recording(move |i, api| import_recording_action(&w.unwrap(), &s, i, api));
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_pipeline_session(move |i, api, verify| pipeline_session_action(&w.unwrap(), &s, i, api, verify));
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());

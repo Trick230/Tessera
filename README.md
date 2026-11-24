@@ -124,6 +124,10 @@ D3D12 or Vulkan. The app merges compatible captures by pipeline content
 and displays the last replay result for the current recording, executable
 and driver. **Prepare shaders** replays the imported recording. Build
 the optional Vulkan payload alongside the app with `build.ps1 -Vulkan`.
+**Record pipelines** launches the selected game directly. For D3D12 it
+temporarily places the recorder next to the executable when that path is
+available. **Play and verify cache** uses the prepared Vulkan cache and
+reports the application's cache hits after the game closes.
 
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 

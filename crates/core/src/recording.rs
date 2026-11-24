@@ -54,7 +54,7 @@ impl Format {
             let dependent = if self.d3d12 { read_u32(bytes, 4) as usize } else { 0 };
             let maximum = if self.d3d12 {
                 let kind = read_u32(bytes, 20);
-                if kind > 3 || dependent > 1 << 20 { return Err(io::Error::other("unsupported D3D12 record")); }
+                if kind > 4 || dependent > 1 << 20 { return Err(io::Error::other("unsupported D3D12 record")); }
                 if kind == 0 { 16 << 20 } else { 64 << 20 }
             } else {
                 32 << 20
@@ -75,10 +75,22 @@ impl Format {
     }
 }
 
-fn directory(exe: &Path, api: ShaderApi) -> Option<PathBuf> {
+pub(crate) fn directory(exe: &Path, api: ShaderApi) -> Option<PathBuf> {
     if !matches!(api, ShaderApi::D3d12 | ShaderApi::Vulkan) { return None; }
     let base = scan::scan_base_for(exe, api)?;
     Some(crate::paths::data_dir().join("recordings").join(base.file_name()?))
+}
+
+pub(crate) fn prepared_vulkan(exe: &Path, dir: &Path) -> Option<Value> {
+    let active = active(dir)?;
+    let report = json_file(&dir.join("prepared.json"))?;
+    (report["capture"].as_str() == Some(&active.key) && report["environment"] == environment(exe)
+        && cache_is_current(&report, &dir.join("pipeline-cache.bin"))).then_some(report)
+}
+
+pub(crate) fn save_verification(dir: &Path, mut report: Value, result: &str) -> io::Result<()> {
+    report["verification"] = json!(result);
+    write_json(&dir.join("prepared.json"), report)
 }
 
 fn identity(path: &Path) -> Option<Value> {
@@ -124,6 +136,8 @@ fn active(dir: &Path) -> Option<Active> {
 pub struct Status {
     pub count: u64,
     pub last_result: Option<String>,
+    pub verified: Option<String>,
+    pub can_play: bool,
     pub changed: bool,
 }
 
@@ -137,8 +151,15 @@ pub fn status(exe: &Path, api: ShaderApi) -> Option<Status> {
     Some(Status {
         count: active.count,
         last_result: current.and_then(|report| report["summary"].as_str()).map(str::to_owned),
+        verified: current.and_then(|report| report["verification"].as_str()).map(str::to_owned),
+        can_play: api == ShaderApi::Vulkan
+            && current.is_some_and(|report| cache_is_current(report, &dir.join("pipeline-cache.bin"))),
         changed: report.is_some() && current.is_none(),
     })
+}
+
+fn cache_is_current(report: &Value, cache: &Path) -> bool {
+    report["saved_cache"].as_array().is_some() && identity(cache).as_ref() == report.get("saved_cache")
 }
 
 struct ReadCapture {
@@ -225,8 +246,7 @@ pub fn prepare(exe: &Path, api: ShaderApi, helper_dir: &Path) -> io::Result<Stri
         let cache = dir.join("pipeline-cache.bin");
         if json_file(&report_path).is_some_and(|report| {
             report["capture"].as_str() == Some(&active.key) && report["environment"] == scope
-                && report["saved_cache"].as_array().is_some()
-                && identity(&cache).as_ref() == report.get("saved_cache")
+                && cache_is_current(&report, &cache)
         }) {
             return Ok("The Vulkan cache for this recording is already prepared.".to_owned());
         }

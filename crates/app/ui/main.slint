@@ -76,6 +76,7 @@ export struct ShaderState {
     present: bool,
     native-precompile: bool,
     recording: bool,
+    can-verify: bool,
     rows: [ShaderRow],
 }
 
@@ -756,6 +757,7 @@ component Detail inherits Rectangle {
     in property <GameSettings> settings;
     in property <ShaderState> shaders;
     in property <bool> accepts-recording;
+    in property <string> recording-api;
     in property <bool> busy;
     in-out property <int> tab;
     property <bool> entering-page;
@@ -775,6 +777,7 @@ component Detail inherits Rectangle {
     callback reset-safe-mode();
     callback clear-shaders();
     callback import-recording();
+    callback pipeline-session(bool);
     callback settings-changed(bool, bool, bool, bool, bool, int, int);
     callback advanced-changed(string, int);
     callback prepare-quality();
@@ -948,6 +951,20 @@ component Detail inherits Rectangle {
                         }
                     }
                     if !root.shaders.present: Text { text: "No game executable found."; color: Theme.dim; font-size: 14px; }
+                    if root.shaders.present && root.accepts-recording && root.game.anticheat == "": HorizontalLayout {
+                        alignment: start;
+                        spacing: 8px;
+                        Btn {
+                            text: root.recording-api == "Vulkan" ? "Record compute pipelines" : "Record D3D12 pipelines";
+                            enabled: !root.busy;
+                            clicked => { root.pipeline-session(false); }
+                        }
+                        if root.shaders.can-verify: Btn {
+                            text: "Play and verify cache";
+                            enabled: !root.busy;
+                            clicked => { root.pipeline-session(true); }
+                        }
+                    }
                     for r in root.shaders.rows: ShaderLine { check: r; }
                 }
 
@@ -1196,6 +1213,7 @@ export component MainWindow inherits Window {
     callback reset-safe-mode(int);
     callback warm-shaders(int, string);
     callback import-recording(int, string);
+    callback pipeline-session(int, string, bool);
     callback clear-shaders(int);
     callback add-folder(bool);
     callback remove-folder(FolderSource, int);
@@ -1359,6 +1377,7 @@ export component MainWindow inherits Window {
                             settings: root.settings;
                             busy: root.busy;
                             accepts-recording: root.shader-api == "D3D12" || root.shader-api == "Vulkan";
+                            recording-api: root.shader-api;
                             shaders: root.shader-api == "D3D12" ? root.shader-states.d3d12
                                 : root.shader-api == "Vulkan" ? root.shader-states.vulkan
                                 : root.shader-api == "OpenGL" ? root.shader-states.opengl
@@ -1367,6 +1386,7 @@ export component MainWindow inherits Window {
                             reset-safe-mode => { root.reset-safe-mode(root.selected); }
                             clear-shaders => { root.clear-shaders(root.selected); }
                             import-recording => { root.import-recording(root.selected, root.shader-api); }
+                            pipeline-session(verify) => { root.pipeline-session(root.selected, root.shader-api, verify); }
                             settings-changed(p, r, fl, rc, u, f, v) => { root.settings-changed(root.selected, p, r, fl, rc, u, f, v); }
                             advanced-changed(key, value) => { root.advanced-changed(root.selected, key, value); }
                             prepare-quality => { root.prepare-quality(root.selected); }

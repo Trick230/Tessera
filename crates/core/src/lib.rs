@@ -21,6 +21,7 @@ pub mod pe;
 pub mod paths;
 pub mod quality;
 pub mod recording;
+pub mod recording_session;
 mod recomp;
 pub mod scan;
 pub mod session;
