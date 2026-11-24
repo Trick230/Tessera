@@ -197,9 +197,21 @@ bool free_output_slot(ID3D11DeviceContext* ctx) {
     for (auto* view : rt)
         if (view) view->Release();
     if (!available) return false;
-    ComPtr<ID3D11UnorderedAccessView> uav;
-    ctx->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, kUav, 1, &uav);
-    return !uav;
+    // Binding our UAV replaces the whole output-merger UAV set, so only sample draws without game UAVs.
+    // Feature level 11_1 has 64 slots; 11_0 has 8.
+    ID3D11UnorderedAccessView* uavs[D3D11_1_UAV_SLOT_COUNT] = {};
+    UINT slots = D3D11_PS_CS_UAV_REGISTER_COUNT;
+    ComPtr<ID3D11Device> device;
+    ctx->GetDevice(&device);
+    if (device && device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1) slots = D3D11_1_UAV_SLOT_COUNT;
+    ctx->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, slots, uavs);
+    bool empty = true;
+    for (auto* view : uavs)
+        if (view) {
+            empty = false;
+            view->Release();
+        }
+    return empty;
 }
 
 struct ShaderMiss {
