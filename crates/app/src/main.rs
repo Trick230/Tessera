@@ -1333,6 +1333,11 @@ fn layer_action(ui: &MainWindow, state: &Shared, view_idx: i32, do_install: bool
     if do_install && !g.can_install() {
         return;
     }
+    // The app prepares a game before it starts and never changes its folder while it runs.
+    if g.exe.as_deref().is_some_and(tessera_core::warm::is_running) {
+        ui.set_status_text("Close the game first: the layer is installed or removed only while it is not running".into());
+        return;
+    }
     let result = if do_install {
         let Some(architecture) = g.scan.architecture else { return };
         install::install(&dir, &payload_path(architecture), install::PROXY_D3D11)

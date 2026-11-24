@@ -27,7 +27,7 @@ switch in the app. Everything below is **off by default**.
 | `rt_recycle=1` | Keeps released large render targets and hands them back on an identical create. |
 | `flip_model=1` | Flip presentation for blit-model swap chains in borderless windows. |
 | `present_cpu_sets=1` | Puts the presenting thread on performance cores (hybrid CPUs). |
-| `texture_dedup=1` | Shares byte-identical immutable textures on the same device. |
+| `texture_dedup=1` | Shares byte-identical immutable textures on the same device. The game gets the same object for each copy, so a game that stores its own data on a texture object (private data) or expects distinct pointers can misbehave; off by default. |
 | `stream_io=1` / `2` | Learn file reads / replay them as low-priority prefetch on the next launch. `stream_root` overrides the asset folder. |
 | `mip_prediction=1` | Learns which textures are bound together; with `stream_io`, prefetches matching file ranges. |
 | `mip_streaming=1` | With `mip_residency=1`: split uploads, smallest mips first, throttled by a GPU fence. |

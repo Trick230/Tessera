@@ -53,7 +53,7 @@ Stack: the layer and the GPU tools are C++20 (CMake, VS 2022). The preparation a
    - detects the API (exe imports), engine, anti-cheat (refuses), exe hash and driver version (invalidates caches);
    - processes the previous session's logs (shaders, textures, co-occurrence, I/O);
    - reads (only reads) other tools' settings (RTSS, NVIDIA control panel limit);
-   - warms shaders out of process; installs the DLL (chaining any existing one); closes.
+   - warms shaders out of process; installs the DLL (chaining any existing one). From here on the app does not act on the game: it may stay open (or launch a recording session with its layer set up beforehand and wait for it to exit), but it never touches the running process, and installs or removes the layer only while the game is closed.
 2. The user launches the game normally (Steam, etc.).
 3. The DLL: opens caches by memory-mapping → creates the real device and patches vtables → detects features
    and components (Reflex, frame gen, own streaming, other layers) → preallocates the tile pool.

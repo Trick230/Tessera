@@ -4,7 +4,7 @@
 
 Stutters usually come from a few places: shaders compiled the first time something appears, the game loading data while you move through the world, running out of video memory, and uneven frame pacing. Tessera works on each of them.
 
-It does the heavy work **before** you play, in a small app that then closes. While you play, only a light graphics layer runs. The game loads it by itself, like any other DLL in its folder. Nothing is injected, nothing stays in the background, and nothing outside the game is changed.
+It does the heavy work **before** you play, in a small app. While you play, only a light graphics layer runs; the app may stay open, but it never touches a running game (it sets everything up before the game starts). The game loads it by itself, like any other DLL in its folder. Nothing is injected, nothing stays in the background, and nothing outside the game is changed.
 
 > **Early development.** It works on Direct3D 11 games and is tested on real ones (mainly Final Fantasy VII Remake). Most features are off by default until measurements show they help. Direct3D 12 support is in progress. See [Status](#status).
 
