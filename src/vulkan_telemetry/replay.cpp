@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <windows.h>
 
-#include "compute_recipe.h"
+#include "graphics_recipe.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -18,6 +18,7 @@ struct Context {
     PFN_vkGetInstanceProcAddr get_instance{};
     PFN_vkGetDeviceProcAddr get_device{};
     bool descriptor_indexing{};
+    bool graphics{};
 
     ~Context() {
         if (cache) fn<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(device, cache, nullptr);
@@ -75,25 +76,33 @@ struct Context {
         if (!count || count > 256) return false;
         std::vector<VkQueueFamilyProperties> queues(count);
         queue_properties(physical, &count, queues.data());
-        uint32_t index = 0;
-        while (index < count && (!(queues[index].queueFlags & VK_QUEUE_COMPUTE_BIT) || !queues[index].queueCount)) ++index;
+        uint32_t index = count;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!queues[i].queueCount || !(queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) continue;
+            if (index == count || (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) index = i;
+            if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) break;
+        }
         if (index == count) return false;
+        graphics = (queues[index].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
         const float priority = 1.0f;
         const VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, index, 1, &priority};
         VkPhysicalDeviceFeatures available{};
         features(physical, &available);
-        VkPhysicalDeviceDescriptorIndexingFeatures indexing{};
-        indexing.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+        VkPhysicalDeviceVulkan12Features features12{};
+        features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        VkPhysicalDeviceVulkan11Features features11{};
+        features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+        features11.pNext = &features12;
         const auto features2 = instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2");
         descriptor_indexing = header.api >= VK_API_VERSION_1_2 && features2;
         if (descriptor_indexing) {
             VkPhysicalDeviceFeatures2 query{};
             query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            query.pNext = &indexing;
+            query.pNext = &features11;
             features2(physical, &query);
         }
         const VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-            descriptor_indexing ? &indexing : nullptr, 0, 1, &queue, 0,
+            descriptor_indexing ? &features11 : nullptr, 0, 1, &queue, 0,
             nullptr, 0, nullptr, &available};
         const VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, 0, nullptr};
         return make_device(physical, &info, nullptr, &device) == VK_SUCCESS
@@ -106,13 +115,16 @@ struct PipelineObjects {
     std::vector<VkDescriptorSetLayout> sets;
     std::vector<std::pair<Sampler, VkSampler>> samplers;
     VkPipelineLayout layout{};
-    VkShaderModule shader{};
+    std::vector<VkShaderModule> shaders;
     VkPipeline pipeline{};
+    VkRenderPass render_pass{};
 
     ~PipelineObjects() {
         const auto device = context.device;
         if (pipeline) context.fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device, pipeline, nullptr);
-        if (shader) context.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device, shader, nullptr);
+        const auto destroy_shader = context.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+        for (const auto shader : shaders) if (shader) destroy_shader(device, shader, nullptr);
+        if (render_pass) context.fn<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(device, render_pass, nullptr);
         if (layout) context.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device, layout, nullptr);
         const auto destroy = context.fn<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout");
         for (const auto set : sets) if (set) destroy(device, set, nullptr);
@@ -138,12 +150,12 @@ struct PipelineObjects {
     }
 };
 
-VkResult replay(const Context& context, const Recipe& recipe) {
-    PipelineObjects objects{context, std::vector<VkDescriptorSetLayout>(recipe.layout.sets.size()), {}};
+VkResult make_layout(const Context& context, PipelineObjects& objects, const Layout& description) {
+    objects.sets.resize(description.sets.size());
     const auto make_set = context.fn<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout");
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     for (size_t i = 0; i < objects.sets.size(); ++i) {
-        const auto& set = recipe.layout.sets[i];
+        const auto& set = description.sets[i];
         bindings.clear();
         std::vector<VkDescriptorBindingFlags> flags;
         std::vector<std::vector<VkSampler>> immutable(set.bindings.size());
@@ -170,13 +182,18 @@ VkResult replay(const Context& context, const Recipe& recipe) {
     }
     const VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0,
         static_cast<uint32_t>(objects.sets.size()), objects.sets.data(),
-        static_cast<uint32_t>(recipe.layout.push.size()), recipe.layout.push.data()};
-    auto status = context.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(
-        context.device, &layout, nullptr, &objects.layout);
+        static_cast<uint32_t>(description.push.size()), description.push.data()};
+    return context.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layout, nullptr, &objects.layout);
+}
+
+VkResult replay(const Context& context, const Recipe& recipe) {
+    PipelineObjects objects{context, {}, {}, {}, {}};
+    auto status = make_layout(context, objects, recipe.layout);
     if (status != VK_SUCCESS) return status;
     const VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
         recipe.code.size() * sizeof(uint32_t), recipe.code.data()};
-    status = context.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &module, nullptr, &objects.shader);
+    objects.shaders.resize(1);
+    status = context.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &module, nullptr, &objects.shaders[0]);
     if (status != VK_SUCCESS) return status;
     std::vector<VkSpecializationMapEntry> constants;
     constants.reserve(recipe.constants.size());
@@ -184,11 +201,42 @@ VkResult replay(const Context& context, const Recipe& recipe) {
     const VkSpecializationInfo spec{static_cast<uint32_t>(constants.size()), constants.data(),
         recipe.data.size(), recipe.data.data()};
     const VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr,
-        0, VK_SHADER_STAGE_COMPUTE_BIT, objects.shader, recipe.entry.c_str(), constants.empty() ? nullptr : &spec};
+        0, VK_SHADER_STAGE_COMPUTE_BIT, objects.shaders[0], recipe.entry.c_str(), constants.empty() ? nullptr : &spec};
     const VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0,
         stage, objects.layout, VK_NULL_HANDLE, -1};
     return context.fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(
         context.device, context.cache, 1, &info, nullptr, &objects.pipeline);
+}
+
+VkResult replay_graphics(const Context& context, std::vector<uint8_t>& bytes) {
+    if (!context.graphics) return VK_ERROR_FEATURE_NOT_PRESENT;
+    GraphicsWire wire{};
+    if (!graphics_offsets(bytes, wire, false)) return VK_ERROR_INITIALIZATION_FAILED;
+    Reader reader({wire.layout_data, wire.layout_size});
+    Layout layout;
+    if (!read_layout(reader, layout, false) || !reader.finished()) return VK_ERROR_INITIALIZATION_FAILED;
+    std::vector<uint8_t> pass_data(wire.render_data, wire.render_data + wire.render_size);
+    VkRenderPassCreateInfo pass{};
+    if (!render_pass_offsets(pass_data, pass, false) || wire.pipeline.subpass >= pass.subpassCount)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    PipelineObjects objects{context, {}, {}, {}, {}};
+    auto status = make_layout(context, objects, layout);
+    if (status != VK_SUCCESS) return status;
+    status = context.fn<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &pass, nullptr, &objects.render_pass);
+    if (status != VK_SUCCESS) return status;
+    const auto make_shader = context.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule");
+    objects.shaders.resize(wire.pipeline.stageCount);
+    std::vector<VkPipelineShaderStageCreateInfo> stages(wire.pipeline.pStages, wire.pipeline.pStages + wire.pipeline.stageCount);
+    for (uint32_t i = 0; i < wire.pipeline.stageCount; ++i) {
+        status = make_shader(context.device, &wire.modules[i], nullptr, &objects.shaders[i]);
+        if (status != VK_SUCCESS) return status;
+        stages[i].module = objects.shaders[i];
+    }
+    wire.pipeline.pStages = stages.data();
+    wire.pipeline.layout = objects.layout;
+    wire.pipeline.renderPass = objects.render_pass;
+    return context.fn<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(
+        context.device, context.cache, 1, &wire.pipeline, nullptr, &objects.pipeline);
 }
 
 bool save_cache(const Context& context, const wchar_t* filename) {
@@ -217,7 +265,8 @@ int run(const wchar_t* recording, const wchar_t* output) {
     Header header{};
     const auto header_size = fread(&header, 1, sizeof(header), file);
     const bool legacy = std::memcmp(header.tag, legacy_magic, sizeof(legacy_magic)) == 0;
-    if (header_size != sizeof(header) || (!legacy && std::memcmp(header.tag, magic, sizeof(magic)))
+    const bool mixed = std::memcmp(header.tag, mixed_magic, sizeof(mixed_magic)) == 0;
+    if (header_size != sizeof(header) || (!legacy && !mixed && std::memcmp(header.tag, magic, sizeof(magic)))
         || VK_API_VERSION_VARIANT(header.api) || VK_API_VERSION_MAJOR(header.api) != 1) {
         fprintf(stderr, "invalid Vulkan recording header\n");
         return 1;
@@ -227,33 +276,49 @@ int run(const wchar_t* recording, const wchar_t* output) {
         fprintf(stderr, "cannot create a compatible Vulkan device or pipeline cache\n");
         return 1;
     }
-    size_t total = sizeof(header), prepared = 0, failed = 0;
+    size_t total = sizeof(header), prepared[2]{}, failed = 0;
+    const auto attempted = [&] { return prepared[0] + prepared[1] + failed; };
     std::vector<uint8_t> packet;
     while (true) {
         uint32_t size = 0;
         const size_t got = fread(&size, 1, sizeof(size), file);
         if (!got && feof(file)) break;
         if (got != sizeof(size) || !size || size > packet_limit || size + sizeof(size) > file_limit - total) {
-            fprintf(stderr, "invalid Vulkan record size after %zu pipelines\n", prepared + failed);
+            fprintf(stderr, "invalid Vulkan record size after %zu pipelines\n", attempted());
             return 1;
         }
         total += size + sizeof(size);
         packet.resize(size);
-        Recipe recipe;
-        if (fread(packet.data(), 1, size, file) != size || !decode(packet, recipe, legacy)) {
-            fprintf(stderr, "invalid Vulkan recipe after %zu pipelines\n", prepared + failed);
+        if (fread(packet.data(), 1, size, file) != size || (mixed && size <= sizeof(uint32_t))) {
+            fprintf(stderr, "invalid Vulkan recipe after %zu pipelines\n", attempted());
             return 1;
         }
-        const auto result = replay(context, recipe);
-        if (result == VK_SUCCESS) ++prepared;
+        uint32_t kind = compute_packet;
+        if (mixed) {
+            std::memcpy(&kind, packet.data(), sizeof(kind));
+            packet.erase(packet.begin(), packet.begin() + sizeof(kind));
+        }
+        VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+        if (kind == compute_packet) {
+            Recipe recipe;
+            if (!decode(packet, recipe, legacy)) {
+                fprintf(stderr, "invalid Vulkan recipe after %zu pipelines\n", attempted());
+                return 1;
+            }
+            result = replay(context, recipe);
+        } else if (kind == graphics_packet) {
+            result = replay_graphics(context, packet);
+        }
+        if (result == VK_SUCCESS) ++prepared[kind];
         else {
             ++failed;
-            fprintf(stderr, "Vulkan pipeline %zu failed (%d)\n", prepared + failed, result);
+            fprintf(stderr, "Vulkan pipeline %zu failed (%d)\n", attempted(), result);
             if (result == VK_ERROR_DEVICE_LOST) break;
         }
     }
-    printf("Vulkan compute pipelines prepared: %zu, %zu failed\n", prepared, failed);
-    if (!prepared || failed) return 1;
+    if (prepared[1]) printf("Vulkan pipelines prepared: %zu compute, %zu graphics, %zu failed\n", prepared[0], prepared[1], failed);
+    else printf("Vulkan compute pipelines prepared: %zu, %zu failed\n", prepared[0], failed);
+    if (failed || !attempted()) return 1;
     if (save_cache(context, output)) return 0;
     fprintf(stderr, "cannot save Vulkan pipeline cache\n");
     return 1;

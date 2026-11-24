@@ -955,7 +955,7 @@ component Detail inherits Rectangle {
                         alignment: start;
                         spacing: 8px;
                         Btn {
-                            text: root.recording-api == "Vulkan" ? "Record compute pipelines" : "Record D3D12 pipelines";
+                            text: "Record " + root.recording-api + " pipelines";
                             enabled: !root.busy;
                             clicked => { root.pipeline-session(false); }
                         }

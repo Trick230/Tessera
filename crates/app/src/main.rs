@@ -481,7 +481,7 @@ fn shader_state(
     let scan_only = api != ShaderApi::D3d11;
     if let Some(recording) = recording {
         let detail = if recording.changed {
-            "The capture, game settings or driver changed since the last replay.".into()
+            "The recording, game, driver or prepared cache changed since the last replay.".into()
         } else {
             recording.last_result.clone().unwrap_or_default()
         };

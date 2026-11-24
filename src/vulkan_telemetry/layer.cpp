@@ -242,7 +242,9 @@ void destroy_cache(VkDevice device, const Device& d) {
 }
 
 void create_recipe_capture(const Instance& parent, VkPhysicalDevice physical, Device& d) {
-    const auto path = environment_path(L"TESSERA_VULKAN_COMPUTE_CAPTURE");
+    auto path = environment_path(L"TESSERA_VULKAN_PIPELINE_CAPTURE");
+    const bool graphics = !path.empty();
+    if (!graphics) path = environment_path(L"TESSERA_VULKAN_COMPUTE_CAPTURE");
     if (path.empty()) return;
     const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
         parent.get(parent.handle, "vkGetPhysicalDeviceProperties"));
@@ -250,7 +252,7 @@ void create_recipe_capture(const Instance& parent, VkPhysicalDevice physical, De
     VkPhysicalDeviceProperties properties{};
     get(physical, &properties);
     const auto api = parent.api < properties.apiVersion ? parent.api : properties.apiVersion;
-    auto capture = std::make_shared<tessera::vulkan_recipe::Capture>(path, api, properties);
+    auto capture = std::make_shared<tessera::vulkan_recipe::Capture>(path, api, properties, graphics);
     if (capture->available()) d.recipes = std::move(capture);
 }
 
@@ -373,7 +375,14 @@ VkResult measure(const char* event, const Device& d, Create next, VkDevice devic
 VKAPI_ATTR VkResult VKAPI_CALL graphics_pipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
         const VkGraphicsPipelineCreateInfo* info, const VkAllocationCallbacks* allocator, VkPipeline* results) {
     const auto d = dispatch(devices, device);
-    return measure("graphics", d, d.graphics, device, cache, count, info, allocator, results);
+    const auto status = measure("graphics", d, d.graphics, device, cache, count, info, allocator, results);
+    if (d.recipes && d.graphics) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!results[i]) continue;
+            try { d.recipes->graphics(info[i]); } catch (...) {}
+        }
+    }
+    return status;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL compute_pipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
@@ -414,6 +423,15 @@ void capture_destroy(VkDevice device, Handle handle, const VkAllocationCallbacks
 }
 
 using RecipeCapture = tessera::vulkan_recipe::Capture;
+VKAPI_ATTR VkResult VKAPI_CALL render_pass(VkDevice device, const VkRenderPassCreateInfo* info,
+        const VkAllocationCallbacks* allocator, VkRenderPass* result) {
+    return capture_create<PFN_vkCreateRenderPass>(device, info, allocator, result, "vkCreateRenderPass", &RecipeCapture::render_pass);
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_render_pass(VkDevice device, VkRenderPass pass, const VkAllocationCallbacks* allocator) {
+    capture_destroy<PFN_vkDestroyRenderPass>(device, pass, allocator, "vkDestroyRenderPass", &RecipeCapture::remove_pass);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL sampler(VkDevice device, const VkSamplerCreateInfo* info,
         const VkAllocationCallbacks* allocator, VkSampler* result) {
     return capture_create<PFN_vkCreateSampler>(device, info, allocator, result, "vkCreateSampler", &RecipeCapture::sampler);
@@ -483,6 +501,8 @@ PFN_vkVoidFunction device_intercept(const char* name) {
     if (strcmp(name, "vkCreateGraphicsPipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(graphics_pipelines);
     if (strcmp(name, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(compute_pipelines);
     if (strcmp(name, "vkCreateShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(shader_module);
+    if (strcmp(name, "vkCreateRenderPass") == 0) return reinterpret_cast<PFN_vkVoidFunction>(render_pass);
+    if (strcmp(name, "vkDestroyRenderPass") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_render_pass);
     if (strcmp(name, "vkCreateSampler") == 0) return reinterpret_cast<PFN_vkVoidFunction>(sampler);
     if (strcmp(name, "vkDestroySampler") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_sampler);
     if (strcmp(name, "vkDestroyShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_shader_module);

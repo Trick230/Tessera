@@ -110,14 +110,15 @@ on a later launch. Tessera supplies this cache only for calls where the
 game provides no cache of its own. The snapshot contains opaque driver
 data. Recreating pipeline descriptors offline requires a separate recording.
 
-Set `TESSERA_VULKAN_COMPUTE_CAPTURE` to a new file to record core compute
-pipelines with their SPIR-V, descriptor set layouts, push constants and
-specialization constants. Vulkan 1.2 recordings can include descriptor
-binding flags and core immutable samplers. Run
+Set `TESSERA_VULKAN_PIPELINE_CAPTURE` to a new file to record compute and
+graphics pipelines on x64. The recording holds SPIR-V, descriptor set
+layouts, push constants, specialization constants and core graphics state
+with render passes. Vulkan 1.2 recordings can include descriptor binding
+flags and core immutable samplers. Run
 `tessera_vulkan_replay <recording> <new-cache>`
 on the same driver and adapter, then pass that output to
-`TESSERA_VULKAN_CACHE_INPUT`. Graphics pipelines and extension-specific
-sampler and pipeline state have separate descriptor requirements.
+`TESSERA_VULKAN_CACHE_INPUT`. Dynamic rendering, graphics pipeline
+libraries and extension-specific state require additional capture formats.
 
 Use **Import pipeline recording** in the library's **Shaders** tab for
 D3D12 or Vulkan. The app merges compatible captures by pipeline content
@@ -128,6 +129,9 @@ the optional Vulkan payload alongside the app with `build.ps1 -Vulkan`.
 temporarily places the recorder next to the executable when that path is
 available. **Play and verify cache** uses the prepared Vulkan cache and
 reports the application's cache hits after the game closes.
+An unsuccessful game exit keeps the telemetry but does not save a successful
+verification. Cache feedback confirms pipeline reuse; gameplay frame-time
+measurements are still needed to establish a stutter reduction.
 
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 

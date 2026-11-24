@@ -37,7 +37,7 @@ fn format(api: ShaderApi, bytes: &[u8]) -> io::Result<Format> {
             && read_u32(bytes, 8) == 1 && read_u32(bytes, 12) == 0 =>
             Ok(Format { header: 16, record: 32, max_file: MAX_D3D12, d3d12: true }),
         ShaderApi::Vulkan if bytes.len() >= 36
-            && (bytes.starts_with(b"TSRVKC1\0") || bytes.starts_with(b"TSRVKC2\0")) =>
+            && (bytes.starts_with(b"TSRVKC1\0") || bytes.starts_with(b"TSRVKC2\0") || bytes.starts_with(b"TSRVKC3\0")) =>
             Ok(Format { header: 36, record: 4, max_file: MAX_VULKAN, d3d12: false }),
         _ => Err(io::Error::other("the recording format does not match the selected API")),
     }
@@ -147,6 +147,7 @@ pub fn status(exe: &Path, api: ShaderApi) -> Option<Status> {
     let report = json_file(&dir.join("prepared.json"));
     let current = report.as_ref().filter(|report| {
         report["capture"].as_str() == Some(&active.key) && report["environment"] == environment(exe)
+            && (!report["saved_cache"].is_array() || cache_is_current(report, &dir.join("pipeline-cache.bin")))
     });
     Some(Status {
         count: active.count,

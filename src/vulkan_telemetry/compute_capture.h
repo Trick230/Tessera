@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "compute_recipe.h"
+#include "graphics_recipe.h"
 
 #include <windows.h>
 
@@ -11,12 +11,13 @@
 namespace tessera::vulkan_recipe {
 class Capture {
 public:
-    Capture(const std::wstring& path, uint32_t api, const VkPhysicalDeviceProperties& properties) {
+    Capture(const std::wstring& path, uint32_t api, const VkPhysicalDeviceProperties& properties, bool graphics)
+        : graphics_(graphics) {
         file_ = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
             CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file_ == INVALID_HANDLE_VALUE) return;
         Header header{};
-        std::memcpy(header.tag, magic, sizeof(magic));
+        std::memcpy(header.tag, graphics ? mixed_magic : magic, sizeof(magic));
         header.api = api ? api : VK_API_VERSION_1_0;
         header.vendor = properties.vendorID;
         header.device = properties.deviceID;
@@ -135,6 +136,54 @@ public:
         layouts_.erase(it);
     }
 
+    void render_pass(VkRenderPass handle, const VkRenderPassCreateInfo& info) {
+        if (!graphics_) return;
+        auto desc = info;
+        std::vector<uint8_t> packet;
+        if (!render_pass_offsets(packet, desc, true)) return;
+        const std::lock_guard guard(lock_);
+        const auto size = packet.size();
+        if (passes_.size() < 16384 && size <= layout_limit_ - tracked_layouts_
+            && passes_.try_emplace(handle, std::move(packet)).second) tracked_layouts_ += size;
+    }
+
+    void remove_pass(VkRenderPass handle) {
+        const std::lock_guard guard(lock_);
+        const auto found = passes_.find(handle);
+        if (found == passes_.end()) return;
+        tracked_layouts_ -= found->second.size();
+        passes_.erase(found);
+    }
+
+    void graphics(const VkGraphicsPipelineCreateInfo& info) {
+        if (!graphics_ || info.flags || !pipeline_feedback_only(info.pNext) || !info.stageCount || info.stageCount > max_stages
+            || (info.pRasterizationState && info.pRasterizationState->rasterizerDiscardEnable)) return;
+        const std::lock_guard guard(lock_);
+        if (written_ >= file_limit) return;
+        const auto pass = passes_.find(info.renderPass);
+        const auto layout = layouts_.find(info.layout);
+        if (pass == passes_.end() || layout == layouts_.end()) return;
+        VkShaderModuleCreateInfo shaders[max_stages]{};
+        for (uint32_t i = 0; i < info.stageCount; ++i) {
+            const auto shader = modules_.find(info.pStages[i].module);
+            if (shader == modules_.end()) return;
+            shaders[i] = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
+                shader->second.size() * sizeof(uint32_t), shader->second.data()};
+        }
+        std::vector<uint8_t> layout_packet;
+        put_layout(layout_packet, layout->second);
+        if (layout_packet.size() > packet_limit) return;
+        GraphicsWire wire{info, shaders, pass->second.data(), layout_packet.data(),
+            static_cast<uint32_t>(pass->second.size()), static_cast<uint32_t>(layout_packet.size())};
+        wire.pipeline.pNext = nullptr;
+        wire.pipeline.layout = VK_NULL_HANDLE;
+        wire.pipeline.renderPass = VK_NULL_HANDLE;
+        wire.pipeline.basePipelineHandle = VK_NULL_HANDLE;
+        wire.pipeline.basePipelineIndex = -1;
+        std::vector<uint8_t> packet;
+        if (graphics_offsets(packet, wire, true)) write_packet(graphics_packet, packet);
+    }
+
     void pipeline(const VkComputePipelineCreateInfo& info) {
         if (info.flags || info.stage.flags || info.stage.pNext || info.stage.stage != VK_SHADER_STAGE_COMPUTE_BIT
             || !info.stage.pName) return;
@@ -167,14 +216,19 @@ public:
             }
         }
         const auto bytes = encode(recipe);
-        if (bytes.size() > packet_limit) return;
-        const auto size = static_cast<uint32_t>(bytes.size());
         const std::lock_guard guard(lock_);
-        if (file_limit - written_ < size + sizeof(size)) return;
-        if (!write(&size, sizeof(size)) || !write(bytes.data(), size)) written_ = file_limit;
+        write_packet(compute_packet, bytes);
     }
 
 private:
+    void write_packet(uint32_t kind, const std::vector<uint8_t>& bytes) {
+        const size_t prefix = graphics_ ? sizeof(kind) : 0;
+        if (bytes.size() + prefix > packet_limit || file_limit - written_ < bytes.size() + prefix + sizeof(uint32_t)) return;
+        const auto size = static_cast<uint32_t>(bytes.size() + prefix);
+        if (!write(&size, sizeof(size)) || (graphics_ && !write(&kind, sizeof(kind)))
+            || !write(bytes.data(), static_cast<uint32_t>(bytes.size()))) written_ = file_limit;
+    }
+
     bool write(const void* data, uint32_t size) {
         DWORD written = 0;
         if (!WriteFile(file_, data, size, &written, nullptr) || written != size) return false;
@@ -183,6 +237,7 @@ private:
     }
 
     HANDLE file_{INVALID_HANDLE_VALUE};
+    bool graphics_{};
     std::mutex lock_;
     uint32_t written_{};
     size_t tracked_code_{};
@@ -192,5 +247,6 @@ private:
     std::unordered_map<VkSampler, Sampler> samplers_;
     std::unordered_map<VkDescriptorSetLayout, DescriptorSet> sets_;
     std::unordered_map<VkPipelineLayout, Layout> layouts_;
+    std::unordered_map<VkRenderPass, std::vector<uint8_t>> passes_;
 };
 }  // namespace tessera::vulkan_recipe

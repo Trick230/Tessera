@@ -48,7 +48,8 @@ fn vulkan_layer(command: &mut Command, helper_dir: &Path) -> io::Result<()> {
     if !layers.contains(&VULKAN_LAYER) { layers.push(VULKAN_LAYER); }
     command.env("VK_LAYER_PATH", paths).env("VK_INSTANCE_LAYERS", layers.join(";"))
         .env_remove("TESSERA_VULKAN_CACHE_INPUT").env_remove("TESSERA_VULKAN_CACHE_OUTPUT")
-        .env_remove("TESSERA_VULKAN_TELEMETRY").env_remove("TESSERA_VULKAN_COMPUTE_CAPTURE");
+        .env_remove("TESSERA_VULKAN_TELEMETRY").env_remove("TESSERA_VULKAN_COMPUTE_CAPTURE")
+        .env_remove("TESSERA_VULKAN_PIPELINE_CAPTURE");
     Ok(())
 }
 
@@ -105,10 +106,16 @@ pub fn record(exe: &Path, root: &Path, api: ShaderApi, helper_dir: &Path) -> io:
             game.env("TESSERA_D3D12_CAPTURE", &trace);
         } else {
             vulkan_layer(&mut game, helper_dir)?;
-            game.env("TESSERA_VULKAN_COMPUTE_CAPTURE", &trace);
+            game.env("TESSERA_VULKAN_PIPELINE_CAPTURE", &trace);
         }
         let exit = game.status()?;
-        if let Some(mut proxy) = proxy { proxy.finish()?; }
+        if let Some(mut proxy) = proxy {
+            if warm::is_running(exe) {
+                proxy.owned = false;
+                return Err(io::Error::other("a game process is still running after its launcher exited"));
+            }
+            proxy.finish()?;
+        }
         if !trace.is_file() {
             return Err(io::Error::other(format!("the game did not produce a pipeline recording ({exit})")));
         }
@@ -131,7 +138,14 @@ pub fn play_vulkan(exe: &Path, root: &Path, helper_dir: &Path) -> io::Result<Str
         .env("TESSERA_VULKAN_CACHE_INPUT", dir.join("pipeline-cache.bin"))
         .env("TESSERA_VULKAN_TELEMETRY", &output).status()?;
     if !exit.success() {
-        return Err(io::Error::other(format!("game exited before successful cache verification ({exit})")));
+        let feedback = summarize(&output).unwrap_or_else(|_| "No readable cache feedback.".to_owned());
+        return Err(io::Error::other(format!(
+            "game exited before successful cache verification ({exit}). {feedback} No verification saved. Telemetry: {}",
+            output.display()
+        )));
+    }
+    if warm::is_running(exe) {
+        return Err(io::Error::other("a game process is still running after its launcher exited; cache verification was not saved"));
     }
     let summary = summarize(&output)?;
     recording::save_verification(&dir, report, &summary)?;
