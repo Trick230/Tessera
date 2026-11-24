@@ -85,8 +85,9 @@ via `D3D12GetInterface`. In an isolated copy of a game, place
 `TESSERA_D3D12_CAPTURE` to a new output file for the game process. Use
 `tessera.exe --prepare-d3d12-capture <game-exe> <capture>` once the game closes.
 The recorded duration is the time spent in the driver's pipeline creation call.
-The capture excludes pipeline state streams, stream-output declarations and
-ray tracing state objects.
+The x64 helper also replays pipeline state streams, including supported
+mesh, view instancing and stream-output subobjects. Ray tracing state
+objects and legacy graphics stream-output declarations are separate.
 
 Build the Windows Vulkan layer with `-DTESSERA_BUILD_VULKAN_TELEMETRY=ON`
 and the Vulkan SDK headers. For the game process, set `VK_LAYER_PATH` to

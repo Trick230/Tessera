@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "tessera/d3d12_capture_format.h"
+#include "tessera/d3d12_stream.h"
 #include "tessera/shader_store_format.h"
 
 namespace {
@@ -606,6 +607,18 @@ HRESULT replay_graphics(ID3D12Device* device, ID3D12RootSignature* root,
     return device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
 }
 
+HRESULT replay_stream(ID3D12Device* device, ID3D12RootSignature* root, std::vector<uint8_t>& payload) {
+    using namespace tessera::d3d12_capture;
+    Microsoft::WRL::ComPtr<ID3D12Device2> device2;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device2)))) return E_NOINTERFACE;
+    if (!relocate_stream(payload, false, root)) return E_INVALIDARG;
+    StreamHeader header{};
+    std::memcpy(&header, payload.data(), sizeof(header));
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{header.size, payload.data() + sizeof(header)};
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+    return device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+}
+
 int replay_d3d12(const wchar_t* path, bool warp) {
     using namespace tessera::d3d12_capture;
     using Microsoft::WRL::ComPtr;
@@ -627,16 +640,17 @@ int replay_d3d12(const wchar_t* path, bool warp) {
     }
     std::vector<uint8_t> payload, root;
     uint64_t total_bytes = sizeof(header);
-    size_t compute = 0, graphics = 0, failed = 0;
+    size_t prepared[3]{}, failed = 0;
+    const auto completed = [&] { return prepared[0] + prepared[1] + prepared[2] + failed; };
     while (true) {
         Record record{};
         const size_t received = fread(&record, 1, sizeof(record), file.get());
         if (received == 0 && feof(file.get())) break;
         const uint64_t size = sizeof(record) + uint64_t{record.payload_size} + record.root_size;
         const uint32_t max_payload = record.kind == compute_kind ? max_shader_bytes : max_graphics_bytes;
-        if (received != sizeof(record) || record.kind > graphics_kind || !record.payload_size || record.payload_size > max_payload
+        if (received != sizeof(record) || record.kind > stream_kind || !record.payload_size || record.payload_size > max_payload
             || record.root_size > max_root_bytes || total_bytes > max_capture_bytes - size) {
-            fprintf(stderr, "invalid D3D12 capture record after %zu pipelines\n", compute + graphics + failed);
+            fprintf(stderr, "invalid D3D12 capture record after %zu pipelines\n", completed());
             return 1;
         }
         total_bytes += size;
@@ -644,7 +658,7 @@ int replay_d3d12(const wchar_t* path, bool warp) {
         root.resize(record.root_size);
         if (fread(payload.data(), 1, payload.size(), file.get()) != payload.size()
             || (!root.empty() && fread(root.data(), 1, root.size(), file.get()) != root.size())) {
-            fprintf(stderr, "truncated D3D12 capture record after %zu pipelines\n", compute + graphics + failed);
+            fprintf(stderr, "truncated D3D12 capture record after %zu pipelines\n", completed());
             return 1;
         }
         ComPtr<ID3D12RootSignature> signature;
@@ -654,6 +668,8 @@ int replay_d3d12(const wchar_t* path, bool warp) {
         }
         if (SUCCEEDED(hr) && record.kind == graphics_kind) {
             hr = replay_graphics(device.dev.Get(), signature.Get(), record, payload);
+        } else if (SUCCEEDED(hr) && record.kind == stream_kind) {
+            hr = replay_stream(device.dev.Get(), signature.Get(), payload);
         } else if (SUCCEEDED(hr)) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
             desc.pRootSignature = signature.Get();
@@ -664,16 +680,16 @@ int replay_d3d12(const wchar_t* path, bool warp) {
             hr = device.dev->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline));
         }
         if (SUCCEEDED(hr)) {
-            ++(record.kind == compute_kind ? compute : graphics);
+            ++prepared[record.kind];
         } else {
             ++failed;
-            fprintf(stderr, "pipeline %zu: 0x%08lx\n", compute + graphics + failed, static_cast<unsigned long>(hr));
+            fprintf(stderr, "pipeline %zu: 0x%08lx\n", completed(), static_cast<unsigned long>(hr));
             if (device.removed()) break;
         }
     }
-    printf("D3D12 pipelines prepared: %zu compute, %zu graphics, %zu failed%s\n",
-           compute, graphics, failed, warp ? " (WARP)" : "");
-    return failed != 0 || compute + graphics == 0 ? 1 : 0;
+    printf("D3D12 pipelines prepared: %zu compute, %zu graphics, %zu streams, %zu failed%s\n",
+           prepared[0], prepared[1], prepared[2], failed, warp ? " (WARP)" : "");
+    return failed != 0 || completed() == 0 ? 1 : 0;
 }
 
 template<class Device>

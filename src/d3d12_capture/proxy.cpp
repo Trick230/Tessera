@@ -9,6 +9,7 @@
 
 #include "exports_d3d12_gen.h"
 #include "tessera/d3d12_capture_format.h"
+#include "tessera/d3d12_stream.h"
 #include "vtable.h"
 
 extern "C" void* tessera_real[];
@@ -69,11 +70,13 @@ bool capture_enabled() {
 HRESULT STDMETHODCALLTYPE record_root(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
 HRESULT STDMETHODCALLTYPE record_compute(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE record_graphics(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE record_stream(ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE factory_device(ID3D12DeviceFactory*, IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 HRESULT STDMETHODCALLTYPE sdk_factory(ID3D12SDKConfiguration1*, UINT, LPCSTR, REFIID, void**);
 tessera::VtHook root_hook{16, reinterpret_cast<void*>(&record_root)};
 tessera::VtHook compute_hook{11, reinterpret_cast<void*>(&record_compute)};
 tessera::VtHook graphics_hook{10, reinterpret_cast<void*>(&record_graphics)};
+tessera::VtHook stream_hook{47, reinterpret_cast<void*>(&record_stream)};
 tessera::VtHook factory_hook{9, reinterpret_cast<void*>(&factory_device)};
 tessera::VtHook sdk_hook{4, reinterpret_cast<void*>(&sdk_factory)};
 
@@ -202,6 +205,28 @@ HRESULT STDMETHODCALLTYPE record_graphics(ID3D12Device* device, const D3D12_GRAP
     return hr;
 }
 
+HRESULT STDMETHODCALLTYPE record_stream(ID3D12Device2* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                        REFIID iid, void** result) {
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+    const auto start = Clock::now();
+    const HRESULT hr = reinterpret_cast<Fn>(tessera::vt_orig(stream_hook, device))(device, desc, iid, result);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+    if (SUCCEEDED(hr) && desc && result && *result && desc->pPipelineStateSubobjectStream
+        && desc->SizeInBytes <= max_graphics_bytes - sizeof(StreamHeader)) {
+        try {
+            const StreamHeader header{static_cast<uint32_t>(desc->SizeInBytes), 0};
+            std::vector<uint8_t> payload;
+            append_payload(payload, &header, sizeof(header));
+            append_payload(payload, desc->pPipelineStateSubobjectStream, desc->SizeInBytes);
+            ID3D12RootSignature* root = nullptr;
+            if (relocate_stream(payload, true, root))
+                append_pipeline(payload.data(), static_cast<uint32_t>(payload.size()), root, 0,
+                    D3D12_PIPELINE_STATE_FLAG_NONE, stream_kind, elapsed);
+        } catch (...) {}
+    }
+    return hr;
+}
+
 bool arm_capture() {
     if (!capture_enabled()) return false;
     static const bool pinned = [] {
@@ -218,6 +243,11 @@ void hook_device(void* result) {
         && tessera::vt_hook(root_hook, device.Get())) {
         tessera::vt_hook(compute_hook, device.Get());
         tessera::vt_hook(graphics_hook, device.Get());
+    }
+    ComPtr<ID3D12Device2> device2;
+    if (SUCCEEDED(static_cast<IUnknown*>(result)->QueryInterface(IID_PPV_ARGS(&device2)))) {
+        tessera::vt_hook(root_hook, device2.Get());
+        tessera::vt_hook(stream_hook, device2.Get());
     }
 }
 
