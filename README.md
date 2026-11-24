@@ -107,6 +107,13 @@ on a later launch. Tessera supplies this cache only for calls where the
 game provides no cache of its own. The snapshot contains opaque driver
 data. Recreating pipeline descriptors offline requires a separate recording.
 
+Set `TESSERA_VULKAN_COMPUTE_CAPTURE` to a new file to record core compute
+pipelines with their SPIR-V, descriptor set layouts, push constants and
+specialization constants. Run `tessera_vulkan_replay <recording> <new-cache>`
+on the same driver and adapter, then pass that output to
+`TESSERA_VULKAN_CACHE_INPUT`. Graphics pipelines, immutable samplers and
+extension-specific pipeline state have separate descriptor requirements.
+
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 
 **Being measured:** Unreal variants (dynamic resolution off, render targets that only grow, pool limits, shader creation on load, level streaming time limits) in Final Fantasy VII Remake.

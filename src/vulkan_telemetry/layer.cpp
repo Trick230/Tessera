@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "compute_capture.h"
+
 namespace {
 using Clock = std::chrono::steady_clock;
 
@@ -37,6 +39,7 @@ struct Device {
     VkDevice handle{};
     VkPipelineCache cache{};
     bool checkpoint_pending{};
+    std::shared_ptr<tessera::vulkan_recipe::Capture> recipes;
 };
 
 std::mutex dispatch_lock;
@@ -230,6 +233,19 @@ void destroy_cache(VkDevice device, const Device& d) {
     if (d.cache && destroy) destroy(device, d.cache, nullptr);
 }
 
+void create_recipe_capture(const Instance& parent, VkPhysicalDevice physical, Device& d) {
+    const auto path = environment_path(L"TESSERA_VULKAN_COMPUTE_CAPTURE");
+    if (path.empty()) return;
+    const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        parent.get(parent.handle, "vkGetPhysicalDeviceProperties"));
+    if (!get) return;
+    VkPhysicalDeviceProperties properties{};
+    get(physical, &properties);
+    const auto api = parent.api < properties.apiVersion ? parent.api : properties.apiVersion;
+    auto capture = std::make_shared<tessera::vulkan_recipe::Capture>(path, api, properties);
+    if (capture->available()) d.recipes = std::move(capture);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
         const VkAllocationCallbacks* allocator, VkDevice* result) {
     const auto parent = dispatch(instances, physical);
@@ -265,6 +281,7 @@ VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice physical, const Vk
         reinterpret_cast<PFN_vkQueuePresentKHR>(get_device(*result, "vkQueuePresentKHR")),
         feedback, *result};
     try { create_cache(parent, physical, *result, device); } catch (...) {}
+    try { create_recipe_capture(parent, physical, device); } catch (...) {}
     try {
         const std::lock_guard lock(dispatch_lock);
         devices.emplace(dispatch_key(*result), device);
@@ -354,7 +371,73 @@ VKAPI_ATTR VkResult VKAPI_CALL graphics_pipelines(VkDevice device, VkPipelineCac
 VKAPI_ATTR VkResult VKAPI_CALL compute_pipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
         const VkComputePipelineCreateInfo* info, const VkAllocationCallbacks* allocator, VkPipeline* results) {
     const auto d = dispatch(devices, device);
-    return measure("compute", d, d.compute, device, cache, count, info, allocator, results);
+    const auto status = measure("compute", d, d.compute, device, cache, count, info, allocator, results);
+    if (d.recipes && d.compute) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!results[i]) continue;
+            try { d.recipes->pipeline(info[i]); } catch (...) {}
+        }
+    }
+    return status;
+}
+
+template<class Function, class Info, class Handle, class Method>
+VkResult capture_create(VkDevice device, const Info* info, const VkAllocationCallbacks* allocator,
+                        Handle* result, const char* name, Method record) {
+    const auto d = dispatch(devices, device);
+    if (!d.get) return VK_ERROR_INITIALIZATION_FAILED;
+    const auto call = reinterpret_cast<Function>(d.get(device, name));
+    if (!call) return VK_ERROR_INITIALIZATION_FAILED;
+    const auto status = call(device, info, allocator, result);
+    if (status == VK_SUCCESS && d.recipes) {
+        try { ((*d.recipes).*record)(*result, *info); } catch (...) {}
+    }
+    return status;
+}
+
+template<class Function, class Handle, class Method>
+void capture_destroy(VkDevice device, Handle handle, const VkAllocationCallbacks* allocator,
+                     const char* name, Method remove) {
+    const auto d = dispatch(devices, device);
+    if (!d.get) return;
+    const auto call = reinterpret_cast<Function>(d.get(device, name));
+    if (d.recipes && handle) ((*d.recipes).*remove)(handle);
+    if (call) call(device, handle, allocator);
+}
+
+using RecipeCapture = tessera::vulkan_recipe::Capture;
+VKAPI_ATTR VkResult VKAPI_CALL shader_module(VkDevice device, const VkShaderModuleCreateInfo* info,
+        const VkAllocationCallbacks* allocator, VkShaderModule* result) {
+    return capture_create<PFN_vkCreateShaderModule>(device, info, allocator, result,
+        "vkCreateShaderModule", &RecipeCapture::shader);
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_shader_module(VkDevice device, VkShaderModule module, const VkAllocationCallbacks* allocator) {
+    capture_destroy<PFN_vkDestroyShaderModule>(device, module, allocator, "vkDestroyShaderModule", &RecipeCapture::remove_shader);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL descriptor_layout(VkDevice device, const VkDescriptorSetLayoutCreateInfo* info,
+        const VkAllocationCallbacks* allocator, VkDescriptorSetLayout* result) {
+    return capture_create<PFN_vkCreateDescriptorSetLayout>(device, info, allocator, result,
+        "vkCreateDescriptorSetLayout", &RecipeCapture::descriptor_set);
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_descriptor_layout(VkDevice device, VkDescriptorSetLayout layout,
+        const VkAllocationCallbacks* allocator) {
+    capture_destroy<PFN_vkDestroyDescriptorSetLayout>(device, layout, allocator, "vkDestroyDescriptorSetLayout",
+        &RecipeCapture::remove_set);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pipeline_layout(VkDevice device, const VkPipelineLayoutCreateInfo* info,
+        const VkAllocationCallbacks* allocator, VkPipelineLayout* result) {
+    return capture_create<PFN_vkCreatePipelineLayout>(device, info, allocator, result,
+        "vkCreatePipelineLayout", &RecipeCapture::pipeline_layout);
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_pipeline_layout(VkDevice device, VkPipelineLayout layout,
+        const VkAllocationCallbacks* allocator) {
+    capture_destroy<PFN_vkDestroyPipelineLayout>(device, layout, allocator, "vkDestroyPipelineLayout",
+        &RecipeCapture::remove_layout);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL present(VkQueue queue, const VkPresentInfoKHR* info) {
@@ -384,6 +467,12 @@ PFN_vkVoidFunction device_intercept(const char* name) {
     if (strcmp(name, "vkDestroyDevice") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_device);
     if (strcmp(name, "vkCreateGraphicsPipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(graphics_pipelines);
     if (strcmp(name, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(compute_pipelines);
+    if (strcmp(name, "vkCreateShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(shader_module);
+    if (strcmp(name, "vkDestroyShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_shader_module);
+    if (strcmp(name, "vkCreateDescriptorSetLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(descriptor_layout);
+    if (strcmp(name, "vkDestroyDescriptorSetLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_descriptor_layout);
+    if (strcmp(name, "vkCreatePipelineLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pipeline_layout);
+    if (strcmp(name, "vkDestroyPipelineLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_pipeline_layout);
     if (strcmp(name, "vkQueuePresentKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(present);
     return nullptr;
 }
