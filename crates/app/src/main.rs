@@ -461,7 +461,6 @@ fn shader_state(
     run: Option<(u64, u64)>,
     can_prepare: bool,
     api: ShaderApi,
-    recording: bool,
     native_precompile: bool,
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<&tessera_core::driver::NvidiaGameCache>,
@@ -479,10 +478,7 @@ fn shader_state(
     };
     let mut rows = Vec::new();
     let scan_only = api != ShaderApi::D3d11;
-    if recording {
-        rows.push(line("Pipeline recording", "Linked".into(), Vec::new(), OK));
-    }
-    if native_precompile && !recording {
+    if native_precompile {
         rows.push(line("Game precompiler", "Available".into(), vec![
             "Prepare shaders runs the game's offline precompiler.".into(),
         ], NEUTRAL));
@@ -499,7 +495,6 @@ fn shader_state(
                 let source = match source {
                     PakKeySource::Environment => "Environment variable",
                     PakKeySource::LinkedFile => "Linked file",
-                    PakKeySource::ScsKiller => "Key file detected automatically.",
                 };
                 ("Available", source, OK)
             }
@@ -671,7 +666,7 @@ fn shader_state(
     }
     rows.push(line("Out of date", value.to_string(), d, tone));
 
-    ShaderState { present: true, recording, native_precompile, rows: ModelRc::new(VecModel::from(rows)) }
+    ShaderState { present: true, native_precompile, rows: ModelRc::new(VecModel::from(rows)) }
 }
 
 const FPS_CHOICES: [u32; 9] = [0, 30, 40, 60, 90, 120, 144, 165, 240];
@@ -764,7 +759,6 @@ struct GameView {
     run: Option<(u64, u64)>,
     facts: Option<advanced::Facts>,
     shader_checks: Option<[ShaderCheck; 4]>,
-    pipeline_recordings: [bool; 4],
     native_precompilers: [bool; 4],
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<tessera_core::driver::NvidiaGameCache>,
@@ -789,7 +783,6 @@ impl GameView {
         Self {
             session, budget, run, facts,
             shader_checks: Some(ShaderApi::SELECTABLE.map(|api| shader_check::check_for(exe, api, key.as_deref(), &drivers))),
-            pipeline_recordings: ShaderApi::SELECTABLE.map(|api| pipeline_warm::recording(exe, api).is_some()),
             native_precompilers: ShaderApi::SELECTABLE.map(|api| pipeline_warm::NativePrecompiler::detect(exe, api).is_some()),
             pak_key: is_unreal(game).then(|| tessera_core::scan::unreal_key_status(exe)),
             disk_cache: tessera_core::driver::nvidia_game_cache(exe),
@@ -819,7 +812,7 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
     let shaders = view.shader_checks.as_ref().map_or_else(ShaderStates::default, |checks| {
         let render = |i: usize| {
             shader_state(&checks[i], view.run, can_prepare(game), ShaderApi::SELECTABLE[i],
-                view.pipeline_recordings[i], view.native_precompilers[i],
+                view.native_precompilers[i],
                 view.pak_key, view.disk_cache.as_ref())
         };
         let [d3d11, d3d12, vulkan, opengl] = std::array::from_fn(render);
@@ -1034,9 +1027,8 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
     }) else {
         return;
     };
-    let recording = pipeline_warm::recording(&exe, scope);
-    let native = pipeline_warm::NativePrecompiler::detect(&exe, scope).filter(|_| recording.is_none());
-    let prepare = matches!(scope, ShaderApi::D3d11 | ShaderApi::D3d12) || recording.is_some() || native.is_some();
+    let native = pipeline_warm::NativePrecompiler::detect(&exe, scope);
+    let prepare = matches!(scope, ShaderApi::D3d11 | ShaderApi::D3d12) || native.is_some();
     ui.set_busy(true);
     ui.set_shader_progress_active(true);
     ui.set_shader_progress(-1.0);
@@ -1078,13 +1070,6 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
             }
         } else if scope != ShaderApi::D3d11 && scan_error.is_some() {
             format!("{api} shader scan failed ({}).", scan_error.unwrap())
-        } else if let Some(capture) = recording {
-            status("Preparing recorded pipelines (outside the game)…");
-            match pipeline_warm::run(&exe, scope, &capture) {
-                Ok(stats) => format!("{api} pipelines: {} of {} prepared, {} failed ({:.1} s).",
-                    stats.prepared, stats.total, stats.failed, t0.elapsed().as_secs_f64()),
-                Err(e) => format!("{api} preparation failed ({e})."),
-            }
         } else {
             status("Warming shaders (outside the game)…");
             let helper = if architecture == Some(Architecture::X86) {
@@ -1146,31 +1131,6 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
             }
         });
     });
-}
-
-fn link_pipelines_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString) {
-    if ui.get_busy() {
-        return;
-    }
-    let (scope, ext) = match api.as_str() {
-        "D3D12" => (ShaderApi::D3d12, "db"),
-        "Vulkan" => (ShaderApi::Vulkan, "foz"),
-        _ => return,
-    };
-    let exe = {
-        let st = state.lock().unwrap();
-        st.view.get(view_idx as usize).and_then(|&gi| st.games[gi].exe.clone())
-    };
-    let Some(exe) = exe else { return };
-    let Some(path) = rfd::FileDialog::new().set_title("Link pipeline recording")
-        .add_filter("Pipeline recording", &[ext]).pick_file() else { return };
-    match pipeline_warm::link(&exe, scope, &path) {
-        Ok(()) => {
-            let mut st = state.lock().unwrap();
-            request_view(ui, state, &mut st, view_idx, true);
-        }
-        Err(e) => ui.set_status_text(format!("Could not link pipeline recording ({e}).").into()),
-    }
 }
 
 fn clear_shader_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
@@ -1357,21 +1317,6 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         }
     }
-    if args.len() == 4 && args[0] == "--prepare-recording" {
-        let result = ShaderApi::SELECTABLE.into_iter().find(|api| api.slug() == args[2])
-            .ok_or_else(|| std::io::Error::other("unknown shader API"))
-            .and_then(|api| pipeline_warm::run(Path::new(&args[1]), api, Path::new(&args[3])));
-        match result {
-            Ok(stats) => {
-                println!("{} prepared, {} failed, {} total", stats.prepared, stats.failed, stats.total);
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        }
-    }
     if matches!(args.len(), 3 | 4) && args[0] == "--scan" {
         std::process::exit(scan_child(&args[1..]));
     }
@@ -1495,10 +1440,6 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_warm_shaders(move |i, api| warm_action(&w.unwrap(), &s, i, api));
-    }
-    {
-        let (w, s) = (ui.as_weak(), state.clone());
-        ui.on_link_pipelines(move |i, api| link_pipelines_action(&w.unwrap(), &s, i, api));
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());

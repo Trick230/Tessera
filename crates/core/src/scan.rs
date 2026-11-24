@@ -1142,7 +1142,6 @@ fn unreal_key_reference(exe: &Path) -> Option<PathBuf> {
 pub enum PakKeySource {
     Environment,
     LinkedFile,
-    ScsKiller,
 }
 
 fn unreal_key_file(exe: &Path) -> Option<(PathBuf, PakKeySource)> {
@@ -1154,12 +1153,7 @@ fn unreal_key_file(exe: &Path) -> Option<(PathBuf, PakKeySource)> {
             return Some((path.into(), PakKeySource::LinkedFile));
         }
     }
-    if !exe.file_name()?.eq_ignore_ascii_case("ff7remake_.exe") {
-        return None;
-    }
-    let path = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
-        .join("SCSKiller/games/steam_1462040/aes.key");
-    path.is_file().then_some((path, PakKeySource::ScsKiller))
+    None
 }
 
 pub fn unreal_key_status(exe: &Path) -> Option<(PakKeySource, bool)> {

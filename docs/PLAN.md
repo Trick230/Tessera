@@ -63,7 +63,7 @@ Stack: the layer and the GPU tools are C++20 (CMake, VS 2022). The preparation a
 
 - D3D11 → `d3d11.dll` proxy (or `dxgi.dll`). D3D12 → `d3d12.dll` proxy (a `dxgi.dll` only sees the device through
   the swapchain and may miss resources created earlier).
-- If a DLL with the same name already exists (ReShade, DXVK, Special K, OptiScaler, SCSKiller's recorder):
+- If a DLL with the same name already exists (ReShade, DXVK, Special K, OptiScaler):
   rename it to `<name>.next.dll` and load it as the next layer (`next=` in `tessera.ini`).
   Uninstalling restores the original name.
 - Patch the vtables of the **real implementation** (obtained when the proxy creates the device), not of wrappers
@@ -117,9 +117,7 @@ Format: **realistic** (first version) → **potential** (full version).
 
 ### Shaders (S) — goal: full coverage without the player having to record
 
-Fact measured by SCSKiller: on NVIDIA in D3D12, the driver cache is per **stage** and depends only on the shaders and
-the root signature bytes (synthesised state hits; exception: view instancing). So on NVIDIA the problem
-is "all shaders + the right root signature", not an explosion of combinations.
+Measure cache reuse per shader stage and pipeline on the tested GPU and driver. Verify which root signature and render state changes require compilation.
 
 - **S1 Exhaustive bytecode search** — every file of the install, including the exe and DLLs;
   try zlib, zstd, LZ4, Oodle, Brotli on compressed blocks; validate DXBC/DXIL containers. Encrypted
@@ -128,7 +126,7 @@ is "all shaders + the right root signature", not an explosion of combinations.
   with full PSO descriptions recorded by the developers. Tessera's own format aligned with
   **SODB** (Advanced Shader Delivery, SQLite, public Microsoft specification).
 - **S3 Root signatures** — embedded (RTS0) → exact; serialised blobs in files/exe; per-engine rules
-  (SCSKiller has rules for UE 4.20–5.7); **automatic capture at startup**: the app launches the game up to the
+  **automatic capture at startup**: the app launches the game up to the
   menu, the DLL records root signatures and global PSOs, the app closes it. Bindless engines have few root
   signatures → cross them with every shader.
 - **S4 Valid pipelines** — NVIDIA: each stage in any valid pipeline (pair by signatures,
@@ -269,8 +267,6 @@ were built side by side. Everything below is on `master`.
 The D3D11 preparation reads Unreal PAK v4 package entries and looks for inline bytecode.
 For encrypted archives, use **Choose PAK key file** in the game's **Shaders** tab and select an existing file containing a 256-bit hexadecimal key. Tessera saves the path to that file locally and reads the key during the scan. The game archives are opened read-only.
 
-The length-prefixed zlib layout follows the legacy reader in SCSKiller's [InlineShaders.cs](https://github.com/BlueHeisenberg/SCSKiller/blob/05205ef1f6c3914b1f1245d133ebc710e2d30b52/src/SCSKiller.Core/Unreal/InlineShaders.cs).
-
 ### Phase 4 — preview in D3D11
 
 These settings are off by default. Use the app's Textures tab for streaming options and Settings for
@@ -325,8 +321,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_quality.ps1
 
 - Real cost of `UpdateTileMappings` and of sampling tiled resources on each driver.
 - Cost of shader instrumentation (target: a few %).
-- D3D11 on AMD: can it be warmed by recording full state combinations? (SCSKiller only warms
-  D3D11 on NVIDIA.)
+- D3D11 on AMD: can it be warmed by recording full state combinations?
 - Acceptance of modified DXIL (re-signing with `dxil.dll`).
 - Share of tileable textures in real D3D11 games.
 - How much of the UE4 streaming pool is off screen in FF7 Remake's sewers.
@@ -337,10 +332,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_quality.ps1
 
 ## 7. References
 
-- **SCSKiller** (GPL-3.0-or-later, reusable): https://github.com/BlueHeisenberg/SCSKiller —
-  read `ARCHITECTURE.md`. Copy: hash-only plans, warming with a copy of the exe, measured behaviour
-  (`selftest`), recorder with an inbox and a size cap, device-removed recovery,
-  driver update detection, read-only on anti-cheat games.
 - **CUE4Parse** (Unreal pak/IoStore reader, C# — port the logic), **ree-pak-rs** (RE Engine).
 - **Advanced Shader Delivery / SODB**: https://microsoft.github.io/DirectX-Specs/d3d/StateObjectDatabase.html
 - **Unreal bundled PSO caches**: Epic's documentation on `.upipelinecache` / `.spc` / `.shk`.
