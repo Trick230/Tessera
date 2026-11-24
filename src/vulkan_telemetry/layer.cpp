@@ -414,6 +414,15 @@ void capture_destroy(VkDevice device, Handle handle, const VkAllocationCallbacks
 }
 
 using RecipeCapture = tessera::vulkan_recipe::Capture;
+VKAPI_ATTR VkResult VKAPI_CALL sampler(VkDevice device, const VkSamplerCreateInfo* info,
+        const VkAllocationCallbacks* allocator, VkSampler* result) {
+    return capture_create<PFN_vkCreateSampler>(device, info, allocator, result, "vkCreateSampler", &RecipeCapture::sampler);
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_sampler(VkDevice device, VkSampler handle, const VkAllocationCallbacks* allocator) {
+    capture_destroy<PFN_vkDestroySampler>(device, handle, allocator, "vkDestroySampler", &RecipeCapture::remove_sampler);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL shader_module(VkDevice device, const VkShaderModuleCreateInfo* info,
         const VkAllocationCallbacks* allocator, VkShaderModule* result) {
     return capture_create<PFN_vkCreateShaderModule>(device, info, allocator, result,
@@ -474,6 +483,8 @@ PFN_vkVoidFunction device_intercept(const char* name) {
     if (strcmp(name, "vkCreateGraphicsPipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(graphics_pipelines);
     if (strcmp(name, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(compute_pipelines);
     if (strcmp(name, "vkCreateShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(shader_module);
+    if (strcmp(name, "vkCreateSampler") == 0) return reinterpret_cast<PFN_vkVoidFunction>(sampler);
+    if (strcmp(name, "vkDestroySampler") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_sampler);
     if (strcmp(name, "vkDestroyShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_shader_module);
     if (strcmp(name, "vkCreateDescriptorSetLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(descriptor_layout);
     if (strcmp(name, "vkDestroyDescriptorSetLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroy_descriptor_layout);

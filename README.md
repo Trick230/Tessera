@@ -112,10 +112,12 @@ data. Recreating pipeline descriptors offline requires a separate recording.
 
 Set `TESSERA_VULKAN_COMPUTE_CAPTURE` to a new file to record core compute
 pipelines with their SPIR-V, descriptor set layouts, push constants and
-specialization constants. Run `tessera_vulkan_replay <recording> <new-cache>`
+specialization constants. Vulkan 1.2 recordings can include descriptor
+binding flags and core immutable samplers. Run
+`tessera_vulkan_replay <recording> <new-cache>`
 on the same driver and adapter, then pass that output to
-`TESSERA_VULKAN_CACHE_INPUT`. Graphics pipelines, immutable samplers and
-extension-specific pipeline state have separate descriptor requirements.
+`TESSERA_VULKAN_CACHE_INPUT`. Graphics pipelines and extension-specific
+sampler and pipeline state have separate descriptor requirements.
 
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 

@@ -3,6 +3,7 @@
 
 #include "compute_recipe.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 
@@ -16,6 +17,7 @@ struct Context {
     VkPipelineCache cache{};
     PFN_vkGetInstanceProcAddr get_instance{};
     PFN_vkGetDeviceProcAddr get_device{};
+    bool descriptor_indexing{};
 
     ~Context() {
         if (cache) fn<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(device, cache, nullptr);
@@ -80,7 +82,18 @@ struct Context {
         const VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, index, 1, &priority};
         VkPhysicalDeviceFeatures available{};
         features(physical, &available);
-        const VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, nullptr, 0, 1, &queue, 0,
+        VkPhysicalDeviceDescriptorIndexingFeatures indexing{};
+        indexing.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+        const auto features2 = instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2");
+        descriptor_indexing = header.api >= VK_API_VERSION_1_2 && features2;
+        if (descriptor_indexing) {
+            VkPhysicalDeviceFeatures2 query{};
+            query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            query.pNext = &indexing;
+            features2(physical, &query);
+        }
+        const VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            descriptor_indexing ? &indexing : nullptr, 0, 1, &queue, 0,
             nullptr, 0, nullptr, &available};
         const VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, 0, nullptr};
         return make_device(physical, &info, nullptr, &device) == VK_SUCCESS
@@ -91,6 +104,7 @@ struct Context {
 struct PipelineObjects {
     const Context& context;
     std::vector<VkDescriptorSetLayout> sets;
+    std::vector<std::pair<Sampler, VkSampler>> samplers;
     VkPipelineLayout layout{};
     VkShaderModule shader{};
     VkPipeline pipeline{};
@@ -102,18 +116,55 @@ struct PipelineObjects {
         if (layout) context.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device, layout, nullptr);
         const auto destroy = context.fn<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout");
         for (const auto set : sets) if (set) destroy(device, set, nullptr);
+        const auto destroy_sampler = context.fn<PFN_vkDestroySampler>("vkDestroySampler");
+        for (const auto& entry : samplers) destroy_sampler(device, entry.second, nullptr);
+    }
+
+    VkResult sampler(const Sampler& desc, VkSampler& handle) {
+        const auto found = std::find_if(samplers.begin(), samplers.end(), [&](const auto& item) {
+            return std::memcmp(&item.first, &desc, sizeof(desc)) == 0;
+        });
+        if (found != samplers.end()) { handle = found->second; return VK_SUCCESS; }
+        const auto info = desc.info();
+        const auto status = context.fn<PFN_vkCreateSampler>("vkCreateSampler")(context.device, &info, nullptr, &handle);
+        if (status == VK_SUCCESS) {
+            try { samplers.emplace_back(desc, handle); }
+            catch (...) {
+                context.fn<PFN_vkDestroySampler>("vkDestroySampler")(context.device, handle, nullptr);
+                throw;
+            }
+        }
+        return status;
     }
 };
 
 VkResult replay(const Context& context, const Recipe& recipe) {
-    PipelineObjects objects{context, std::vector<VkDescriptorSetLayout>(recipe.layout.sets.size())};
+    PipelineObjects objects{context, std::vector<VkDescriptorSetLayout>(recipe.layout.sets.size()), {}};
     const auto make_set = context.fn<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout");
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     for (size_t i = 0; i < objects.sets.size(); ++i) {
+        const auto& set = recipe.layout.sets[i];
         bindings.clear();
-        for (const auto& b : recipe.layout.sets[i]) bindings.push_back({b.number, b.type, b.count, b.stages, nullptr});
-        const VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr,
-            0, static_cast<uint32_t>(bindings.size()), bindings.data()};
+        std::vector<VkDescriptorBindingFlags> flags;
+        std::vector<std::vector<VkSampler>> immutable(set.bindings.size());
+        for (size_t index = 0; index < set.bindings.size(); ++index) {
+            const auto& binding = set.bindings[index];
+            const auto& b = binding.state;
+            auto& handles = immutable[index];
+            handles.resize(binding.immutable.size());
+            for (size_t j = 0; j < handles.size(); ++j) {
+                const auto status = objects.sampler(binding.immutable[j], handles[j]);
+                if (status != VK_SUCCESS) return status;
+            }
+            bindings.push_back({b.number, b.type, b.count, b.stages, handles.empty() ? nullptr : handles.data()});
+            flags.push_back(binding.flags);
+        }
+        const bool has_flags = std::any_of(flags.begin(), flags.end(), [](auto flag) { return flag != 0; });
+        if (has_flags && !context.descriptor_indexing) return VK_ERROR_FEATURE_NOT_PRESENT;
+        const VkDescriptorSetLayoutBindingFlagsCreateInfo indexing{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+            nullptr, static_cast<uint32_t>(flags.size()), flags.data()};
+        const VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            has_flags ? &indexing : nullptr, set.flags, static_cast<uint32_t>(bindings.size()), bindings.data()};
         const auto status = make_set(context.device, &info, nullptr, &objects.sets[i]);
         if (status != VK_SUCCESS) return status;
     }
@@ -164,7 +215,9 @@ int run(const wchar_t* recording, const wchar_t* output) {
     }
     const std::unique_ptr<FILE, decltype(&fclose)> guard(file, fclose);
     Header header{};
-    if (fread(&header, 1, sizeof(header), file) != sizeof(header) || std::memcmp(header.tag, magic, sizeof(magic))
+    const auto header_size = fread(&header, 1, sizeof(header), file);
+    const bool legacy = std::memcmp(header.tag, legacy_magic, sizeof(legacy_magic)) == 0;
+    if (header_size != sizeof(header) || (!legacy && std::memcmp(header.tag, magic, sizeof(magic)))
         || VK_API_VERSION_VARIANT(header.api) || VK_API_VERSION_MAJOR(header.api) != 1) {
         fprintf(stderr, "invalid Vulkan recording header\n");
         return 1;
@@ -187,7 +240,7 @@ int run(const wchar_t* recording, const wchar_t* output) {
         total += size + sizeof(size);
         packet.resize(size);
         Recipe recipe;
-        if (fread(packet.data(), 1, size, file) != size || !decode(packet, recipe)) {
+        if (fread(packet.data(), 1, size, file) != size || !decode(packet, recipe, legacy)) {
             fprintf(stderr, "invalid Vulkan recipe after %zu pipelines\n", prepared + failed);
             return 1;
         }

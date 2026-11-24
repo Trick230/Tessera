@@ -50,26 +50,58 @@ public:
     }
 
     void descriptor_set(VkDescriptorSetLayout set, const VkDescriptorSetLayoutCreateInfo& info) {
-        if (info.flags || info.pNext || info.bindingCount > binding_limit) return;
-        std::vector<Binding> bindings;
-        bindings.reserve(info.bindingCount);
+        if (info.flags & ~VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT || info.bindingCount > binding_limit)
+            return;
+        const VkDescriptorBindingFlags* flags = nullptr;
+        if (info.pNext) {
+            const auto* indexing = static_cast<const VkDescriptorSetLayoutBindingFlagsCreateInfo*>(info.pNext);
+            if (indexing->sType != VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO || indexing->pNext
+                || (indexing->bindingCount && indexing->bindingCount != info.bindingCount))
+                return;
+            if (indexing->bindingCount) flags = indexing->pBindingFlags;
+        }
+        DescriptorSet recorded{info.flags, {}};
+        recorded.bindings.reserve(info.bindingCount);
+        const std::lock_guard guard(lock_);
+        size_t sampler_count = 0;
         for (uint32_t i = 0; i < info.bindingCount; ++i) {
             const auto& b = info.pBindings[i];
-            if (b.pImmutableSamplers || !b.descriptorCount || b.descriptorType < VK_DESCRIPTOR_TYPE_SAMPLER
+            if (!b.descriptorCount || b.descriptorType < VK_DESCRIPTOR_TYPE_SAMPLER
                 || b.descriptorType > VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) return;
-            bindings.push_back({b.binding, b.descriptorType, b.descriptorCount, b.stageFlags});
+            DescriptorBinding binding{{b.binding, b.descriptorType, b.descriptorCount, b.stageFlags}, flags ? flags[i] : 0, {}};
+            if (b.pImmutableSamplers && (b.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER
+                || b.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)) {
+                if (b.descriptorCount > binding_limit - sampler_count) return;
+                sampler_count += b.descriptorCount;
+                for (uint32_t index = 0; index < b.descriptorCount; ++index) {
+                    const auto found = samplers_.find(b.pImmutableSamplers[index]);
+                    if (found == samplers_.end()) return;
+                    binding.immutable.push_back(found->second);
+                }
+            }
+            recorded.bindings.push_back(std::move(binding));
         }
-        const std::lock_guard guard(lock_);
-        const size_t size = bindings.size() * sizeof(Binding);
+        const size_t size = recorded.size();
         if (sets_.size() < 4096 && size <= layout_limit_ - tracked_layouts_
-            && sets_.try_emplace(set, std::move(bindings)).second) tracked_layouts_ += size;
+            && sets_.try_emplace(set, std::move(recorded)).second) tracked_layouts_ += size;
+    }
+
+    void sampler(VkSampler handle, const VkSamplerCreateInfo& info) {
+        if (info.pNext || info.flags) return;
+        const std::lock_guard guard(lock_);
+        if (samplers_.size() < 4096) samplers_.try_emplace(handle, info);
+    }
+
+    void remove_sampler(VkSampler handle) {
+        const std::lock_guard guard(lock_);
+        samplers_.erase(handle);
     }
 
     void remove_set(VkDescriptorSetLayout set) {
         const std::lock_guard guard(lock_);
         const auto it = sets_.find(set);
         if (it == sets_.end()) return;
-        tracked_layouts_ -= it->second.size() * sizeof(Binding);
+        tracked_layouts_ -= it->second.size();
         sets_.erase(it);
     }
 
@@ -84,7 +116,7 @@ public:
         for (uint32_t i = 0; i < info.setLayoutCount; ++i) {
             const auto it = sets_.find(info.pSetLayouts[i]);
             if (it == sets_.end()) return;
-            size += it->second.size() * sizeof(Binding);
+            size += it->second.size();
             if (size > layout_limit_ - tracked_layouts_) return;
             layout.sets.push_back(it->second);
         }
@@ -99,7 +131,7 @@ public:
         const auto it = layouts_.find(layout);
         if (it == layouts_.end()) return;
         tracked_layouts_ -= it->second.push.size() * sizeof(VkPushConstantRange);
-        for (const auto& set : it->second.sets) tracked_layouts_ -= set.size() * sizeof(Binding);
+        for (const auto& set : it->second.sets) tracked_layouts_ -= set.size();
         layouts_.erase(it);
     }
 
@@ -157,7 +189,8 @@ private:
     size_t tracked_layouts_{};
     static constexpr size_t layout_limit_ = 64 * 1024 * 1024;
     std::unordered_map<VkShaderModule, std::vector<uint32_t>> modules_;
-    std::unordered_map<VkDescriptorSetLayout, std::vector<Binding>> sets_;
+    std::unordered_map<VkSampler, Sampler> samplers_;
+    std::unordered_map<VkDescriptorSetLayout, DescriptorSet> sets_;
     std::unordered_map<VkPipelineLayout, Layout> layouts_;
 };
 }  // namespace tessera::vulkan_recipe
