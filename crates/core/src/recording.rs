@@ -253,8 +253,10 @@ pub fn prepare(exe: &Path, api: ShaderApi, helper_dir: &Path) -> io::Result<Stri
         }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
         let temporary = dir.join(format!("replay-{}-{now}.bin", std::process::id()));
+        let environment_key = xxh3_128(scope.to_string().as_bytes());
+        let checkpoint = dir.join(format!("resume-{}-{environment_key:032x}.bin", active.key));
         let output = Command::new(helper).creation_flags(0x0800_0000)
-            .arg(&active.file).arg(&temporary).output();
+            .arg(&active.file).arg(&temporary).arg("--checkpoint").arg(checkpoint).output();
         output.and_then(|output| {
             if !output.status.success() {
                 return Err(io::Error::other(String::from_utf8_lossy(&output.stderr).trim().to_owned()));

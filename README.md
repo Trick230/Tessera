@@ -132,6 +132,10 @@ reports the application's cache hits after the game closes.
 An unsuccessful game exit keeps the telemetry but does not save a successful
 verification. Cache feedback confirms pipeline reuse; gameplay frame-time
 measurements are still needed to establish a stutter reduction.
+Vulkan preparation saves periodic checkpoints scoped to the recording, game,
+driver and supported configuration files. Retrying an interrupted preparation
+recreates the descriptors with that cache as input; only a complete replay
+promotes the result to the prepared cache.
 
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 

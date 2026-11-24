@@ -10,6 +10,31 @@
 namespace {
 using namespace tessera::vulkan_recipe;
 
+bool same_path(const wchar_t* first, const wchar_t* second) {
+    wchar_t a[32768], b[32768];
+    const auto na = GetFullPathNameW(first, _countof(a), a, nullptr);
+    const auto nb = GetFullPathNameW(second, _countof(b), b, nullptr);
+    return !na || !nb || na >= _countof(a) || nb >= _countof(b) || !_wcsicmp(a, b);
+}
+
+std::vector<uint8_t> read_checkpoint(const wchar_t* path, const Header& header) {
+    if (!path) return {};
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path, L"rb") || !file) return {};
+    const std::unique_ptr<FILE, decltype(&fclose)> guard(file, fclose);
+    if (_fseeki64(file, 0, SEEK_END)) return {};
+    const auto size = _ftelli64(file);
+    if (size < sizeof(VkPipelineCacheHeaderVersionOne) || size > file_limit || _fseeki64(file, 0, SEEK_SET)) return {};
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    if (fread(bytes.data(), 1, bytes.size(), file) != bytes.size()) return {};
+    VkPipelineCacheHeaderVersionOne cache{};
+    std::memcpy(&cache, bytes.data(), sizeof(cache));
+    if (cache.headerSize != sizeof(cache) || cache.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE
+        || cache.vendorID != header.vendor || cache.deviceID != header.device
+        || std::memcmp(cache.pipelineCacheUUID, header.cache_uuid, VK_UUID_SIZE)) return {};
+    return bytes;
+}
+
 struct Context {
     HMODULE loader{};
     VkInstance instance{};
@@ -33,7 +58,7 @@ struct Context {
     template<class T>
     T fn(const char* name) const { return reinterpret_cast<T>(get_device(device, name)); }
 
-    bool initialize(const Header& header) {
+    bool initialize(const Header& header, const wchar_t* checkpoint) {
         loader = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!loader) return false;
         get_instance = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(loader, "vkGetInstanceProcAddr"));
@@ -104,7 +129,9 @@ struct Context {
         const VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             descriptor_indexing ? &features11 : nullptr, 0, 1, &queue, 0,
             nullptr, 0, nullptr, &available};
-        const VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, 0, nullptr};
+        const auto seed = read_checkpoint(checkpoint, header);
+        const VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0,
+            seed.size(), seed.empty() ? nullptr : seed.data()};
         return make_device(physical, &info, nullptr, &device) == VK_SUCCESS
             && fn<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(device, &cache_info, nullptr, &cache) == VK_SUCCESS;
     }
@@ -239,7 +266,7 @@ VkResult replay_graphics(const Context& context, std::vector<uint8_t>& bytes) {
         context.device, context.cache, 1, &wire.pipeline, nullptr, &objects.pipeline);
 }
 
-bool save_cache(const Context& context, const wchar_t* filename) {
+bool save_cache(const Context& context, const wchar_t* filename, bool replace = false) {
     const auto read = context.fn<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     size_t size = 0;
     if (read(context.device, context.cache, &size, nullptr) != VK_SUCCESS
@@ -247,15 +274,17 @@ bool save_cache(const Context& context, const wchar_t* filename) {
     std::vector<char> cache(size);
     if (read(context.device, context.cache, &size, cache.data()) != VK_SUCCESS) return false;
     const std::wstring temporary = std::wstring(filename) + L".tmp";
-    const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
+        replace ? CREATE_ALWAYS : CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
     const bool complete = WriteFile(file, cache.data(), static_cast<DWORD>(size), &written, nullptr) && written == size;
     CloseHandle(file);
-    return complete && MoveFileExW(temporary.c_str(), filename, MOVEFILE_WRITE_THROUGH);
+    return complete && MoveFileExW(temporary.c_str(), filename,
+        MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0));
 }
 
-int run(const wchar_t* recording, const wchar_t* output) {
+int run(const wchar_t* recording, const wchar_t* output, const wchar_t* checkpoint = nullptr) {
     FILE* file = nullptr;
     if (_wfopen_s(&file, recording, L"rb") != 0 || !file) {
         fprintf(stderr, "cannot open Vulkan recording\n");
@@ -272,7 +301,7 @@ int run(const wchar_t* recording, const wchar_t* output) {
         return 1;
     }
     Context context;
-    if (!context.initialize(header)) {
+    if (!context.initialize(header, checkpoint)) {
         fprintf(stderr, "cannot create a compatible Vulkan device or pipeline cache\n");
         return 1;
     }
@@ -309,7 +338,14 @@ int run(const wchar_t* recording, const wchar_t* output) {
         } else if (kind == graphics_packet) {
             result = replay_graphics(context, packet);
         }
-        if (result == VK_SUCCESS) ++prepared[kind];
+        if (result == VK_SUCCESS) {
+            ++prepared[kind];
+            if (checkpoint && (attempted() == 1 || attempted() % 32 == 0)
+                && !save_cache(context, checkpoint, true)) {
+                fprintf(stderr, "cannot save Vulkan replay checkpoint\n");
+                return 1;
+            }
+        }
         else {
             ++failed;
             fprintf(stderr, "Vulkan pipeline %zu failed (%d)\n", attempted(), result);
@@ -319,6 +355,10 @@ int run(const wchar_t* recording, const wchar_t* output) {
     if (prepared[1]) printf("Vulkan pipelines prepared: %zu compute, %zu graphics, %zu failed\n", prepared[0], prepared[1], failed);
     else printf("Vulkan compute pipelines prepared: %zu, %zu failed\n", prepared[0], failed);
     if (failed || !attempted()) return 1;
+    if (checkpoint && !save_cache(context, checkpoint, true)) {
+        fprintf(stderr, "cannot save Vulkan replay checkpoint\n");
+        return 1;
+    }
     if (save_cache(context, output)) return 0;
     fprintf(stderr, "cannot save Vulkan pipeline cache\n");
     return 1;
@@ -326,12 +366,20 @@ int run(const wchar_t* recording, const wchar_t* output) {
 }  // namespace
 
 int wmain(int count, wchar_t** args) {
-    if (count != 3) {
-        fprintf(stderr, "usage: tessera_vulkan_replay <recording> <new cache file>\n");
+    if (count != 3 && (count != 5 || wcscmp(args[3], L"--checkpoint"))) {
+        fprintf(stderr, "usage: tessera_vulkan_replay <recording> <new cache file> [--checkpoint <cache file>]\n");
         return 1;
     }
     try {
-        return run(args[1], args[2]);
+        if (count == 5) {
+            const auto temporary = std::wstring(args[4]) + L".tmp";
+            if (same_path(args[4], args[1]) || same_path(args[4], args[2])
+                || same_path(temporary.c_str(), args[1]) || same_path(temporary.c_str(), args[2])) {
+                fprintf(stderr, "checkpoint paths must differ from the recording and output\n");
+                return 1;
+            }
+        }
+        return run(args[1], args[2], count == 5 ? args[4] : nullptr);
     } catch (const std::exception& error) {
         fprintf(stderr, "%s\n", error.what());
         return 1;
