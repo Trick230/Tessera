@@ -462,6 +462,7 @@ fn shader_state(
     can_prepare: bool,
     api: ShaderApi,
     recording: bool,
+    native_precompile: bool,
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<&tessera_core::driver::NvidiaGameCache>,
 ) -> ShaderState {
@@ -480,6 +481,11 @@ fn shader_state(
     let scan_only = api != ShaderApi::D3d11;
     if recording {
         rows.push(line("Pipeline recording", "Linked".into(), Vec::new(), OK));
+    }
+    if native_precompile && !recording {
+        rows.push(line("Game precompiler", "Available".into(), vec![
+            "Prepare shaders runs the game's offline precompiler.".into(),
+        ], NEUTRAL));
     }
 
     if c.auto_key_archives > 0 && c.scan_outdated == Some(false) {
@@ -665,7 +671,7 @@ fn shader_state(
     }
     rows.push(line("Out of date", value.to_string(), d, tone));
 
-    ShaderState { present: true, recording, rows: ModelRc::new(VecModel::from(rows)) }
+    ShaderState { present: true, recording, native_precompile, rows: ModelRc::new(VecModel::from(rows)) }
 }
 
 const FPS_CHOICES: [u32; 9] = [0, 30, 40, 60, 90, 120, 144, 165, 240];
@@ -759,6 +765,7 @@ struct GameView {
     facts: Option<advanced::Facts>,
     shader_checks: Option<[ShaderCheck; 4]>,
     pipeline_recordings: [bool; 4],
+    native_precompilers: [bool; 4],
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<tessera_core::driver::NvidiaGameCache>,
 }
@@ -783,6 +790,7 @@ impl GameView {
             session, budget, run, facts,
             shader_checks: Some(ShaderApi::SELECTABLE.map(|api| shader_check::check_for(exe, api, key.as_deref(), &drivers))),
             pipeline_recordings: ShaderApi::SELECTABLE.map(|api| pipeline_warm::recording(exe, api).is_some()),
+            native_precompilers: ShaderApi::SELECTABLE.map(|api| pipeline_warm::NativePrecompiler::detect(exe, api).is_some()),
             pak_key: is_unreal(game).then(|| tessera_core::scan::unreal_key_status(exe)),
             disk_cache: tessera_core::driver::nvidia_game_cache(exe),
         }
@@ -811,7 +819,8 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
     let shaders = view.shader_checks.as_ref().map_or_else(ShaderStates::default, |checks| {
         let render = |i: usize| {
             shader_state(&checks[i], view.run, can_prepare(game), ShaderApi::SELECTABLE[i],
-                view.pipeline_recordings[i], view.pak_key, view.disk_cache.as_ref())
+                view.pipeline_recordings[i], view.native_precompilers[i],
+                view.pak_key, view.disk_cache.as_ref())
         };
         let [d3d11, d3d12, vulkan, opengl] = std::array::from_fn(render);
         ShaderStates { d3d11, d3d12, vulkan, opengl }
@@ -1026,7 +1035,8 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
         return;
     };
     let recording = pipeline_warm::recording(&exe, scope);
-    let prepare = matches!(scope, ShaderApi::D3d11 | ShaderApi::D3d12) || recording.is_some();
+    let native = pipeline_warm::NativePrecompiler::detect(&exe, scope).filter(|_| recording.is_none());
+    let prepare = matches!(scope, ShaderApi::D3d11 | ShaderApi::D3d12) || recording.is_some() || native.is_some();
     ui.set_busy(true);
     ui.set_shader_progress_active(true);
     ui.set_shader_progress(-1.0);
@@ -1040,7 +1050,9 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
         };
         let running = tessera_core::warm::is_running(&exe);
         let missing_d3d12_store = scope == ShaderApi::D3d12 && !tessera_core::warm::d3d12_store_exists(&exe);
-        let scan_error = if !running && (!prepare || missing_d3d12_store || !scan::up_to_date_for(&exe, &root, scope)) {
+        let scan_error = if native.is_none() && !running
+            && (!prepare || missing_d3d12_store || !scan::up_to_date_for(&exe, &root, scope))
+        {
             status("Searching the game files for shaders (read only)…");
             scan_isolated(&exe, &root, scope).err()
         } else {
@@ -1050,7 +1062,13 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
             let m = format!("Warming shaders: the driver has been on one shader for {s} s (left running, it may finish)…");
             let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
         };
-        let msg = if !prepare {
+        let msg = if let Some(native) = native {
+            status("Running the game's offline precompiler…");
+            match native.run(&exe) {
+                Ok(stats) => format!("{api} precompile: {stats} ({:.1} s).", t0.elapsed().as_secs_f64()),
+                Err(e) => format!("{api} preparation failed ({e})."),
+            }
+        } else if !prepare {
             if running { "Close the game before scanning shaders.".to_string() }
             else if let Some(e) = scan_error { format!("{api} shader scan failed ({e}).") }
             else if let Some(path) = scan::export_path_for(&exe, scope) {
@@ -1322,6 +1340,23 @@ fn scan_child(args: &[String]) -> i32 {
 
 fn main() -> Result<(), slint::PlatformError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 3 && args[0] == "--prepare-native" {
+        let exe = Path::new(&args[1]);
+        let result = ShaderApi::SELECTABLE.into_iter().find(|api| api.slug() == args[2])
+            .and_then(|api| pipeline_warm::NativePrecompiler::detect(exe, api))
+            .ok_or_else(|| std::io::Error::other("no offline precompiler for this game and API"))
+            .and_then(|native| native.run(exe));
+        match result {
+            Ok(stats) => {
+                println!("{stats}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.len() == 4 && args[0] == "--prepare-recording" {
         let result = ShaderApi::SELECTABLE.into_iter().find(|api| api.slug() == args[2])
             .ok_or_else(|| std::io::Error::other("unknown shader API"))
