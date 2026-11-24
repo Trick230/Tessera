@@ -8,7 +8,8 @@
 namespace tessera::d3d12_capture {
 inline constexpr char magic[8] = "TSRD12C";
 // 2: AddToStateObject records name their parent by hash instead of embedding it.
-inline constexpr uint32_t version = 2;
+// 3: the header identifies the game executable.
+inline constexpr uint32_t version = 3;
 inline constexpr uint32_t max_shader_bytes = 16 * 1024 * 1024;
 inline constexpr uint32_t max_root_bytes = 1024 * 1024;
 inline constexpr uint32_t max_graphics_bytes = 64 * 1024 * 1024;
@@ -20,10 +21,14 @@ inline constexpr uint32_t raytracing_kind = 3;
 inline constexpr uint32_t raytracing_add_kind = 4;
 inline constexpr size_t graphics_stages = 5;
 
+// The game executable's size and last write time (FILETIME) identify the build it was
+// recorded from; the app keeps one recording per build and flags a stale one.
 struct Header {
     char magic[8];
     uint32_t version;
     uint32_t reserved;
+    uint64_t exe_size;
+    uint64_t exe_write_time;
 };
 
 // Each record contains a payload and a serialized root signature. A root size
@@ -65,7 +70,7 @@ struct InputElement {
     uint32_t step_rate;
 };
 
-static_assert(sizeof(Header) == 16);
+static_assert(sizeof(Header) == 32);
 static_assert(sizeof(Record) == 32);
 static_assert(sizeof(InputElement) == 28);
 }  // namespace tessera::d3d12_capture

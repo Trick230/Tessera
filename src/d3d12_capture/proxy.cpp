@@ -53,6 +53,12 @@ BOOL CALLBACK open_capture(PINIT_ONCE, void*, void**) {
     Header header{};
     std::memcpy(header.magic, magic, sizeof(magic));
     header.version = version;
+    WIN32_FILE_ATTRIBUTE_DATA exe{};
+    const DWORD exe_length = GetModuleFileNameW(nullptr, path, _countof(path));
+    if (exe_length && exe_length < _countof(path) && GetFileAttributesExW(path, GetFileExInfoStandard, &exe)) {
+        header.exe_size = (uint64_t(exe.nFileSizeHigh) << 32) | exe.nFileSizeLow;
+        header.exe_write_time = (uint64_t(exe.ftLastWriteTime.dwHighDateTime) << 32) | exe.ftLastWriteTime.dwLowDateTime;
+    }
     if (write_bytes(file, &header, sizeof(header))) {
         capture = file;
         recorded_bytes = sizeof(header);

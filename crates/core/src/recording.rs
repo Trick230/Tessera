@@ -27,15 +27,27 @@ struct Format {
     d3d12: bool,
 }
 
+// include/tessera/d3d12_capture_format.h: magic, version, reserved, exe size, exe FILETIME.
+const D3D12_HEADER: usize = 32;
+const D3D12_VERSION: u32 = 3;
+
+/// Whether a D3D12 recording was made from this build of the game.
+fn d3d12_build_matches(exe: &Path, header: &[u8]) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    let read_u64 = |offset: usize| u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
+    header.len() >= D3D12_HEADER && fs::metadata(exe)
+        .is_ok_and(|meta| meta.len() == read_u64(16) && meta.last_write_time() == read_u64(24))
+}
+
 fn read_u32(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
 }
 
 fn format(api: ShaderApi, bytes: &[u8]) -> io::Result<Format> {
     match api {
-        ShaderApi::D3d12 if bytes.len() >= 16 && bytes.starts_with(b"TSRD12C\0")
-            && read_u32(bytes, 8) == 1 && read_u32(bytes, 12) == 0 =>
-            Ok(Format { header: 16, record: 32, max_file: MAX_D3D12, d3d12: true }),
+        ShaderApi::D3d12 if bytes.len() >= D3D12_HEADER && bytes.starts_with(b"TSRD12C\0")
+            && read_u32(bytes, 8) == D3D12_VERSION && read_u32(bytes, 12) == 0 =>
+            Ok(Format { header: D3D12_HEADER, record: 32, max_file: MAX_D3D12, d3d12: true }),
         ShaderApi::Vulkan if bytes.len() >= 36
             && (bytes.starts_with(b"TSRVKC1\0") || bytes.starts_with(b"TSRVKC2\0") || bytes.starts_with(b"TSRVKC3\0")) =>
             Ok(Format { header: 36, record: 4, max_file: MAX_VULKAN, d3d12: false }),
@@ -256,7 +268,11 @@ pub fn prepare(exe: &Path, api: ShaderApi, helper_dir: &Path) -> io::Result<Stri
     let report_path = dir.join("prepared.json");
     let result = if api == ShaderApi::D3d12 {
         let base = scan::scan_base_for(exe, api).ok_or_else(|| io::Error::other("invalid game path"))?;
+        let current = open_capture(&active.file).is_ok_and(|bytes| d3d12_build_matches(exe, &bytes));
         warm::replay_d3d12_locked(exe, &warm::warm_exe_for(exe, helper_dir), &active.file, &base)
+            .map(|summary| if current { summary } else {
+                format!("{summary} (recorded with an earlier build of the game; record a new session)")
+            })
     } else {
         let helper = helper_dir.join(VULKAN_REPLAY_EXE);
         if !helper.is_file() { return Err(io::Error::other("the Vulkan replay helper is not installed")); }
@@ -316,5 +332,25 @@ mod tests {
         let mut legacy = bytes.clone();
         legacy[6] = b'2';
         assert!(!format.is_device(&legacy[..36], records[0]));
+    }
+
+    #[test]
+    fn d3d12_header_names_the_game_build() {
+        use std::os::windows::fs::MetadataExt;
+        let exe = std::env::temp_dir().join(format!("tessera-build-{}.exe", std::process::id()));
+        fs::write(&exe, b"game").unwrap();
+        let meta = fs::metadata(&exe).unwrap();
+        let mut header = b"TSRD12C\0".to_vec();
+        header.extend_from_slice(&D3D12_VERSION.to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&meta.len().to_le_bytes());
+        header.extend_from_slice(&meta.last_write_time().to_le_bytes());
+        assert_eq!(format(ShaderApi::D3d12, &header).unwrap().header, D3D12_HEADER);
+        assert!(d3d12_build_matches(&exe, &header));
+        fs::write(&exe, b"patched").unwrap();
+        assert!(!d3d12_build_matches(&exe, &header));
+        header[8] = 2;
+        assert!(format(ShaderApi::D3d12, &header).is_err());
+        let _ = fs::remove_file(&exe);
     }
 }
