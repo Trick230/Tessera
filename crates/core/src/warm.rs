@@ -280,10 +280,14 @@ pub fn replay_d3d12_capture(exe: &Path, warm_exe: &Path, capture: &Path) -> io::
         .ok_or_else(|| io::Error::other("invalid game path"))?;
     let capture = fs::canonicalize(capture)?;
     let _lock = crate::scan::lock(exe)?;
+    replay_d3d12_locked(exe, warm_exe, &capture, &base)
+}
+
+pub(crate) fn replay_d3d12_locked(exe: &Path, warm_exe: &Path, capture: &Path, base: &Path) -> io::Result<String> {
     if is_running(exe) {
         return Err(io::Error::other("close the game before replaying pipelines"));
     }
-    let copy = stage_helper(exe, &base, warm_exe)?;
+    let copy = stage_helper(exe, base, warm_exe)?;
     let output = Command::new(copy).creation_flags(CREATE_NO_WINDOW)
         .arg("--replay-d3d12").arg(capture).output()?;
     let summary = String::from_utf8_lossy(&output.stdout);

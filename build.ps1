@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Builds everything: Rust app (target\release\tessera.exe) and the C++ layer,
 # copied next to the app in x64 and x86 variants.
-#   powershell -File build.ps1 [-Test] [-Quality]
-param([switch]$Test, [switch]$Quality)
+#   powershell -File build.ps1 [-Test] [-Quality] [-Vulkan]
+param([switch]$Test, [switch]$Quality, [switch]$Vulkan)
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $cmake = "D:\BuildTools\VS2022\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
@@ -38,6 +38,15 @@ try {
         Copy-Item build\quality\src\texcomp\Release\tessera_texcomp.exe,
                   build\quality\src\texcomp\Release\DirectXTex-LICENSE.txt,
                   build\quality\src\texcomp\Release\FLIP-LICENSE.txt target\release -Force
+    }
+    if ($Vulkan) {
+        & $cmake -S . -B build/vulkan-telemetry -G "Visual Studio 17 2022" -A x64 -DTESSERA_BUILD_VULKAN_TELEMETRY=ON
+        if ($LASTEXITCODE) { throw "Vulkan configure failed" }
+        & $cmake --build build/vulkan-telemetry --config Release --target tessera_vulkan_telemetry tessera_vulkan_replay
+        if ($LASTEXITCODE) { throw "Vulkan tools build failed" }
+        $vk = "build/vulkan-telemetry/src/vulkan_telemetry/Release"
+        Copy-Item "$vk/tessera_vulkan_telemetry.dll","$vk/tessera_vulkan_replay.exe",
+                  "$vk/TesseraTelemetry.json" target/release -Force
     }
     if ($Test) {
         cargo test -q -p tessera-core

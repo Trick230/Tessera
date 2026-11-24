@@ -462,6 +462,7 @@ fn shader_state(
     can_prepare: bool,
     api: ShaderApi,
     native_precompile: Option<&NativePrecompileView>,
+    recording: Option<&tessera_core::recording::Status>,
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<&tessera_core::driver::NvidiaGameCache>,
 ) -> ShaderState {
@@ -478,7 +479,14 @@ fn shader_state(
     };
     let mut rows = Vec::new();
     let scan_only = api != ShaderApi::D3d11;
-    if let Some(native) = native_precompile {
+    if let Some(recording) = recording {
+        let detail = if recording.changed {
+            "The capture, game settings or driver changed since the last replay.".into()
+        } else {
+            recording.last_result.clone().unwrap_or_default()
+        };
+        rows.push(line("Pipeline recording", format!("{} pipelines", recording.count), vec![detail], NEUTRAL));
+    } else if let Some(native) = native_precompile {
         rows.push(line("Game precompiler", "Available".into(), vec![
             "Prepare shaders runs the game's offline precompiler.".into(),
         ], NEUTRAL));
@@ -669,7 +677,8 @@ fn shader_state(
     }
     rows.push(line("Out of date", value.to_string(), d, tone));
 
-    ShaderState { present: true, native_precompile: native_precompile.is_some(), rows: ModelRc::new(VecModel::from(rows)) }
+    ShaderState { present: true, native_precompile: native_precompile.is_some(), recording: recording.is_some(),
+        rows: ModelRc::new(VecModel::from(rows)) }
 }
 
 const FPS_CHOICES: [u32; 9] = [0, 30, 40, 60, 90, 120, 144, 165, 240];
@@ -767,6 +776,7 @@ struct GameView {
     facts: Option<advanced::Facts>,
     shader_checks: Option<[ShaderCheck; 4]>,
     native_precompilers: [Option<NativePrecompileView>; 4],
+    recordings: [Option<tessera_core::recording::Status>; 4],
     pak_key: Option<Option<(tessera_core::scan::PakKeySource, bool)>>,
     disk_cache: Option<tessera_core::driver::NvidiaGameCache>,
 }
@@ -795,6 +805,7 @@ impl GameView {
                     last_result: native.last_result(exe),
                 })
             }),
+            recordings: ShaderApi::SELECTABLE.map(|api| tessera_core::recording::status(exe, api)),
             pak_key: is_unreal(game).then(|| tessera_core::scan::unreal_key_status(exe)),
             disk_cache: tessera_core::driver::nvidia_game_cache(exe),
         }
@@ -824,6 +835,7 @@ fn show_requested_view(ui: &MainWindow, st: &mut State) {
         let render = |i: usize| {
             shader_state(&checks[i], view.run, can_prepare(game), ShaderApi::SELECTABLE[i],
                 view.native_precompilers[i].as_ref(),
+                view.recordings[i].as_ref(),
                 view.pak_key, view.disk_cache.as_ref())
         };
         let [d3d11, d3d12, vulkan, opengl] = std::array::from_fn(render);
@@ -1038,8 +1050,9 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
     }) else {
         return;
     };
+    let recording = tessera_core::recording::status(&exe, scope).is_some();
     let native = pipeline_warm::NativePrecompiler::detect(&exe, scope);
-    let prepare = matches!(scope, ShaderApi::D3d11 | ShaderApi::D3d12) || native.is_some();
+    let prepare = matches!(scope, ShaderApi::D3d11 | ShaderApi::D3d12) || native.is_some() || recording;
     ui.set_busy(true);
     ui.set_shader_progress_active(true);
     ui.set_shader_progress(-1.0);
@@ -1053,7 +1066,7 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
         };
         let running = tessera_core::warm::is_running(&exe);
         let missing_d3d12_store = scope == ShaderApi::D3d12 && !tessera_core::warm::d3d12_store_exists(&exe);
-        let scan_error = if native.is_none() && !running
+        let scan_error = if !recording && native.is_none() && !running
             && (!prepare || missing_d3d12_store || !scan::up_to_date_for(&exe, &root, scope))
         {
             status("Searching the game files for shaders (read only)…");
@@ -1065,7 +1078,13 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
             let m = format!("Warming shaders: the driver has been on one shader for {s} s (left running, it may finish)…");
             let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
         };
-        let msg = if let Some(native) = native {
+        let msg = if recording {
+            status("Replaying recorded pipelines…");
+            match tessera_core::recording::prepare(&exe, scope, &app_dir()) {
+                Ok(summary) => summary,
+                Err(error) => format!("Pipeline replay failed ({error})."),
+            }
+        } else if let Some(native) = native {
             status("Running the game's offline precompiler…");
             match native.run(&exe) {
                 Ok(stats) => format!("{api} precompile: {stats} ({:.1} s).", t0.elapsed().as_secs_f64()),
@@ -1136,6 +1155,49 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
             if same {
                 request_view(&ui, &state, &mut st, sel, true);
             } else if let Some(game) = st.games.iter().find(|g| g.exe.as_deref() == Some(&exe)) {
+                let root = game.entry.root.clone();
+                invalidate_view(&mut st, &root);
+                start_view_worker(&ui, &state, &mut st);
+            }
+        });
+    });
+}
+
+fn recording_api(api: &str) -> Option<ShaderApi> {
+    match api {
+        "D3D12" | "d3d12" => Some(ShaderApi::D3d12),
+        "Vulkan" | "vulkan" => Some(ShaderApi::Vulkan),
+        _ => None,
+    }
+}
+
+fn import_recording_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString) {
+    if ui.get_busy() { return; }
+    let Some(scope) = recording_api(api.as_str()) else { return };
+    let exe = {
+        let st = state.lock().unwrap();
+        st.view.get(view_idx as usize).and_then(|&gi| st.games[gi].exe.clone())
+    };
+    let Some(exe) = exe else { return };
+    let Some(path) = rfd::FileDialog::new().set_title("Import pipeline recording")
+        .add_filter("Tessera recordings", &["td12", "tvc", "capture"]).pick_file() else { return };
+    ui.set_busy(true);
+    ui.set_status_text("Importing pipeline recording…".into());
+    let (weak, state) = (ui.as_weak(), state.clone());
+    std::thread::spawn(move || {
+        let result = tessera_core::recording::import(&exe, scope, &path);
+        let message = match result {
+            Ok(count) => format!("{count} unique pipelines in the {api} recording."),
+            Err(error) => format!("Pipeline import failed ({error})."),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_busy(false);
+            ui.set_status_text(message.into());
+            let mut st = state.lock().unwrap();
+            let sel = ui.get_selected();
+            if st.view.get(sel as usize).is_some_and(|&gi| st.games[gi].exe.as_deref() == Some(&exe)) {
+                request_view(&ui, &state, &mut st, sel, true);
+            } else if let Some(game) = st.games.iter().find(|game| game.exe.as_deref() == Some(&exe)) {
                 let root = game.entry.root.clone();
                 invalidate_view(&mut st, &root);
                 start_view_worker(&ui, &state, &mut st);
@@ -1311,6 +1373,24 @@ fn scan_child(args: &[String]) -> i32 {
 
 fn main() -> Result<(), slint::PlatformError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [command, exe, api, rest @ ..] = args.as_slice() {
+        let action = match (command.as_str(), rest) {
+            ("--import-pipeline-recording", [path]) => Some(recording_api(api)
+                .ok_or_else(|| std::io::Error::other("unsupported pipeline recording API"))
+                .and_then(|api| tessera_core::recording::import(Path::new(exe), api, Path::new(path)))
+                .map(|count| format!("{count} unique pipelines imported"))),
+            ("--prepare-imported-pipelines", []) => Some(recording_api(api)
+                .ok_or_else(|| std::io::Error::other("unsupported pipeline recording API"))
+                .and_then(|api| tessera_core::recording::prepare(Path::new(exe), api, &app_dir()))),
+            _ => None,
+        };
+        if let Some(result) = action {
+            match result {
+                Ok(summary) => { println!("{summary}"); std::process::exit(0); }
+                Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+            }
+        }
+    }
     if args.len() == 3 && args[0] == "--prepare-d3d12-capture" {
         let helper = app_dir().join(tessera_core::warm::WARM_EXE);
         match tessera_core::warm::replay_d3d12_capture(Path::new(&args[1]), &helper, Path::new(&args[2])) {
@@ -1464,6 +1544,10 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_warm_shaders(move |i, api| warm_action(&w.unwrap(), &s, i, api));
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_import_recording(move |i, api| import_recording_action(&w.unwrap(), &s, i, api));
     }
     {
         let (w, s) = (ui.as_weak(), state.clone());

@@ -119,6 +119,12 @@ on the same driver and adapter, then pass that output to
 `TESSERA_VULKAN_CACHE_INPUT`. Graphics pipelines and extension-specific
 sampler and pipeline state have separate descriptor requirements.
 
+Use **Import pipeline recording** in the library's **Shaders** tab for
+D3D12 or Vulkan. The app merges compatible captures by pipeline content
+and displays the last replay result for the current recording, executable
+and driver. **Prepare shaders** replays the imported recording. Build
+the optional Vulkan payload alongside the app with `build.ps1 -Vulkan`.
+
 - **Unreal Engine:** sets console variables without calling into the engine. The app finds each variable in the executable offline; the layer checks the build and every slot before writing. Texture streaming profile, off by default.
 
 **Being measured:** Unreal variants (dynamic resolution off, render targets that only grow, pool limits, shader creation on load, level streaming time limits) in Final Fantasy VII Remake.

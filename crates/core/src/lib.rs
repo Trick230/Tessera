@@ -20,6 +20,7 @@ mod unreal_shader;
 pub mod pe;
 pub mod paths;
 pub mod quality;
+pub mod recording;
 mod recomp;
 pub mod scan;
 pub mod session;
