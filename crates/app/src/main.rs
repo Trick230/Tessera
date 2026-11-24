@@ -1053,20 +1053,22 @@ fn warm_action(ui: &MainWindow, state: &Shared, view_idx: i32, api: SharedString
     }) else {
         return;
     };
-    let recording = tessera_core::recording::status(&exe, scope).is_some();
-    let native = pipeline_warm::NativePrecompiler::detect(&exe, scope);
-    let prepare = matches!(scope, ShaderApi::D3d11 | ShaderApi::D3d12) || native.is_some() || recording;
     ui.set_busy(true);
     ui.set_shader_progress_active(true);
     ui.set_shader_progress(-1.0);
     ui.set_shader_progress_label("".into());
-    ui.set_status_text(if prepare { format!("Preparing {api} shaders…") } else { "Scanning shaders…".into() }.into());
+    ui.set_status_text(format!("Preparing {api} shaders…").into());
     let (weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
+        // Both read files on disk; keep them off the UI thread.
+        let recording = tessera_core::recording::status(&exe, scope).is_some();
+        let native = pipeline_warm::NativePrecompiler::detect(&exe, scope);
+        let prepare = matches!(scope, ShaderApi::D3d11 | ShaderApi::D3d12) || native.is_some() || recording;
         let t0 = std::time::Instant::now();
         let status = |m: &'static str| {
             let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(m.into()));
         };
+        if !prepare { status("Scanning shaders…"); }
         let running = tessera_core::warm::is_running(&exe);
         let missing_d3d12_store = scope == ShaderApi::D3d12 && !tessera_core::warm::d3d12_store_exists(&exe);
         let scan_error = if !recording && native.is_none() && !running
@@ -1255,18 +1257,38 @@ fn clear_shader_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
     if ui.get_busy() {
         return;
     }
-    let Some((exe, root, name)) = ({
+    let Some((exe, root, name, shared_with, nvidia)) = ({
         let st = state.lock().unwrap();
         st.view.get(view_idx as usize).and_then(|&gi| {
             let game = &st.games[gi];
-            game.exe.clone().map(|exe| (exe, game.entry.root.clone(), game.entry.name.clone()))
+            let exe = game.exe.clone()?;
+            // NVIDIA cache files only name the executable, not its folder.
+            let shared_with: Vec<String> = st.games.iter().enumerate()
+                .filter(|&(i, other)| i != gi && other.exe.as_ref().is_some_and(|o| o.file_name()
+                    .zip(exe.file_name())
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))))
+                .map(|(_, other)| other.entry.name.clone())
+                .collect();
+            // Counted by the view worker; the dialog must not rescan DXCache on the UI thread.
+            let nvidia = st.ready_views.get(&game.entry.root).and_then(|v| v.disk_cache.as_ref())
+                .map_or((0, 0), |c| (c.files, c.bytes));
+            Some((exe, game.entry.root.clone(), game.entry.name.clone(), shared_with, nvidia))
         })
     }) else {
         return;
     };
+    let exe_name = exe.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let driver = shared_with.is_empty();
+    let description = if driver {
+        format!("Clear Tessera's shader data for {name} and {} NVIDIA cache file(s) ({:.1} MiB) named after {exe_name}? Other programs with an executable named {exe_name} that are not in the library lose their NVIDIA cache too.",
+            nvidia.0, nvidia.1 as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("Clear Tessera's shader data for {name}? The NVIDIA cache is kept because {} also use(s) an executable named {exe_name}.",
+            shared_with.join(", "))
+    };
     let answer = rfd::MessageDialog::new()
         .set_title("Clear shader cache")
-        .set_description(format!("Clear Tessera's shader data for {name} and the NVIDIA cache shared by executables named {}?", exe.file_name().unwrap_or_default().to_string_lossy()))
+        .set_description(description)
         .set_level(rfd::MessageLevel::Warning)
         .set_buttons(rfd::MessageButtons::OkCancel)
         .show();
@@ -1277,9 +1299,10 @@ fn clear_shader_action(ui: &MainWindow, state: &Shared, view_idx: i32) {
     ui.set_status_text("Clearing shader cache…".into());
     let (weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
-        let msg = match tessera_core::warm::clear_shader_cache(&exe) {
+        let msg = match tessera_core::warm::clear_shader_cache(&exe, driver) {
             Ok(0) => format!("No matching shader cache files for {name}."),
-            Ok(_) => format!("Cleared Tessera shader data and matching NVIDIA cache files for {name}."),
+            Ok(_) if driver => format!("Cleared Tessera shader data and matching NVIDIA cache files for {name}."),
+            Ok(_) => format!("Cleared Tessera shader data for {name}; the shared NVIDIA cache was kept."),
             Err(e) => format!("Could not clear the shader cache: {e}"),
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -1443,7 +1466,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     }
     if args.len() == 3 && args[0] == "--prepare-d3d12-capture" {
-        let helper = app_dir().join(tessera_core::warm::WARM_EXE);
+        let helper = tessera_core::warm::warm_exe_for(Path::new(&args[1]), &app_dir());
         match tessera_core::warm::replay_d3d12_capture(Path::new(&args[1]), &helper, Path::new(&args[2])) {
             Ok(summary) => {
                 println!("{summary}");

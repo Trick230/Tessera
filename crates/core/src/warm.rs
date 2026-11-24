@@ -15,6 +15,12 @@ use std::process::Command;
 
 pub const WARM_EXE: &str = "tessera_warm.exe";
 pub const WARM_EXE_X86: &str = "tessera_warm_x86.exe";
+
+/// The warm-up helper in `dir` that matches the game's architecture.
+pub fn warm_exe_for(exe: &Path, dir: &Path) -> std::path::PathBuf {
+    let x86 = crate::pe::scan_exe(exe).is_ok_and(|scan| scan.architecture == Some(crate::pe::Architecture::X86));
+    dir.join(if x86 { WARM_EXE_X86 } else { WARM_EXE })
+}
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Crashes or device removals tolerated in one warm-up; each relaunch skips
 /// the shader that was being compiled.
@@ -53,14 +59,21 @@ pub fn bases(exe: &Path) -> Vec<PathBuf> {
     [store_base(exe), crate::scan::scan_base(exe)].into_iter().flatten().collect()
 }
 
-/// Clears the shader data Tessera owns and matching NVIDIA cache files.
-pub fn clear_shader_cache(exe: &Path) -> io::Result<usize> {
+/// Clears the shader data Tessera owns and, when `driver` is set, the NVIDIA
+/// cache files naming this executable. NVIDIA files only record the executable
+/// name, so the caller must leave them alone when another game shares it.
+pub fn clear_shader_cache(exe: &Path, driver: bool) -> io::Result<usize> {
     if process_is_running(exe)? {
         return Err(io::Error::other("close the game before clearing its shader cache"));
     }
     let key = crate::session::exe_key_name(exe).ok_or_else(|| io::Error::other("invalid game path"))?;
-    let driver = crate::driver::clear_nvidia_game_cache(exe)?;
-    Ok(driver + clear_shader_files(&crate::paths::data_dir(), &key)?)
+    // Same lock as scans, warm-ups and recordings: none of them may write while we clear.
+    let _lock = crate::scan::lock(exe)
+        .map_err(|_| io::Error::other("a scan or warm-up of this game is running"))?;
+    // Tessera's files first: if the driver step fails, coverage reads "not warmed" rather than warm.
+    let own = clear_shader_files(&crate::paths::data_dir(), &key)?;
+    let nvidia = if driver { crate::driver::clear_nvidia_game_cache(exe)? } else { 0 };
+    Ok(own + nvidia)
 }
 
 fn clear_shader_files(data: &Path, key: &str) -> io::Result<usize> {

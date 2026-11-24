@@ -240,7 +240,7 @@ pub fn prepare(exe: &Path, api: ShaderApi, helper_dir: &Path) -> io::Result<Stri
     let report_path = dir.join("prepared.json");
     let result = if api == ShaderApi::D3d12 {
         let base = scan::scan_base_for(exe, api).ok_or_else(|| io::Error::other("invalid game path"))?;
-        warm::replay_d3d12_locked(exe, &helper_dir.join(warm::WARM_EXE), &active.file, &base)
+        warm::replay_d3d12_locked(exe, &warm::warm_exe_for(exe, helper_dir), &active.file, &base)
     } else {
         let helper = helper_dir.join(VULKAN_REPLAY_EXE);
         if !helper.is_file() { return Err(io::Error::other("the Vulkan replay helper is not installed")); }
