@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -553,6 +554,58 @@ struct WarmD3d12 {
     void finish() const {}
 };
 
+template<typename T>
+bool take_capture(std::span<const uint8_t>& data, T& object) {
+    if (data.size() < sizeof(T)) return false;
+    std::memcpy(&object, data.data(), sizeof(T));
+    data = data.subspan(sizeof(T));
+    return true;
+}
+
+HRESULT replay_graphics(ID3D12Device* device, ID3D12RootSignature* root,
+                        const tessera::d3d12_capture::Record& entry, std::span<const uint8_t> data) {
+    using namespace tessera::d3d12_capture;
+    GraphicsState state{};
+    if (!take_capture(data, state) || state.input_elements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT
+        || state.render_targets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)
+        return E_INVALIDARG;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    D3D12_SHADER_BYTECODE* shaders[] = {&desc.VS, &desc.PS, &desc.DS, &desc.HS, &desc.GS};
+    for (size_t i = 0; i < graphics_stages; ++i) {
+        const auto size = state.code_sizes[i];
+        if (size > data.size() || size > max_shader_bytes) return E_INVALIDARG;
+        if (size) *shaders[i] = {data.data(), size};
+        data = data.subspan(size);
+    }
+    D3D12_INPUT_ELEMENT_DESC input[D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT]{};
+    for (uint32_t i = 0; i < state.input_elements; ++i) {
+        InputElement element{};
+        if (!take_capture(data, element) || element.name_size <= 1 || element.name_size > data.size()
+            || std::memchr(data.data(), 0, element.name_size) != data.data() + element.name_size - 1)
+            return E_INVALIDARG;
+        input[i] = {reinterpret_cast<const char*>(data.data()), element.semantic_index, element.format,
+            element.slot, element.offset, element.classification, element.step_rate};
+        data = data.subspan(element.name_size);
+    }
+    if (!data.empty()) return E_INVALIDARG;
+    desc.pRootSignature = root;
+    desc.BlendState = state.blend;
+    desc.SampleMask = state.sample_mask;
+    desc.RasterizerState = state.rasterizer;
+    desc.DepthStencilState = state.depth_stencil;
+    desc.InputLayout = {state.input_elements ? input : nullptr, state.input_elements};
+    desc.IBStripCutValue = state.strip_cut;
+    desc.PrimitiveTopologyType = state.topology;
+    desc.NumRenderTargets = state.render_targets;
+    std::memcpy(desc.RTVFormats, state.formats, sizeof(state.formats));
+    desc.DSVFormat = state.depth_format;
+    desc.SampleDesc = state.samples;
+    desc.NodeMask = entry.node_mask;
+    desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(entry.flags);
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+    return device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
+}
+
 int replay_d3d12(const wchar_t* path, bool warp) {
     using namespace tessera::d3d12_capture;
     using Microsoft::WRL::ComPtr;
@@ -572,25 +625,26 @@ int replay_d3d12(const wchar_t* path, bool warp) {
         fprintf(stderr, "no D3D12 device\n");
         return 1;
     }
-    std::vector<uint8_t> shader, root;
+    std::vector<uint8_t> payload, root;
     uint64_t total_bytes = sizeof(header);
-    size_t prepared = 0, failed = 0;
+    size_t compute = 0, graphics = 0, failed = 0;
     while (true) {
-        ComputeRecord record{};
+        Record record{};
         const size_t received = fread(&record, 1, sizeof(record), file.get());
         if (received == 0 && feof(file.get())) break;
-        const uint64_t size = sizeof(record) + uint64_t{record.shader_size} + record.root_size;
-        if (received != sizeof(record) || record.reserved || !record.shader_size || record.shader_size > max_shader_bytes
+        const uint64_t size = sizeof(record) + uint64_t{record.payload_size} + record.root_size;
+        const uint32_t max_payload = record.kind == compute_kind ? max_shader_bytes : max_graphics_bytes;
+        if (received != sizeof(record) || record.kind > graphics_kind || !record.payload_size || record.payload_size > max_payload
             || record.root_size > max_root_bytes || total_bytes > max_capture_bytes - size) {
-            fprintf(stderr, "invalid D3D12 capture record after %zu pipelines\n", prepared + failed);
+            fprintf(stderr, "invalid D3D12 capture record after %zu pipelines\n", compute + graphics + failed);
             return 1;
         }
         total_bytes += size;
-        shader.resize(record.shader_size);
+        payload.resize(record.payload_size);
         root.resize(record.root_size);
-        if (fread(shader.data(), 1, shader.size(), file.get()) != shader.size()
+        if (fread(payload.data(), 1, payload.size(), file.get()) != payload.size()
             || (!root.empty() && fread(root.data(), 1, root.size(), file.get()) != root.size())) {
-            fprintf(stderr, "truncated D3D12 capture record after %zu pipelines\n", prepared + failed);
+            fprintf(stderr, "truncated D3D12 capture record after %zu pipelines\n", compute + graphics + failed);
             return 1;
         }
         ComPtr<ID3D12RootSignature> signature;
@@ -598,25 +652,28 @@ int replay_d3d12(const wchar_t* path, bool warp) {
         if (!root.empty()) {
             hr = device.dev->CreateRootSignature(record.root_node_mask, root.data(), root.size(), IID_PPV_ARGS(&signature));
         }
-        if (SUCCEEDED(hr)) {
+        if (SUCCEEDED(hr) && record.kind == graphics_kind) {
+            hr = replay_graphics(device.dev.Get(), signature.Get(), record, payload);
+        } else if (SUCCEEDED(hr)) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
             desc.pRootSignature = signature.Get();
-            desc.CS = {shader.data(), shader.size()};
+            desc.CS = {payload.data(), payload.size()};
             desc.NodeMask = record.node_mask;
             desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(record.flags);
             ComPtr<ID3D12PipelineState> pipeline;
             hr = device.dev->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline));
         }
         if (SUCCEEDED(hr)) {
-            ++prepared;
+            ++(record.kind == compute_kind ? compute : graphics);
         } else {
             ++failed;
-            fprintf(stderr, "pipeline %zu: 0x%08lx\n", prepared + failed, static_cast<unsigned long>(hr));
+            fprintf(stderr, "pipeline %zu: 0x%08lx\n", compute + graphics + failed, static_cast<unsigned long>(hr));
             if (device.removed()) break;
         }
     }
-    printf("%zu D3D12 compute pipelines prepared, %zu failed%s\n", prepared, failed, warp ? " (WARP)" : "");
-    return failed != 0 || prepared == 0 ? 1 : 0;
+    printf("D3D12 pipelines prepared: %zu compute, %zu graphics, %zu failed%s\n",
+           compute, graphics, failed, warp ? " (WARP)" : "");
+    return failed != 0 || compute + graphics == 0 ? 1 : 0;
 }
 
 template<class Device>

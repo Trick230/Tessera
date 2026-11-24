@@ -68,8 +68,14 @@ bool capture_enabled() {
 
 HRESULT STDMETHODCALLTYPE record_root(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
 HRESULT STDMETHODCALLTYPE record_compute(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE record_graphics(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE factory_device(ID3D12DeviceFactory*, IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+HRESULT STDMETHODCALLTYPE sdk_factory(ID3D12SDKConfiguration1*, UINT, LPCSTR, REFIID, void**);
 tessera::VtHook root_hook{16, reinterpret_cast<void*>(&record_root)};
 tessera::VtHook compute_hook{11, reinterpret_cast<void*>(&record_compute)};
+tessera::VtHook graphics_hook{10, reinterpret_cast<void*>(&record_graphics)};
+tessera::VtHook factory_hook{9, reinterpret_cast<void*>(&factory_device)};
+tessera::VtHook sdk_hook{4, reinterpret_cast<void*>(&sdk_factory)};
 
 HRESULT STDMETHODCALLTYPE record_root(ID3D12Device* device, UINT nodes, const void* bytes, SIZE_T size,
                                       REFIID iid, void** result) {
@@ -89,27 +95,26 @@ HRESULT STDMETHODCALLTYPE record_root(ID3D12Device* device, UINT nodes, const vo
     return hr;
 }
 
-void append_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, uint64_t create_ns) {
-    if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength || desc.CS.BytecodeLength > max_shader_bytes) return;
+void append_pipeline(const void* payload, uint32_t payload_size, ID3D12RootSignature* root,
+                     UINT nodes, D3D12_PIPELINE_STATE_FLAGS flags, uint32_t kind, uint64_t create_ns) {
     std::vector<uint8_t> signature;
     uint32_t root_nodes = 0;
-    if (desc.pRootSignature) {
+    if (root) {
         UINT size = 0;
-        desc.pRootSignature->GetPrivateData(root_data, &size, nullptr);
+        root->GetPrivateData(root_data, &size, nullptr);
         if (size <= sizeof(root_nodes) || size > max_root_bytes + sizeof(root_nodes)) return;
         signature.resize(size);
-        if (FAILED(desc.pRootSignature->GetPrivateData(root_data, &size, signature.data()))
+        if (FAILED(root->GetPrivateData(root_data, &size, signature.data()))
             || size != signature.size()) return;
         std::memcpy(&root_nodes, signature.data(), sizeof(root_nodes));
     }
     const auto root_size = static_cast<uint32_t>(signature.empty() ? 0 : signature.size() - sizeof(root_nodes));
-    const ComputeRecord entry{static_cast<uint32_t>(desc.CS.BytecodeLength), root_size, desc.NodeMask,
-        root_nodes, static_cast<uint32_t>(desc.Flags), 0, create_ns};
-    const uint64_t size = sizeof(entry) + entry.shader_size + entry.root_size;
+    const Record entry{payload_size, root_size, nodes, root_nodes, static_cast<uint32_t>(flags), kind, create_ns};
+    const uint64_t size = sizeof(entry) + entry.payload_size + entry.root_size;
     AcquireSRWLockExclusive(&capture_lock);
     if (recorded_bytes <= max_capture_bytes - size) {
         const bool complete = write_bytes(capture, &entry, sizeof(entry))
-            && write_bytes(capture, desc.CS.pShaderBytecode, entry.shader_size)
+            && write_bytes(capture, payload, entry.payload_size)
             && (!root_size || write_bytes(capture, signature.data() + sizeof(root_nodes), root_size));
         recorded_bytes = complete ? recorded_bytes + size : max_capture_bytes;
     }
@@ -124,11 +129,116 @@ HRESULT STDMETHODCALLTYPE record_compute(ID3D12Device* device, const D3D12_COMPU
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
     if (SUCCEEDED(hr) && desc && result && *result) {
         try {
-            append_compute(*desc, static_cast<uint64_t>(elapsed));
+            const auto& shader = desc->CS;
+            if (shader.pShaderBytecode && shader.BytecodeLength && shader.BytecodeLength <= max_shader_bytes)
+                append_pipeline(shader.pShaderBytecode, static_cast<uint32_t>(shader.BytecodeLength),
+                                desc->pRootSignature, desc->NodeMask, desc->Flags, compute_kind, elapsed);
         } catch (...) {
             // The driver result is independent of the recording.
         }
     }
+    return hr;
+}
+
+void append_payload(std::vector<uint8_t>& payload, const void* data, size_t size) {
+    if (!size) return;
+    const size_t from = payload.size();
+    payload.resize(from + size);
+    std::memcpy(payload.data() + from, data, size);
+}
+
+void append_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, uint64_t elapsed) {
+    if (desc.StreamOutput.NumEntries || desc.StreamOutput.NumStrides
+        || desc.InputLayout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT)
+        return;
+    const D3D12_SHADER_BYTECODE shaders[] = {desc.VS, desc.PS, desc.DS, desc.HS, desc.GS};
+    GraphicsState state{};
+    state.input_elements = desc.InputLayout.NumElements;
+    state.blend = desc.BlendState;
+    state.sample_mask = desc.SampleMask;
+    state.rasterizer = desc.RasterizerState;
+    state.depth_stencil = desc.DepthStencilState;
+    state.strip_cut = desc.IBStripCutValue;
+    state.topology = desc.PrimitiveTopologyType;
+    state.render_targets = desc.NumRenderTargets;
+    std::memcpy(state.formats, desc.RTVFormats, sizeof(state.formats));
+    state.depth_format = desc.DSVFormat;
+    state.samples = desc.SampleDesc;
+    size_t total = sizeof(state);
+    for (size_t i = 0; i < graphics_stages; ++i) {
+        const auto size = shaders[i].BytecodeLength;
+        if (size > max_shader_bytes || size > max_graphics_bytes - total
+            || (size && !shaders[i].pShaderBytecode)) return;
+        state.code_sizes[i] = static_cast<uint32_t>(size);
+        total += size;
+    }
+    std::vector<uint8_t> payload;
+    payload.reserve(total);
+    append_payload(payload, &state, sizeof(state));
+    for (const auto& shader : shaders) append_payload(payload, shader.pShaderBytecode, shader.BytecodeLength);
+    for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+        const auto& element = desc.InputLayout.pInputElementDescs[i];
+        const size_t name_size = element.SemanticName ? strnlen_s(element.SemanticName, 256) + 1 : 0;
+        if (name_size <= 1 || name_size > 256 || payload.size() + sizeof(InputElement) + name_size > max_graphics_bytes)
+            return;
+        const InputElement entry{static_cast<uint32_t>(name_size), element.SemanticIndex, element.Format,
+            element.InputSlot, element.AlignedByteOffset, element.InputSlotClass, element.InstanceDataStepRate};
+        append_payload(payload, &entry, sizeof(entry));
+        append_payload(payload, element.SemanticName, name_size);
+    }
+    append_pipeline(payload.data(), static_cast<uint32_t>(payload.size()), desc.pRootSignature,
+                    desc.NodeMask, desc.Flags, graphics_kind, elapsed);
+}
+
+HRESULT STDMETHODCALLTYPE record_graphics(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+                                          REFIID iid, void** result) {
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+    const auto start = Clock::now();
+    const HRESULT hr = reinterpret_cast<Fn>(tessera::vt_orig(graphics_hook, device))(device, desc, iid, result);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+    if (SUCCEEDED(hr) && desc && result && *result) {
+        try { append_graphics(*desc, elapsed); } catch (...) {}
+    }
+    return hr;
+}
+
+bool arm_capture() {
+    if (!capture_enabled()) return false;
+    static const bool pinned = [] {
+        HMODULE self{};
+        return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(&record_root), &self) != FALSE;
+    }();
+    return pinned;
+}
+
+void hook_device(void* result) {
+    ComPtr<ID3D12Device> device;
+    if (SUCCEEDED(static_cast<IUnknown*>(result)->QueryInterface(IID_PPV_ARGS(&device)))
+        && tessera::vt_hook(root_hook, device.Get())) {
+        tessera::vt_hook(compute_hook, device.Get());
+        tessera::vt_hook(graphics_hook, device.Get());
+    }
+}
+
+void hook_factory(void* result) {
+    ComPtr<ID3D12DeviceFactory> factory;
+    if (SUCCEEDED(static_cast<IUnknown*>(result)->QueryInterface(IID_PPV_ARGS(&factory))))
+        tessera::vt_hook(factory_hook, factory.Get());
+}
+
+HRESULT STDMETHODCALLTYPE factory_device(ID3D12DeviceFactory* factory, IUnknown* adapter, D3D_FEATURE_LEVEL level,
+                                        REFIID iid, void** result) {
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12DeviceFactory*, IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    const HRESULT hr = reinterpret_cast<Fn>(tessera::vt_orig(factory_hook, factory))(factory, adapter, level, iid, result);
+    if (SUCCEEDED(hr) && result && *result) hook_device(*result);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE sdk_factory(ID3D12SDKConfiguration1* sdk, UINT sdk_version, LPCSTR path, REFIID iid, void** result) {
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12SDKConfiguration1*, UINT, LPCSTR, REFIID, void**);
+    const HRESULT hr = reinterpret_cast<Fn>(tessera::vt_orig(sdk_hook, sdk))(sdk, sdk_version, path, iid, result);
+    if (SUCCEEDED(hr) && result && *result) hook_factory(*result);
     return hr;
 }
 
@@ -150,15 +260,17 @@ extern "C" HRESULT WINAPI Tessera_D3D12CreateDevice(IUnknown* adapter, D3D_FEATU
                                                    REFIID iid, void** result) {
     const auto next = reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(tessera_resolve(tessera::exports::kD3D12CreateDevice));
     const HRESULT hr = next(adapter, level, iid, result);
-    if (FAILED(hr) || !result || !*result || !capture_enabled()) return hr;
-    ComPtr<ID3D12Device> device;
-    if (SUCCEEDED(static_cast<IUnknown*>(*result)->QueryInterface(IID_PPV_ARGS(&device)))) {
-        HMODULE pinned;
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-            reinterpret_cast<LPCWSTR>(&Tessera_D3D12CreateDevice), &pinned)
-            && tessera::vt_hook(root_hook, device.Get())) {
-            tessera::vt_hook(compute_hook, device.Get());
-        }
-    }
+    if (SUCCEEDED(hr) && result && *result && arm_capture()) hook_device(*result);
+    return hr;
+}
+
+extern "C" HRESULT WINAPI Tessera_D3D12GetInterface(REFCLSID clsid, REFIID iid, void** result) {
+    const auto next = reinterpret_cast<PFN_D3D12_GET_INTERFACE>(tessera_resolve(tessera::exports::kD3D12GetInterface));
+    const HRESULT hr = next(clsid, iid, result);
+    if (FAILED(hr) || !result || !*result || !arm_capture()) return hr;
+    hook_factory(*result);
+    ComPtr<ID3D12SDKConfiguration1> sdk;
+    if (SUCCEEDED(static_cast<IUnknown*>(*result)->QueryInterface(IID_PPV_ARGS(&sdk))))
+        tessera::vt_hook(sdk_hook, sdk.Get());
     return hr;
 }

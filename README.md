@@ -77,15 +77,16 @@ The scan reads precompiled shaders embedded in recomp executables and disk
 caches, including Unleashed Recompiled's Zstandard and SMOL-V libraries,
 Savage Wind's `SPZ1` files, and Skate 3's per-user `nrhi_shaders` cache.
 
-The x64 D3D12 capture DLL records compute pipelines created through
-`D3D12CreateDevice` and `ID3D12Device::CreateComputePipelineState`. In an
-isolated copy of a game that uses these entry points, place
+The x64 D3D12 capture DLL records compute and graphics pipelines created
+through the corresponding `ID3D12Device` methods. It observes devices
+created through `D3D12CreateDevice` or through an Agility factory obtained
+via `D3D12GetInterface`. In an isolated copy of a game, place
 `tessera_d3d12_capture.dll` next to its executable as `d3d12.dll` and set
 `TESSERA_D3D12_CAPTURE` to a new output file for the game process. Use
 `tessera.exe --prepare-d3d12-capture <game-exe> <capture>` once the game closes.
 The recorded duration is the time spent in the driver's pipeline creation call.
-The capture covers the entry points above and excludes graphics pipelines,
-pipeline state streams and devices created through an Agility factory.
+The capture excludes pipeline state streams, stream-output declarations and
+ray tracing state objects.
 
 Build the Windows Vulkan layer with `-DTESSERA_BUILD_VULKAN_TELEMETRY=ON`
 and the Vulkan SDK headers. For the game process, set `VK_LAYER_PATH` to
