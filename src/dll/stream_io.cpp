@@ -99,6 +99,13 @@ bool describe(HANDLE h, File& f, uint64_t& key) {
 
 OpenFile& handle_slot(HANDLE h) { return g_handles[(reinterpret_cast<uintptr_t>(h) >> 2) % kHandles]; }
 
+// A handle value is reused once closed: drop it from its slot on every open and close we see.
+void forget(HANDLE h) {
+    auto& s = handle_slot(h);
+    HANDLE expected = h;
+    s.handle.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed);
+}
+
 void remember(HANDLE h, DWORD access, DWORD creation, DWORD flags) {
     if (h == INVALID_HANDLE_VALUE || creation != OPEN_EXISTING || !(access & GENERIC_READ) ||
         (access & (GENERIC_WRITE | GENERIC_ALL | DELETE)) || (flags & FILE_FLAG_DELETE_ON_CLOSE))
@@ -205,6 +212,7 @@ void record(unsigned file, uint64_t offset, DWORD bytes) {
 HANDLE WINAPI open_file(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security, DWORD creation,
                         DWORD flags, HANDLE template_file) {
     const HANDLE h = CreateFileW(name, access, share, security, creation, flags, template_file);
+    if (h != INVALID_HANDLE_VALUE) forget(h);
     if (g_track_reads.load(std::memory_order_acquire)) {
         const DWORD error = GetLastError();
         remember(h, access, creation, flags);
@@ -246,11 +254,8 @@ BOOL WINAPI read_file(HANDLE h, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVER
 }
 
 BOOL WINAPI close_file(HANDLE h) {
-    if (g_track_reads.load(std::memory_order_acquire)) {
-        auto& s = handle_slot(h);
-        HANDLE expected = h;
-        s.handle.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed);
-    }
+    // Also while tracking is paused, or the slot would name another file once h is reused.
+    forget(h);
     return CloseHandle(h);
 }
 
