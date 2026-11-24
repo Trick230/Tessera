@@ -621,23 +621,44 @@ HRESULT replay_stream(ID3D12Device* device, ID3D12RootSignature* root, std::vect
     return device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline));
 }
 
-HRESULT replay_raytracing(ID3D12Device* device, std::vector<uint8_t>& payload) {
+HRESULT create_ray_state(ID3D12Device* device, uint32_t kind, std::span<const uint8_t> data,
+                         unsigned depth, size_t& budget, Microsoft::WRL::ComPtr<ID3D12StateObject>& state) {
     using namespace tessera::d3d12_capture;
     using Microsoft::WRL::ComPtr;
-    ComPtr<ID3D12Device5> device5;
-    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device5)))) return E_NOINTERFACE;
+    if (depth >= 16 || data.size() > budget) return E_INVALIDARG;
+    budget -= data.size();
+    ComPtr<ID3D12StateObject> parent;
+    if (kind == raytracing_add_kind) {
+        RayAddition header{};
+        if (!take_capture(data, header) || header.parent_size > data.size()
+            || header.addition_size != data.size() - header.parent_size) return E_INVALIDARG;
+        auto base = data.first(header.parent_size);
+        uint32_t parent_kind = 0;
+        if (!take_capture(base, parent_kind)) return E_INVALIDARG;
+        const HRESULT hr = create_ray_state(device, parent_kind, base, depth + 1, budget, parent);
+        if (FAILED(hr)) return hr;
+        data = data.subspan(header.parent_size);
+    } else if (kind != raytracing_kind) {
+        return E_INVALIDARG;
+    }
+    std::vector<uint8_t> payload(data.begin(), data.end());
     struct RootSlot {
         ComPtr<ID3D12RootSignature> signature;
         D3D12_GLOBAL_ROOT_SIGNATURE global{};
         D3D12_LOCAL_ROOT_SIGNATURE local{};
     };
+    struct DependencySlot {
+        ComPtr<ID3D12StateObject> state;
+        D3D12_EXISTING_COLLECTION_DESC desc{};
+    };
     std::deque<RootSlot> roots;
-    HRESULT root_result = S_OK;
+    std::deque<DependencySlot> dependencies;
+    HRESULT dependent_result = S_OK;
     const auto create_root = [&](D3D12_STATE_SUBOBJECT& sub, const RayRoot& root) {
         auto& slot = roots.emplace_back();
         if (root.size) {
-            root_result = device->CreateRootSignature(root.node_mask, root.bytes, root.size, IID_PPV_ARGS(&slot.signature));
-            if (FAILED(root_result)) return false;
+            dependent_result = device->CreateRootSignature(root.node_mask, root.bytes, root.size, IID_PPV_ARGS(&slot.signature));
+            if (FAILED(dependent_result)) return false;
         }
         if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE) {
             slot.global.pGlobalRootSignature = slot.signature.Get();
@@ -648,10 +669,27 @@ HRESULT replay_raytracing(ID3D12Device* device, std::vector<uint8_t>& payload) {
         }
         return true;
     };
+    const auto create_dependency = [&](D3D12_STATE_SUBOBJECT& sub, const RayDependency& dependency) {
+        std::span<const uint8_t> bytes(dependency.bytes, dependency.size);
+        uint32_t dependency_kind = 0;
+        if (!take_capture(bytes, dependency_kind)) return false;
+        auto& slot = dependencies.emplace_back();
+        dependent_result = create_ray_state(device, dependency_kind, bytes, depth + 1, budget, slot.state);
+        if (FAILED(dependent_result)) return false;
+        slot.desc = {slot.state.Get(), dependency.export_count, dependency.exports};
+        sub.pDesc = &slot.desc;
+        return true;
+    };
     D3D12_STATE_OBJECT_DESC desc{};
-    if (!relocate_raytracing<false>(payload, {}, desc, create_root))
-        return FAILED(root_result) ? root_result : E_INVALIDARG;
-    ComPtr<ID3D12StateObject> state;
+    if (!relocate_raytracing<false>(payload, {}, desc, create_root, create_dependency))
+        return FAILED(dependent_result) ? dependent_result : E_INVALIDARG;
+    if (parent) {
+        ComPtr<ID3D12Device7> device7;
+        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device7)))) return E_NOINTERFACE;
+        return device7->AddToStateObject(&desc, parent.Get(), IID_PPV_ARGS(&state));
+    }
+    ComPtr<ID3D12Device5> device5;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device5)))) return E_NOINTERFACE;
     return device5->CreateStateObject(&desc, IID_PPV_ARGS(&state));
 }
 
@@ -676,15 +714,15 @@ int replay_d3d12(const wchar_t* path, bool warp) {
     }
     std::vector<uint8_t> payload, root;
     uint64_t total_bytes = sizeof(header);
-    size_t prepared[4]{}, failed = 0;
-    const auto completed = [&] { return prepared[0] + prepared[1] + prepared[2] + prepared[3] + failed; };
+    size_t prepared[5]{}, failed = 0;
+    const auto completed = [&] { return prepared[0] + prepared[1] + prepared[2] + prepared[3] + prepared[4] + failed; };
     while (true) {
         Record record{};
         const size_t received = fread(&record, 1, sizeof(record), file.get());
         if (received == 0 && feof(file.get())) break;
         const uint64_t size = sizeof(record) + uint64_t{record.payload_size} + record.root_size;
         const uint32_t max_payload = record.kind == compute_kind ? max_shader_bytes : max_graphics_bytes;
-        if (received != sizeof(record) || record.kind > raytracing_kind || !record.payload_size || record.payload_size > max_payload
+        if (received != sizeof(record) || record.kind > raytracing_add_kind || !record.payload_size || record.payload_size > max_payload
             || record.root_size > max_root_bytes || total_bytes > max_capture_bytes - size) {
             fprintf(stderr, "invalid D3D12 capture record after %zu pipelines\n", completed());
             return 1;
@@ -706,8 +744,10 @@ int replay_d3d12(const wchar_t* path, bool warp) {
             hr = replay_graphics(device.dev.Get(), signature.Get(), record, payload);
         } else if (SUCCEEDED(hr) && record.kind == stream_kind) {
             hr = replay_stream(device.dev.Get(), signature.Get(), payload);
-        } else if (SUCCEEDED(hr) && record.kind == raytracing_kind) {
-            hr = replay_raytracing(device.dev.Get(), payload);
+        } else if (SUCCEEDED(hr) && (record.kind == raytracing_kind || record.kind == raytracing_add_kind)) {
+            size_t budget = 128 << 20;
+            Microsoft::WRL::ComPtr<ID3D12StateObject> state;
+            hr = create_ray_state(device.dev.Get(), record.kind, payload, 0, budget, state);
         } else if (SUCCEEDED(hr)) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
             desc.pRootSignature = signature.Get();
@@ -725,8 +765,8 @@ int replay_d3d12(const wchar_t* path, bool warp) {
             if (device.removed()) break;
         }
     }
-    printf("D3D12 pipelines prepared: %zu compute, %zu graphics, %zu streams, %zu ray tracing, %zu failed%s\n",
-           prepared[0], prepared[1], prepared[2], prepared[3], failed, warp ? " (WARP)" : "");
+    printf("D3D12 pipelines prepared: %zu compute, %zu graphics, %zu streams, %zu ray tracing, %zu ray tracing additions, %zu failed%s\n",
+           prepared[0], prepared[1], prepared[2], prepared[3], prepared[4], failed, warp ? " (WARP)" : "");
     return failed != 0 || completed() == 0 ? 1 : 0;
 }
 

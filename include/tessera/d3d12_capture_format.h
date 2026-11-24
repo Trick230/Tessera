@@ -16,6 +16,7 @@ inline constexpr uint32_t compute_kind = 0;
 inline constexpr uint32_t graphics_kind = 1;
 inline constexpr uint32_t stream_kind = 2;
 inline constexpr uint32_t raytracing_kind = 3;
+inline constexpr uint32_t raytracing_add_kind = 4;
 inline constexpr size_t graphics_stages = 5;
 
 struct Header {

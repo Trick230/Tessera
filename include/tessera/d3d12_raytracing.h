@@ -6,7 +6,19 @@
 namespace tessera::d3d12_capture {
 struct RayHeader {
     uint32_t subobjects;
-    uint32_t reserved;
+    uint32_t collection;
+};
+
+struct RayAddition {
+    uint32_t parent_size;
+    uint32_t addition_size;
+};
+
+struct RayDependency {
+    const uint8_t* bytes;
+    uint32_t size;
+    uint32_t export_count;
+    const D3D12_EXPORT_DESC* exports;
 };
 
 struct RayRoot {
@@ -21,22 +33,23 @@ inline constexpr size_t max_ray_name = 4096;
 
 // Ray tracing subobject descriptions use the same checked offsets as
 // pipeline streams. An association points to a subobject index in this record.
-template<bool Capture, class Root>
+template<bool Capture, class Root, class Dependency>
 bool relocate_raytracing(std::vector<uint8_t>& payload, const D3D12_STATE_OBJECT_DESC& source,
-                         D3D12_STATE_OBJECT_DESC& result, Root&& update_root) {
+                         D3D12_STATE_OBJECT_DESC& result, Root&& update_root, Dependency&& update_dependency) {
     if constexpr (sizeof(void*) != 8) return false;
     RayHeader header{};
     if constexpr (Capture) {
-        if (source.Type != D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE
+        if ((source.Type != D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE && source.Type != D3D12_STATE_OBJECT_TYPE_COLLECTION)
             || !source.NumSubobjects || source.NumSubobjects > max_ray_subobjects || !source.pSubobjects)
             return false;
         header.subobjects = source.NumSubobjects;
+        header.collection = source.Type == D3D12_STATE_OBJECT_TYPE_COLLECTION;
         payload.resize(sizeof(header) + header.subobjects * sizeof(D3D12_STATE_SUBOBJECT));
         std::memcpy(payload.data(), &header, sizeof(header));
     } else {
         if (payload.size() < sizeof(header)) return false;
         std::memcpy(&header, payload.data(), sizeof(header));
-        if (header.reserved || !header.subobjects || header.subobjects > max_ray_subobjects) return false;
+        if (header.collection > 1 || !header.subobjects || header.subobjects > max_ray_subobjects) return false;
     }
     const size_t table_end = sizeof(header) + header.subobjects * sizeof(D3D12_STATE_SUBOBJECT);
     if (table_end > payload.size()) return false;
@@ -47,6 +60,10 @@ bool relocate_raytracing(std::vector<uint8_t>& payload, const D3D12_STATE_OBJECT
         if (!relocator.mapped_array(entries, count, max_ray_exports, wide)) return false;
         array = const_cast<LPCWSTR*>(entries);
         return true;
+    };
+    const auto definitions = [&](const D3D12_EXPORT_DESC*& names, UINT count) {
+        return relocator.mapped_array(names, count, max_ray_exports,
+            [&](D3D12_EXPORT_DESC& name) { return wide(name.Name) && wide(name.ExportToRename); });
     };
     for (uint32_t i = 0; i < header.subobjects; ++i) {
         const size_t at = sizeof(header) + i * sizeof(D3D12_STATE_SUBOBJECT);
@@ -111,10 +128,31 @@ bool relocate_raytracing(std::vector<uint8_t>& payload, const D3D12_STATE_OBJECT
                     auto* bytes = static_cast<const uint8_t*>(library.DXILLibrary.pShaderBytecode);
                     if (!relocator.array(bytes, library.DXILLibrary.BytecodeLength, max_shader_bytes)) return false;
                     library.DXILLibrary.pShaderBytecode = bytes;
-                    return relocator.mapped_array(library.pExports, library.NumExports, max_ray_exports,
-                        [&](D3D12_EXPORT_DESC& name) { return wide(name.Name) && wide(name.ExportToRename); });
+                    return definitions(library.pExports, library.NumExports);
                 });
                 break;
+            case D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION: {
+                const auto dependency = [&](RayDependency& value) {
+                    return value.size && relocator.array(value.bytes, value.size, max_graphics_bytes)
+                        && definitions(value.exports, value.export_count);
+                };
+                if constexpr (Capture) {
+                    const auto& desc = *static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(item.pDesc);
+                    std::vector<uint8_t> bytes;
+                    if (!update_dependency(desc.pExistingCollection, bytes)) return false;
+                    const RayDependency wire{bytes.data(), static_cast<uint32_t>(bytes.size()), desc.NumExports, desc.pExports};
+                    item.pDesc = &wire;
+                    ok = field.template operator()<RayDependency>(dependency);
+                } else {
+                    RayDependency decoded{};
+                    ok = field.template operator()<RayDependency>([&](auto& value) {
+                        if (!dependency(value)) return false;
+                        decoded = value;
+                        return true;
+                    }) && update_dependency(item, decoded);
+                }
+                break;
+            }
             case D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP:
                 ok = field.template operator()<D3D12_HIT_GROUP_DESC>([&](auto& group) {
                     return wide(group.HitGroupExport) && wide(group.AnyHitShaderImport)
@@ -149,7 +187,7 @@ bool relocate_raytracing(std::vector<uint8_t>& payload, const D3D12_STATE_OBJECT
         std::memcpy(payload.data() + at, &item, sizeof(item));
     }
     if constexpr (!Capture) {
-        result = {D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, header.subobjects,
+        result = {header.collection ? D3D12_STATE_OBJECT_TYPE_COLLECTION : D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, header.subobjects,
             reinterpret_cast<const D3D12_STATE_SUBOBJECT*>(payload.data() + sizeof(header))};
     }
     return true;

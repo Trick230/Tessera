@@ -21,6 +21,7 @@ using Microsoft::WRL::ComPtr;
 using Clock = std::chrono::steady_clock;
 
 constexpr GUID root_data = {0x18dd39b3, 0xe76e, 0x482f, {0x83, 0xbc, 0x6c, 0x24, 0x24, 0x1f, 0xff, 0x82}};
+constexpr GUID state_data = {0x0902ebfa, 0xeed7, 0x40b9, {0xbd, 0x07, 0x39, 0x1c, 0x24, 0x5a, 0x47, 0x70}};
 INIT_ONCE capture_once = INIT_ONCE_STATIC_INIT;
 INIT_ONCE runtime_once = INIT_ONCE_STATIC_INIT;
 SRWLOCK capture_lock = SRWLOCK_INIT;
@@ -73,6 +74,7 @@ HRESULT STDMETHODCALLTYPE record_compute(ID3D12Device*, const D3D12_COMPUTE_PIPE
 HRESULT STDMETHODCALLTYPE record_graphics(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE record_stream(ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE record_raytracing(ID3D12Device5*, const D3D12_STATE_OBJECT_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE record_addition(ID3D12Device7*, const D3D12_STATE_OBJECT_DESC*, ID3D12StateObject*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE factory_device(ID3D12DeviceFactory*, IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 HRESULT STDMETHODCALLTYPE sdk_factory(ID3D12SDKConfiguration1*, UINT, LPCSTR, REFIID, void**);
 tessera::VtHook root_hook{16, reinterpret_cast<void*>(&record_root)};
@@ -80,6 +82,7 @@ tessera::VtHook compute_hook{11, reinterpret_cast<void*>(&record_compute)};
 tessera::VtHook graphics_hook{10, reinterpret_cast<void*>(&record_graphics)};
 tessera::VtHook stream_hook{47, reinterpret_cast<void*>(&record_stream)};
 tessera::VtHook raytracing_hook{62, reinterpret_cast<void*>(&record_raytracing)};
+tessera::VtHook addition_hook{66, reinterpret_cast<void*>(&record_addition)};
 tessera::VtHook factory_hook{9, reinterpret_cast<void*>(&factory_device)};
 tessera::VtHook sdk_hook{4, reinterpret_cast<void*>(&sdk_factory)};
 
@@ -234,19 +237,69 @@ HRESULT STDMETHODCALLTYPE record_stream(ID3D12Device2* device, const D3D12_PIPEL
     return hr;
 }
 
+bool read_state(ID3D12StateObject* state, std::vector<uint8_t>& bytes) {
+    if (!state) return false;
+    UINT size = 0;
+    state->GetPrivateData(state_data, &size, nullptr);
+    if (size <= sizeof(uint32_t) || size > max_graphics_bytes) return false;
+    bytes.resize(size);
+    return SUCCEEDED(state->GetPrivateData(state_data, &size, bytes.data())) && size == bytes.size();
+}
+
+void remember_state(void* result, const std::vector<uint8_t>& payload, uint32_t kind) {
+    if (payload.size() > max_graphics_bytes - sizeof(kind)) return;
+    ComPtr<ID3D12StateObject> state;
+    if (FAILED(static_cast<IUnknown*>(result)->QueryInterface(IID_PPV_ARGS(&state)))) return;
+    std::vector<uint8_t> stored;
+    stored.reserve(sizeof(kind) + payload.size());
+    append_payload(stored, &kind, sizeof(kind));
+    append_payload(stored, payload.data(), payload.size());
+    state->SetPrivateData(state_data, static_cast<UINT>(stored.size()), stored.data());
+}
+
 HRESULT STDMETHODCALLTYPE record_raytracing(ID3D12Device5* device, const D3D12_STATE_OBJECT_DESC* desc,
                                             REFIID iid, void** result) {
     using Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device5*, const D3D12_STATE_OBJECT_DESC*, REFIID, void**);
     const auto start = Clock::now();
     const HRESULT hr = reinterpret_cast<Fn>(tessera::vt_orig(raytracing_hook, device))(device, desc, iid, result);
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
-    if (SUCCEEDED(hr) && desc && result && *result && desc->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE) {
+    if (SUCCEEDED(hr) && desc && result && *result) {
         try {
             D3D12_STATE_OBJECT_DESC unused{};
             std::vector<uint8_t> payload;
-            if (relocate_raytracing<true>(payload, *desc, unused, read_root_signature))
-                append_pipeline(payload.data(), static_cast<uint32_t>(payload.size()), nullptr, 0,
-                    D3D12_PIPELINE_STATE_FLAG_NONE, raytracing_kind, elapsed);
+            if (relocate_raytracing<true>(payload, *desc, unused, read_root_signature, read_state)) {
+                remember_state(*result, payload, raytracing_kind);
+                if (desc->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
+                    append_pipeline(payload.data(), static_cast<uint32_t>(payload.size()), nullptr, 0,
+                        D3D12_PIPELINE_STATE_FLAG_NONE, raytracing_kind, elapsed);
+            }
+        } catch (...) {}
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE record_addition(ID3D12Device7* device, const D3D12_STATE_OBJECT_DESC* desc,
+                                         ID3D12StateObject* parent, REFIID iid, void** result) {
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device7*, const D3D12_STATE_OBJECT_DESC*, ID3D12StateObject*, REFIID, void**);
+    const auto start = Clock::now();
+    const HRESULT hr = reinterpret_cast<Fn>(tessera::vt_orig(addition_hook, device))(device, desc, parent, iid, result);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+    if (SUCCEEDED(hr) && desc && result && *result) {
+        try {
+            D3D12_STATE_OBJECT_DESC unused{};
+            std::vector<uint8_t> base, addition;
+            if (read_state(parent, base) && relocate_raytracing<true>(addition, *desc, unused, read_root_signature, read_state)
+                && sizeof(RayAddition) + base.size() + addition.size() <= max_graphics_bytes) {
+                const RayAddition header{static_cast<uint32_t>(base.size()), static_cast<uint32_t>(addition.size())};
+                std::vector<uint8_t> payload;
+                append_payload(payload, &header, sizeof(header));
+                append_payload(payload, base.data(), base.size());
+                append_payload(payload, addition.data(), addition.size());
+                remember_state(*result, payload, raytracing_add_kind);
+                if (desc->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
+                    append_pipeline(payload.data(), static_cast<uint32_t>(payload.size()), nullptr, 0,
+                        D3D12_PIPELINE_STATE_FLAG_NONE, raytracing_add_kind, elapsed);
+            }
         } catch (...) {}
     }
     return hr;
@@ -278,6 +331,12 @@ void hook_device(void* result) {
     if (SUCCEEDED(static_cast<IUnknown*>(result)->QueryInterface(IID_PPV_ARGS(&device5)))) {
         tessera::vt_hook(root_hook, device5.Get());
         tessera::vt_hook(raytracing_hook, device5.Get());
+    }
+    ComPtr<ID3D12Device7> device7;
+    if (SUCCEEDED(static_cast<IUnknown*>(result)->QueryInterface(IID_PPV_ARGS(&device7)))) {
+        tessera::vt_hook(root_hook, device7.Get());
+        tessera::vt_hook(raytracing_hook, device7.Get());
+        tessera::vt_hook(addition_hook, device7.Get());
     }
 }
 
