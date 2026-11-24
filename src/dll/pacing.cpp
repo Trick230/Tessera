@@ -23,6 +23,9 @@ bool g_driver_pacing = false;
 unsigned g_seen_revision = 0;
 std::atomic<unsigned> g_pacing_revision{0};
 std::atomic<bool> g_smooth_motion{false};
+// NVAPI pacing on a non-D3D11 device. A D3D12 swap chain reports its queue, not the
+// device, so it cannot be matched per device: all non-D3D11 swap chains yield.
+std::atomic<bool> g_other_paced{false};
 constexpr GUID kDriverPacing = {0x9325db93, 0x1d96, 0x4eab, {0x92, 0x1e, 0xd4, 0xd1, 0xa2, 0xd0, 0x65, 0xba}};
 const int64_t g_freq = [] {
     LARGE_INTEGER f;
@@ -57,7 +60,7 @@ void wait_until(int64_t deadline) {
 }
 bool driver_pacing(IDXGISwapChain* sc) {
     ID3D11Device* dev = nullptr;
-    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&dev)))) return false;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&dev)))) return g_other_paced.load(std::memory_order_relaxed);
     bool active = false;
     UINT size = sizeof active;
     const HRESULT hr = dev->GetPrivateData(kDriverPacing, &size, &active);
@@ -114,7 +117,11 @@ uint32_t pace_before_present(IDXGISwapChain* sc) {
 void pacing_set_driver_mode(IUnknown* device, bool active) {
     if (!device || config().fps_limit <= 0) return;
     ID3D11Device* dev = nullptr;
-    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dev)))) return;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dev)))) {
+        g_other_paced.store(active, std::memory_order_relaxed);
+        g_pacing_revision.fetch_add(1, std::memory_order_release);
+        return;
+    }
     const HRESULT hr = dev->SetPrivateData(kDriverPacing, active ? sizeof active : 0, active ? &active : nullptr);
     dev->Release();
     if (SUCCEEDED(hr)) g_pacing_revision.fetch_add(1, std::memory_order_release);
