@@ -10,7 +10,6 @@ struct Config {
     bool present_cpu_sets = false;  // P4: select performance cores for the presenting thread
     bool residency = true;      // M2: eviction priority of render targets and buffers
     int fps_limit = 0;          // P1: frame limiter, 0 = off
-    int ext_fps_limit = 0;      // P1: lowest limit of another tool (RTSS, NVIDIA), written by the app
     int limiter_mode = 1;       // P1: 0 wait before Present, 1 low latency, 2 wait at frame start
     int max_frame_latency = 0;  // P3: DXGI maximum frame latency, 0 = leave the game's
     bool d3d11_call_diagnostics = false;

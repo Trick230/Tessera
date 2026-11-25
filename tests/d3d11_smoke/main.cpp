@@ -3,7 +3,7 @@
 //   d3d11_smoke            render through both creation paths, then exit cleanly
 //   d3d11_smoke --crash    create a device and die without DLL detach
 //   d3d11_smoke --tiled    mip residency (M3-M5), with mip_residency=1 and mip_force_evict=1
-//   d3d11_smoke --pacing [driver]   measure recovery after a late frame or verify driver handoff
+//   d3d11_smoke --pacing [driver]   measure recovery after a late frame or verify the cap ignores driver pacing
 //   d3d11_smoke --limiter-bench / --limiter-report   frame limiter latency and cadence (limiter_bench.cpp)
 //   d3d11_smoke --verify <sessions dir> [fps]   check the newest session file;
 //       with fps, also check that the frame limiter held that rate
@@ -487,19 +487,19 @@ int pacing_driver(ID3D11Device* dev, IDXGISwapChain* sc, int64_t freq) {
         uint8_t padding[31] = {};
     } params;
     static_assert(sizeof params == 44);
-    const auto measure = [&](bool expect_cap) {
+    const auto measure = [&]() {
         sc->Present(0, 0);
         LARGE_INTEGER start, stop;
         QueryPerformanceCounter(&start);
         for (int i = 0; i < 10; ++i) sc->Present(0, 0);
         QueryPerformanceCounter(&stop);
         const double average_ms = (stop.QuadPart - start.QuadPart) * 100.0 / freq;
-        std::printf("NVAPI probe: %s, %.2f ms/frame\n", expect_cap ? "Tessera cap" : "delegated", average_ms);
-        return expect_cap ? average_ms >= 15.0 : average_ms < 10.0;
+        std::printf("NVAPI probe: %.2f ms/frame\n", average_ms);
+        return average_ms >= 15.0;  // the cap stays in charge whatever NVAPI is told
     };
 
     Sleep(2100);  // Let the background poll see the loaded, inactive SDK.
-    if (!measure(true)) return fail("idle Reflex SDK must leave Tessera's cap active");
+    if (!measure()) return fail("idle Reflex SDK must leave Tessera's cap active");
     ID3D11Device* other = nullptr;
     const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
                                          D3D11_SDK_VERSION, &other, nullptr, nullptr);
@@ -507,17 +507,17 @@ int pacing_driver(ID3D11Device* dev, IDXGISwapChain* sc, int64_t freq) {
     params.low_latency = true;
     const int secondary_status = set_mode(other, &params);
     other->Release();
-    if (secondary_status != 0 || !measure(true)) return fail("NVAPI mode on a secondary device must leave the cap active");
-    if (set_mode(dev, &params) != 0 || !measure(false)) return fail("handoff with Reflex enabled");
+    if (secondary_status != 0 || !measure()) return fail("NVAPI mode on a secondary device must leave the cap active");
+    if (set_mode(dev, &params) != 0 || !measure()) return fail("Reflex enabled must leave the cap active");
     params.low_latency = false;
     params.reject = true;
-    if (set_mode(dev, &params) == 0 || !measure(false)) return fail("failed NVAPI change must leave the cap delegated");
+    if (set_mode(dev, &params) == 0 || !measure()) return fail("failed NVAPI change must leave the cap active");
     params.reject = false;
-    if (set_mode(dev, &params) != 0 || !measure(true)) return fail("cap resumes after Reflex is disabled");
+    if (set_mode(dev, &params) != 0 || !measure()) return fail("cap after Reflex is disabled");
     params.interval = 20000;
-    if (set_mode(dev, &params) != 0 || !measure(false)) return fail("handoff to an explicit NVAPI cap");
+    if (set_mode(dev, &params) != 0 || !measure()) return fail("an explicit NVAPI cap must leave the cap active");
     params.interval = 0;
-    if (set_mode(dev, &params) != 0 || !measure(true)) return fail("cap resumes after NVAPI cap is disabled");
+    if (set_mode(dev, &params) != 0 || !measure()) return fail("cap after the NVAPI cap is disabled");
     return 0;
 }
 

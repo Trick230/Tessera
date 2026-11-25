@@ -51,10 +51,10 @@ frames. `limiter_mode=0` waits just before the present (steady, up to one interv
 
 D3D12 games get the same layer as `dxgi.dll` (`tessera_dxgi.dll`): it hooks the swap chains created from DXGI
 factories, so the frame limiter and session recording work there. Vulkan-only games get it as `vulkan-1.dll`
-(`tessera_vulkan.dll`): it wraps `vkQueuePresentKHR` (export and `vkGet*ProcAddr`) and yields while
-`VK_NV_low_latency2` sleep mode is on. On both, the memory, residency, presentation and texture modules stay
+(`tessera_vulkan.dll`): it wraps `vkQueuePresentKHR` (export and `vkGet*ProcAddr`). On both, the memory, residency, presentation and texture modules stay
 idle (the app hides their options). When the limiter is on it
-also caps frame generation (Smooth Motion, XeSS-FG, FidelityFX): it does not step aside for it. `tessera_vulkan_present <fps> <csv>` (built with
+is in charge on every API: it never yields to Reflex, NVAPI or Vulkan low-latency modes, frame generation
+(Smooth Motion, XeSS-FG, FidelityFX), RTSS or the NVIDIA limiter. `tessera_vulkan_present <fps> <csv>` (built with
 `-Vulkan`) is the Vulkan bench; it runs with the layer copied next to it as `vulkan-1.dll`.
 
 ## Command line

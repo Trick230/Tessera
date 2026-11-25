@@ -37,7 +37,6 @@ BOOL CALLBACK load_once(PINIT_ONCE, void*, void**) {
     c.residency = get(L"residency", 0) != 0;
     c.fps_limit = clamp_int(get(L"fps_limit", 0), 0, 1000);
     if (c.fps_limit && c.fps_limit < 20) c.fps_limit = 0;  // nonsense values: off
-    c.ext_fps_limit = clamp_int(get(L"ext_fps_limit", 0), 0, 1000);
     c.limiter_mode = clamp_int(get(L"limiter_mode", 1), 0, 2);
     c.max_frame_latency = clamp_int(get(L"max_frame_latency", 0), 0, 16);
     c.d3d11_call_diagnostics = get(L"d3d11_call_diagnostics", 0) != 0;
@@ -70,15 +69,13 @@ void config_load() { InitOnceExecuteOnce(&g_once, load_once, nullptr, nullptr); 
 
 void config_log() {
     const Config& c = g_config;
-    logf("config: process %d priority %d residency %d fps_limit %d limiter_mode %d ext_fps_limit %d max_frame_latency %d "
+    logf("config: process %d priority %d residency %d fps_limit %d limiter_mode %d max_frame_latency %d "
          "vram_budget_mb %d "
          "flip_model %d workset %d mip_residency %d mip_ram_mb %d mip_force_evict %d rt_recycle %d ue_cvars %d "
          "present_cpu_sets %d texture_dedup %d stream_io %d mip_prediction %d mip_streaming %d mip_feedback %d texture_quality %d",
-         c.process, c.priority, c.residency, c.fps_limit, c.limiter_mode, c.ext_fps_limit, c.max_frame_latency, c.vram_budget_mb,
+         c.process, c.priority, c.residency, c.fps_limit, c.limiter_mode, c.max_frame_latency, c.vram_budget_mb,
          c.flip_model, c.workset, c.mip_residency, c.mip_ram_mb, c.mip_force_evict, c.rt_recycle, c.ue_cvars,
          c.present_cpu_sets, c.texture_dedup, c.stream_io, c.mip_prediction, c.mip_streaming, c.mip_feedback, c.texture_quality);
-    if (c.fps_limit > 0 && c.ext_fps_limit > 0 && c.ext_fps_limit <= c.fps_limit)
-        logf("limiter: yielding to the configured external cap");
 }
 
 const Config& config() { return g_config; }

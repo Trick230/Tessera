@@ -922,9 +922,6 @@ fn start_view_worker(ui: &MainWindow, state: &Shared, st: &mut State) {
             }
             ViewJob::SyncSettings(game, budget) => {
                 if let Some((dir, exe)) = game.exe_dir().zip(game.exe.as_deref()) {
-                    if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
-                        let _ = install::note_external_limit(dir, name);
-                    }
                     if is_unreal(&game) && game.scan.architecture == Some(Architecture::X64) {
                         let _ = install::apply_ue_cvars(dir, exe, ue_vram_mb(budget));
                     }

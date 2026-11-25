@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// M1 / P6 through NVAPI: memory reported by NvAPI_GPU_GetMemoryInfo and
-// Reflex turned on with NvAPI_D3D_SetSleepMode.
+// M1 through NVAPI: memory reported by NvAPI_GPU_GetMemoryInfo.
 #pragma once
 
 namespace tessera {

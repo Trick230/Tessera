@@ -370,13 +370,6 @@ mod nvapi {
     const DRS_LOAD_SETTINGS: u32 = 0x375D_BD6B;
     const DRS_GET_BASE_PROFILE: u32 = 0xDA84_66A0;
     const DRS_GET_SETTING: u32 = 0x73BF_8338;
-    const DRS_FIND_APPLICATION_BY_NAME: u32 = 0xEEE5_66B2;
-
-    /// FRL_FPS_ID: the control panel's "Max Frame Rate", fps, 0 = off.
-    const FRAME_RATE_LIMIT: u32 = 0x1083_5002;
-    /// NVDRS_APPLICATION_V1: version, isPredefined, appName, userFriendlyName,
-    /// launcher (three 2048-u16 strings).
-    const APPLICATION_SIZE: usize = 8 + 3 * 4096;
 
     /// PS_SHADERDISKCACHE_MAX_SIZE_ID (value in MB).
     const SHADER_CACHE_MAX_SIZE: u32 = 0x00AC_8497;
@@ -399,14 +392,12 @@ mod nvapi {
     type SessionFn = unsafe extern "C" fn(*mut c_void) -> i32;
     type GetBaseProfile = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32;
     type GetSetting = unsafe extern "C" fn(*mut c_void, *mut c_void, u32, *mut Setting) -> i32;
-    type FindApplication = unsafe extern "C" fn(*mut c_void, *const u16, *mut *mut c_void, *mut u8) -> i32;
 
     /// A loaded DRS session: settings read from a profile.
     struct Drs {
         session: *mut c_void,
         base: *mut c_void,
         setting: GetSetting,
-        find: Option<FindApplication>,
     }
 
     impl Drs {
@@ -423,21 +414,6 @@ mod nvapi {
                 _ => Err(()),
             }
         }
-
-        /// The profile the driver applies to this executable, if any.
-        unsafe fn app_profile(&self, exe: &str) -> Option<*mut c_void> {
-            let find = self.find?;
-            let mut name = [0u16; 2048];
-            for (d, c) in name.iter_mut().take(2047).zip(exe.encode_utf16()) {
-                *d = c;
-            }
-            let mut app = vec![0u8; APPLICATION_SIZE];
-            let version = APPLICATION_SIZE as u32 | (1 << 16);
-            app[..4].copy_from_slice(&version.to_le_bytes());
-            let mut profile = std::ptr::null_mut();
-            (find(self.session, name.as_ptr(), &mut profile, app.as_mut_ptr()) == 0 && !profile.is_null())
-                .then_some(profile)
-        }
     }
 
     pub fn cache_limit() -> Option<NvCacheLimit> {
@@ -451,19 +427,6 @@ mod nvapi {
                 Some(0) => NvCacheLimit::Disabled,
                 Some(mb) => NvCacheLimit::Megabytes(mb),
             })
-        })
-    }
-
-    /// The control panel's Max Frame Rate for this executable (its own
-    /// profile first, then the global one); None when off or unreadable.
-    pub fn frame_limit(exe: &str) -> Option<u32> {
-        with_drs(|d| unsafe {
-            let app = d.app_profile(exe).and_then(|p| d.read(p, FRAME_RATE_LIMIT).ok().flatten());
-            let v = match app {
-                Some(v) => v,
-                None => d.read(d.base, FRAME_RATE_LIMIT).ok().flatten()?,
-            };
-            (v > 0).then_some(v)
         })
     }
 
@@ -503,7 +466,6 @@ mod nvapi {
             let load: SessionFn = std::mem::transmute(get(DRS_LOAD_SETTINGS)?);
             let base: GetBaseProfile = std::mem::transmute(get(DRS_GET_BASE_PROFILE)?);
             let setting: GetSetting = std::mem::transmute(get(DRS_GET_SETTING)?);
-            let find: Option<FindApplication> = get(DRS_FIND_APPLICATION_BY_NAME).map(|p| std::mem::transmute(p));
             let mut session = std::ptr::null_mut();
             if create(&mut session) != 0 {
                 return None;
@@ -516,7 +478,7 @@ mod nvapi {
                 if base(session, &mut profile) != 0 {
                     return None;
                 }
-                f(&Drs { session, base: profile, setting, find })
+                f(&Drs { session, base: profile, setting })
             })();
             destroy(session);
             r
@@ -526,14 +488,6 @@ mod nvapi {
         }
         r
     }
-}
-
-/// NVIDIA control panel Max Frame Rate for this executable, None when off.
-pub fn nvidia_frame_limit(exe_name: &str) -> Option<u32> {
-    if !gpus().iter().any(|g| g.vendor == Vendor::Nvidia) {
-        return None;
-    }
-    nvapi::frame_limit(exe_name)
 }
 
 /// "32.0.15.6094" as the 64-bit UMD version D3D reports (16 bits a part),

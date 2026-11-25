@@ -52,7 +52,6 @@ Stack: the layer and the GPU tools are C++20 (CMake, VS 2022). The preparation a
 1. The user opens Tessera → "Prepare". The app:
    - detects the API (exe imports), engine, anti-cheat (refuses), exe hash and driver version (invalidates caches);
    - processes the previous session's logs (shaders, textures, co-occurrence, I/O);
-   - reads (only reads) other tools' settings (RTSS, NVIDIA control panel limit);
    - warms shaders out of process; installs the DLL (chaining any existing one). From here on the app does not act on the game: it may stay open (or launch a recording session with its layer set up beforehand and wait for it to exit), but it never touches the running process, and installs or removes the layer only while the game is closed.
 2. The user launches the game normally (Steam, etc.).
 3. The DLL: opens caches by memory-mapping → creates the real device and patches vtables → detects features
@@ -170,8 +169,8 @@ Measure cache reuse per shader stage and pipeline on the tested GPU and driver. 
   API dependency. Default low-latency mode: after a present, hold the next frame's start until the target
   minus the predicted work (p90 of the last 32 frames, stutters excluded) minus an adaptive margin, then align
   the present to the target. After a late frame the cadence restarts from its release (no catch-up burst).
-  Modes 0 (wait before `Present`) and 2 (front edge only) stay selectable. RTSS or NVIDIA takes precedence
-  when the cap detected during preparation is equal to or below Tessera's.
+  Modes 0 (wait before `Present`) and 2 (front edge only) stay selectable. When the user sets a cap, it is in
+  charge: no other limiter takes precedence (see P6).
 - **P2 Flip model + tearing** for D3D11 in borderless windows: convert blit swapchains (`DISCARD` →
   `FLIP_DISCARD`, `SEQUENTIAL` → `FLIP_SEQUENTIAL`, at least 2 buffers) and, with VRR, `ALLOW_TEARING` at
   `SyncInterval 0`. Windowed only, game swapchains only (C3). Exclude: MSAA back buffers,
@@ -181,10 +180,8 @@ Measure cache reuse per shader stage and pipeline on the tested GPU and driver. 
 - **P3 Frame latency** — `SetMaximumFrameLatency`, waitable object.
 - **P4 CPU sets** — the thread that calls `Present` on P-cores (hybrid CPUs).
 - **P5 Process** — timer resolution, EcoQoS off (`SetProcessInformation`), moderate priority.
-- **P6 Back-off** — the D3D11 limiter yields to confirmed Reflex or NVAPI pacing on the presenting
-  device and resumes when it is disabled. On D3D12 it yields to NVAPI sleep mode, on Vulkan to
-  `VK_NV_low_latency2`. It does not yield to frame generation runtimes: when the user turns the limiter on,
-  it takes precedence over them.
+- **P6 No back-off** — by the author's decision, a cap the user turned on never yields: not to Reflex or
+  NVAPI sleep intervals, `VK_NV_low_latency2`, frame generation runtimes, RTSS or the NVIDIA limiter.
 
 ### Diagnostics (D)
 
@@ -243,7 +240,7 @@ built side by side in D3D11, with pipeline recording for D3D12 and Vulkan added 
   detection, install/uninstall. Overhead measured with `tools/measure_overhead.ps1`. 32-bit D3D11 games
   supported (separate x86 layer and warm-up).
 - Phase 1: M1 (DXGI + NVAPI budget/description hooks, also before the first device), M2 (off by default),
-  P1 limiter with RTSS/NVIDIA limit detection and cadence reset after late frames, P2 flip model (off by
+  P1 limiter with cadence reset after late frames, P2 flip model (off by
   default), P3, P5, P6, S7, basic D2, optional slow D3D11 context call records.
 - Phase 2: S1 across engines — Unreal PAK (legacy and modern indexes), IoStore (incl. encrypted blocks),
   shader libraries up to UE 5.8, AES key detected in the executable; Unity bundles, WebGL archives, APK, SMOL-V;

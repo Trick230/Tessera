@@ -21,7 +21,7 @@ function CheckPacing {
     $previousDataDir = $env:TESSERA_DATA_DIR
     $env:TESSERA_DATA_DIR = Join-Path $run "data"
     try {
-        # A lower or equal external cap delegates; a higher one leaves our 60 FPS cap in charge.
+        # An external cap (old ini key, now ignored) never takes over our 60 FPS cap.
         foreach ($ext in @(50, 60, 61)) {
             Set-Content "$run\tessera.ini" -Value "[tessera]`nfps_limit=60`next_fps_limit=$ext" -Encoding ascii
             $out = & "$run\d3d11_smoke.exe" --pacing
@@ -31,13 +31,13 @@ function CheckPacing {
             if ($code -eq 0 -and "$out" -match 'median=([0-9.]+) ms, recovery median=([0-9.]+) ms') {
                 $median = [double]$Matches[1]
                 $recovery = [double]$Matches[2]
-                $ok = if ($ext -le 60) { $median -lt 10 } else { $median -ge 16 -and $recovery -ge 16 }
+                $ok = $median -ge 16 -and $recovery -ge 16
             }
             Check "60 FPS cap with an external cap of $ext" $ok
         }
         Set-Content "$run\tessera.ini" -Value "[tessera]`nfps_limit=60" -Encoding ascii
         & "$run\d3d11_smoke.exe" --pacing driver | Write-Host
-        Check "idle SDK, secondary device, Reflex and NVAPI cap transitions" ($LASTEXITCODE -eq 0)
+        Check "cap stays in charge through Reflex and NVAPI cap changes" ($LASTEXITCODE -eq 0)
         # Low-latency limiter on a noisy load with stutters, through d3d11.dll and (D3D12) dxgi.dll.
         $proxy = Join-Path $root "build\pacing-smoke\$([guid]::NewGuid())"
         New-Item -ItemType Directory -Path $proxy -Force | Out-Null

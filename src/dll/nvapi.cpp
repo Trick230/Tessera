@@ -8,7 +8,6 @@
 // except the few memory.cpp wants (memory_import_hook), patched the same way
 // in import tables and in GetProcAddress results.
 //   M1: NvAPI_GPU_GetMemoryInfo(Ex) reports at most the budget the game is given.
-//   P6: observe when NVAPI low latency or a driver sleep interval takes over.
 #include "nvapi.h"
 
 #include <windows.h>
@@ -22,7 +21,6 @@
 #include "log.h"
 #include "memory.h"
 #include "module.h"
-#include "pacing.h"
 #include "stream_io.h"
 
 namespace tessera {
@@ -31,19 +29,16 @@ using NvStatus = int;
 using QueryInterface = void*(__cdecl*)(unsigned);
 using GetMemoryInfo = NvStatus(__cdecl*)(void*, uint32_t*);
 using GetMemoryInfoEx = NvStatus(__cdecl*)(void*, uint64_t*);
-using SetSleepMode = NvStatus(__cdecl*)(IUnknown*, const uint8_t*);
 using GetProc = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 
 // Ids from the public NVAPI interface table.
 constexpr unsigned kGetMemoryInfo = 0x07F9B368;
 constexpr unsigned kGetMemoryInfoEx = 0xC0599498;
-constexpr unsigned kSetSleepMode = 0xAC1CA9E0;
 
 GetProc g_get_proc = nullptr;  // written once in DllMain, before the patch
 std::atomic<QueryInterface> g_qi{nullptr};
 std::atomic<GetMemoryInfo> g_mem{nullptr};
 std::atomic<GetMemoryInfoEx> g_mem_ex{nullptr};
-std::atomic<SetSleepMode> g_sleep{nullptr};
 
 constexpr uint32_t nv_version(uint32_t size, uint32_t v) { return size | (v << 16); }
 
@@ -92,21 +87,6 @@ NvStatus __cdecl hk_get_memory_info_ex(void* gpu, uint64_t* info) {
     return st;
 }
 
-// NV_SET_SLEEP_MODE_PARAMS V1: version, low latency and boost (NvBool),
-// padding, minimum interval in microseconds, markers and reserved bytes.
-NvStatus __cdecl hk_set_sleep_mode(IUnknown* dev, const uint8_t* p) {
-    const NvStatus st = g_sleep.load(std::memory_order_relaxed)(dev, p);
-    if (st != 0 || !p) return st;
-    uint32_t version;
-    std::memcpy(&version, p, sizeof version);
-    if ((version >> 16) == 1 && (version & 0xFFFFu) >= 12) {
-        uint32_t interval;
-        std::memcpy(&interval, p + 8, sizeof interval);
-        pacing_set_driver_mode(dev, p[4] != 0 || interval != 0);
-    }
-    return st;
-}
-
 void* __cdecl hk_query_interface(unsigned id) {
     void* const p = g_qi.load(std::memory_order_relaxed)(id);
     if (!p) return p;
@@ -121,11 +101,6 @@ void* __cdecl hk_query_interface(unsigned id) {
         GetMemoryInfoEx expected = nullptr;
         g_mem_ex.compare_exchange_strong(expected, reinterpret_cast<GetMemoryInfoEx>(p));
         return reinterpret_cast<void*>(&hk_get_memory_info_ex);
-    }
-    if (id == kSetSleepMode) {
-        SetSleepMode expected = nullptr;
-        g_sleep.compare_exchange_strong(expected, reinterpret_cast<SetSleepMode>(p));
-        return reinterpret_cast<void*>(&hk_set_sleep_mode);
     }
     return p;
 }
