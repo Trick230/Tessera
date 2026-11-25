@@ -16,7 +16,7 @@ It does the heavy work **before** you play, in a small app. While you play, only
 |---|---|
 | **Hitches the first time you see an effect or area** | Finds the game's shaders on disk (or records them while you play) and compiles them ahead of time, so the driver's cache is ready before you launch the game. |
 | **Hitches while moving through the world** | Learns which files the game reads together and loads them early, at low priority. |
-| **Uneven frame times** | A precise frame limiter, lower input latency settings and per-game scheduling tweaks. It works in D3D11, D3D12 and Vulkan games and steps aside when Reflex, frame generation, RTSS or the NVIDIA limiter is already doing the job. |
+| **Uneven frame times** | A precise frame limiter, lower input latency settings and per-game scheduling tweaks. It works in D3D11, D3D12 and Vulkan games and steps aside when Reflex, RTSS or the NVIDIA limiter is already doing the job. |
 | **Running out of video memory** | Reports the real budget to the game and keeps memory close to what is actually on screen. Removed texture detail comes back *before* it is drawn, so there is no pop-in. |
 | **Unreal Engine games** | Applies better engine settings (for example texture streaming) safely, without editing the game's files. |
 | **"Why does it stutter?"** | Every session is recorded. The app shows frame time percentiles, stutters per minute, video memory used and the likely cause. |

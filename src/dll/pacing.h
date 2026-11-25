@@ -21,10 +21,6 @@ uint32_t pace_after_present_any(const void* chain);
 // P6 outside DXGI: a driver low-latency mode (Vulkan Reflex) is pacing frames.
 void pacing_set_external_pacing(bool active);
 
-// P6: polled from the session writer thread (never the frame path): looks
-// for a loaded frame generation runtime (Smooth Motion, XeSS-FG, FidelityFX).
-void pacing_background_tick();
-
 // P6: track a successful NVAPI pacing change for the corresponding device.
 void pacing_set_driver_mode(IUnknown* device, bool active);
 // P3: applies max_frame_latency to a new swap chain's device, unless the

@@ -21,7 +21,6 @@ std::atomic<IDXGISwapChain*> g_checked{nullptr};
 std::atomic<unsigned> g_seen_revision{0};
 std::atomic<bool> g_driver_pacing{false};
 std::atomic<unsigned> g_pacing_revision{0};
-std::atomic<bool> g_smooth_motion{false};  // a frame generation runtime is loaded
 // NVAPI pacing on a non-D3D11 device. A D3D12 swap chain reports its queue, not the
 // device, so it cannot be matched per device: all non-D3D11 swap chains yield.
 std::atomic<bool> g_other_paced{false};
@@ -50,7 +49,7 @@ bool yielding(IDXGISwapChain* sc) {
         g_seen_revision.store(revision, std::memory_order_relaxed);
         ReleaseSRWLockExclusive(&g_check_lock);
     }
-    return g_driver_pacing.load(std::memory_order_relaxed) || g_smooth_motion.load(std::memory_order_relaxed);
+    return g_driver_pacing.load(std::memory_order_relaxed);
 }
 
 int active_limit() {
@@ -79,7 +78,7 @@ uint32_t pace_after_present(IDXGISwapChain* sc) {
 uint32_t pace_before_present_any(const void* chain) {
     const int fps = active_limit();
     if (!fps) return 0;
-    if (g_other_paced.load(std::memory_order_relaxed) || g_smooth_motion.load(std::memory_order_relaxed)) {
+    if (g_other_paced.load(std::memory_order_relaxed)) {
         limiter::reset();
         return 0;
     }
@@ -88,7 +87,7 @@ uint32_t pace_before_present_any(const void* chain) {
 
 uint32_t pace_after_present_any(const void* chain) {
     const int fps = active_limit();
-    if (!fps || g_other_paced.load(std::memory_order_relaxed) || g_smooth_motion.load(std::memory_order_relaxed))
+    if (!fps || g_other_paced.load(std::memory_order_relaxed))
         return 0;
     return limiter::after_present(chain, fps, config().limiter_mode);
 }
@@ -111,29 +110,6 @@ void pacing_set_driver_mode(IUnknown* device, bool active) {
     dev->Release();
     if (SUCCEEDED(hr)) g_pacing_revision.fetch_add(1, std::memory_order_release);
 }
-void pacing_background_tick() {
-    if (config().fps_limit <= 0) return;
-    // Frame generation runtimes present generated frames from their own
-    // thread and pace them themselves: NVIDIA Smooth Motion (no public state
-    // query), XeSS-FG and the FidelityFX frame interpolation DLLs. Leave the
-    // cadence alone while one is loaded (DLSS-FG runs with Reflex: NVAPI path).
-    static constexpr const wchar_t* kFrameGen[] = {
-        L"nvpresent64.dll", L"nvpresent32.dll", L"libxess_fg.dll",
-        L"ffx_frameinterpolation_x64.dll", L"amd_fidelityfx_framegeneration_dx12.dll",
-        L"amd_fidelityfx_framegeneration_vk.dll"};
-    const wchar_t* found = nullptr;
-    for (const wchar_t* m : kFrameGen)
-        if (GetModuleHandleW(m)) {
-            found = m;
-            break;
-        }
-    const bool loaded = found != nullptr;
-    if (g_smooth_motion.exchange(loaded, std::memory_order_relaxed) != loaded) {
-        if (loaded) logf("limiter: yielding to the frame generation runtime %ls", found);
-        else logf("limiter: frame generation runtime unloaded, resuming");
-    }
-}
-
 void pacing_on_swapchain(IDXGISwapChain* sc) {
     if (config().fps_limit > 0)
         g_pacing_revision.fetch_add(1, std::memory_order_release);  // DXGI can reuse an old swap chain's address.

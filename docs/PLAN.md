@@ -183,8 +183,8 @@ Measure cache reuse per shader stage and pipeline on the tested GPU and driver. 
 - **P5 Process** — timer resolution, EcoQoS off (`SetProcessInformation`), moderate priority.
 - **P6 Back-off** — the D3D11 limiter yields to confirmed Reflex or NVAPI pacing on the presenting
   device and resumes when it is disabled. On D3D12 it yields to NVAPI sleep mode, on Vulkan to
-  `VK_NV_low_latency2`. It also yields while a frame generation runtime is loaded (Smooth Motion, XeSS-FG,
-  FidelityFX frame interpolation DLLs).
+  `VK_NV_low_latency2`. It does not yield to frame generation runtimes: when the user turns the limiter on,
+  it takes precedence over them.
 
 ### Diagnostics (D)
 
@@ -273,7 +273,7 @@ built side by side in D3D11, with pipeline recording for D3D12 and Vulkan added 
   `vkQueuePresentKHR` from the export and from `vkGet*ProcAddr`; limiter, P5 and session recording only.
   Same bench numbers as D3D11 (`tessera_vulkan_present`, in the smoke test when built). The app installs it
   for Vulkan-only games. Open: export coverage of the dxgi/vulkan proxies on other Windows builds, a game
-  test on each API, and FidelityFX 3.1 frame generation (single `amd_fidelityfx_dx12.dll`, not detected).
+  test on each API.
 
 **Pipeline recording (towards phase 6, S2/S3):**
 - D3D12: `tessera_d3d12_capture.dll` records compute, graphics (pipeline state streams) and ray tracing state
