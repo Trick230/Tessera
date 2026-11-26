@@ -12,6 +12,30 @@ powershell -File build.ps1 -Quality   # adds tessera_texcomp.exe (BC7/BC6H + FLI
 powershell -File build.ps1 -Vulkan    # adds the Vulkan layer and tessera_vulkan_replay.exe (needs the Vulkan SDK headers)
 ```
 
+### Portable toolchain
+
+Everything the build needs can live in `.toolchain/<host>/` inside the repository folder (not
+committed), so the folder builds on another PC with nothing installed: pinned LLVM (clang-cl,
+lld-link, llvm-ml), CMake, Ninja, Rust (`RUSTUP_HOME`/`CARGO_HOME` in the folder) and the MSVC CRT
+and Windows SDK fetched by [xwin](https://github.com/Jake-Shadle/xwin). Each host gets its own
+toolchain and build folders, so one copy of the repository can move between machines.
+
+```powershell
+powershell -File tools/toolchain.ps1 -AcceptLicense   # Windows x64/ARM64 host, ~2.7 GB
+powershell -File build.ps1 -Portable -Test            # output in build\windows-<arch>\cargo\release\
+```
+
+```sh
+sh tools/toolchain.sh --accept-license   # Linux x64/ARM64 host
+sh build.sh                              # Windows binaries in build/linux-<arch>/cargo/x86_64-pc-windows-msvc/release/
+```
+
+`-AcceptLicense` / `--accept-license` accepts the Microsoft license of the CRT and SDK files
+(they stay local, never redistributed). Visual Studio stays the reference build; the portable
+one uses clang-cl and passes the same smoke tests. `-Vulkan` needs the Vulkan SDK and is not
+available in portable builds. Linux builds only: the tests need Windows (`build.ps1 -Test` or CI);
+the Rust build scripts there also need the system C compiler (gcc or clang).
+
 Focused tests: `tests/run_smoke.ps1` (D3D11 layer), `tests/run_phase4.ps1` (prediction and I/O),
 `tests/run_quality.ps1` (mip feedback and recompression), `tests/run_vulkan_replay.ps1`.
 

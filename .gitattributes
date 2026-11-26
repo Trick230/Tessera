@@ -1,0 +1,2 @@
+# Shell scripts keep LF so a Windows checkout still runs when the folder is moved to Linux.
+*.sh text eol=lf

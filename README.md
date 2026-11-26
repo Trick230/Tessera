@@ -70,7 +70,7 @@ powershell -File build.ps1          # app + layer -> target\release\
 powershell -File build.ps1 -Test    # also runs the unit tests and the D3D11 smoke tests
 ```
 
-This produces `target\release\tessera.exe` with the layer and shader warm-up for both 64-bit and 32-bit games. Optional parts (texture recompression, Vulkan tools) are in [`docs/ADVANCED.md`](docs/ADVANCED.md).
+This produces `target\release\tessera.exe` with the layer and shader warm-up for both 64-bit and 32-bit games. Without Visual Studio, or from Linux, a self-contained toolchain can live inside the repository folder (see "Portable toolchain" in [`docs/ADVANCED.md`](docs/ADVANCED.md)). Optional parts (texture recompression, Vulkan tools) are in [`docs/ADVANCED.md`](docs/ADVANCED.md).
 
 ## How it works
 
