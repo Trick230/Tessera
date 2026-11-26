@@ -157,7 +157,9 @@ try {
     & $exe | Write-Host
     Check "limited run" ($LASTEXITCODE -eq 0)
     # M1 before any device: factories through every route are the layer's; a D3D12 device turns the cap off.
-    & $exe --imports | Write-Host
+    $imports = & $exe --imports
+    $imports | Write-Host
+    $basicRender = "$imports" -match "Microsoft Basic Render Driver"  # GPU-less CI runner
     Check "DXGI factories wrapped, capped before the device, left alone for D3D12" ($LASTEXITCODE -eq 0)
     & $exe --verify "$data\sessions" 60 | Write-Host
     Check "limiter holds 60 fps, budget capped, flip model" ($LASTEXITCODE -eq 0)
@@ -178,8 +180,11 @@ try {
     $w3 = & $layer warm $exe $warm 2>&1
     $code = $LASTEXITCODE
     $ErrorActionPreference = "Stop"
-    if ($code) { $w3 | Write-Host }
-    Check "app warm-up reads the log" ($code -eq 0 -and "$w3" -match "warm log: ok 2 failed 0")
+    # The app counts only logs of an installed display driver; the Basic Render Driver is not one.
+    $want = if ($basicRender) { "warm log: ok 0 failed 0" } else { "warm log: ok 2 failed 0" }
+    $ok = $code -eq 0 -and "$w3" -match $want
+    if (-not $ok) { $w3 | Write-Host }
+    Check "app warm-up reads the log" $ok
     Check "warm copy has the game's exe name" (@(Get-ChildItem "$data\warm\*\d3d11_smoke.exe").Count -eq 1)
 } finally { Remove-Item $ini; Remove-Item Env:TESSERA_SMOKE_CAP_MB }
 
