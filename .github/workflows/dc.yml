@@ -1,0 +1,29 @@
+# devcloud (https://github.com/Trick230/devcloud): `dc run` dispatches this; pinned to one
+# devcloud commit (`dc init` again moves the pin to the current one)
+name: dc
+run-name: dc ${{ inputs.id }} ${{ inputs.commands }}
+on:
+  workflow_dispatch:
+    inputs:
+      id: {default: ""}
+      commands: {required: true}
+      os: {default: ubuntu-latest}
+      drive_in: {default: ""}
+      drive_out: {default: ""}
+      artifacts: {default: ""}
+  workflow_call:   # the project's own workflows reuse it: `uses: ./.github/workflows/dc.yml`
+    inputs:
+      id: {type: string, default: ""}
+      commands: {type: string, required: true}
+      os: {type: string, default: ubuntu-latest}
+      drive_in: {type: string, default: ""}
+      drive_out: {type: string, default: ""}
+      artifacts: {type: string, default: ""}
+      artifacts_in: {type: string, default: ""}   # artifacts of the calling run, into this folder
+    secrets:
+      DC_ENV: {required: false}
+jobs:
+  run:
+    uses: Trick230/devcloud/.github/workflows/run.yml@21419ebabb3dec022024f109ea9e9012737373dd
+    with: {commands: "${{ inputs.commands }}", os: "${{ inputs.os }}", drive_in: "${{ inputs.drive_in }}", drive_out: "${{ inputs.drive_out }}", artifacts: "${{ inputs.artifacts }}", artifacts_in: "${{ inputs.artifacts_in }}", ref: 21419ebabb3dec022024f109ea9e9012737373dd}
+    secrets: {DC_ENV: "${{ secrets.DC_ENV }}"}
