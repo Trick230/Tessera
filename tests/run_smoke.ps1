@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Layer smoke test: clean run + session check, then safe mode after two crashes.
-#   powershell -File tests/run_smoke.ps1 [-Config Release] [-X86] [-PacingOnly] [-D3D11CallsOnly]
-param([string]$Config = "Release", [switch]$X86, [switch]$PacingOnly, [switch]$D3D11CallsOnly)
+#   powershell -File tests/run_smoke.ps1 [-Config Release] [-X86] [-Build <dir>] [-PacingOnly] [-D3D11CallsOnly]
+#   -Build: another native build dir (relative to the repo); -Config "" for single-config generators (Ninja).
+param([string]$Config = "Release", [switch]$X86, [string]$Build = "", [switch]$PacingOnly, [switch]$D3D11CallsOnly)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
-$native = if ($X86) { "build\win32" } else { "build" }
+$native = if ($Build) { $Build } elseif ($X86) { "build\win32" } else { "build" }
 $exe = Join-Path $root "$native\tests\d3d11_smoke\$Config\d3d11_smoke.exe"
 $layer = Join-Path $root "target\release\examples\layer.exe"
 $fails = 0
