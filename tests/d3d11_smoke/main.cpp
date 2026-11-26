@@ -31,6 +31,10 @@ int fail(const char* what, HRESULT hr = S_OK) {
     return 1;
 }
 
+// Microsoft Basic Render Driver (GPU-less CI runners): no dedicated memory,
+// so VRAM caps and residency are not decisive there.
+constexpr UINT kMicrosoftVendor = 0x1414;
+
 // S6: a VS (created twice: the second is already known) and a PS.
 int make_shaders(ID3D11Device* dev) {
     static const char kSrc[] =
@@ -947,6 +951,14 @@ int tiled() {
     g.dev->QueryInterface(IID_PPV_ARGS(&dxgi));
     dxgi->GetAdapter(&a);
     a->QueryInterface(IID_PPV_ARGS(&g.adapter));
+    DXGI_ADAPTER_DESC ad = {};
+    a->GetDesc(&ad);
+    if (ad.VendorId == kMicrosoftVendor && !ad.DedicatedVideoMemory) {
+        std::printf("tiled: skipped (Microsoft Basic Render Driver)\n");
+        a->Release();
+        dxgi->Release();
+        return 0;
+    }
     a->GetParent(IID_PPV_ARGS(&factory));
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.Width = sd.Height = 64;
@@ -1258,7 +1270,8 @@ int imports_mode() {
     wchar_t cap_s[16] = {};
     GetEnvironmentVariableW(L"TESSERA_SMOKE_CAP_MB", cap_s, 16);
     const unsigned long long cap = static_cast<unsigned long long>(_wtoi(cap_s)) << 20;
-    auto dedicated = []() -> unsigned long long {
+    UINT vendor = 0;
+    auto dedicated = [&vendor]() -> unsigned long long {
         IDXGIFactory1* f = nullptr;
         IDXGIAdapter1* a = nullptr;
         DXGI_ADAPTER_DESC1 d = {};
@@ -1268,10 +1281,15 @@ int imports_mode() {
             a->Release();
         }
         f->Release();
+        vendor = d.VendorId;
         return d.DedicatedVideoMemory;
     };
     const unsigned long long before = dedicated();
     std::printf("dedicated memory before any device: %llu MB\n", before >> 20);
+    if (!before && vendor == kMicrosoftVendor) {
+        std::printf("Microsoft Basic Render Driver: not decisive\n");
+        return 0;
+    }
     if (!before || before > cap) return fail("dedicated memory cap not applied before the device");
     HMODULE d12 = LoadLibraryW(L"d3d12.dll");
     using Create12 = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);

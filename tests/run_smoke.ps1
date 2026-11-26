@@ -137,7 +137,12 @@ Check "counter cleared on clean exit" ((Get-Content $counter) -eq "0")
 
 $log = "$data\logs\d3d11_smoke.exe.log"
 Check "process tweaks logged" ((Select-String -Path $log -Pattern "process:" -Quiet))
-Check "above-normal priority (P5)" ((Select-String -Path $log -Pattern "above-normal priority ok" -Quiet))
+# P5 raises only a normal class; under a below-normal shell (CI runners) the class is inherited and left alone.
+if ((Get-Process -Id $PID).PriorityClass -eq "Normal") {
+    Check "above-normal priority (P5)" ((Select-String -Path $log -Pattern "above-normal priority ok" -Quiet))
+} else {
+    Check "non-normal priority left alone (P5)" ((Select-String -Path $log -Pattern "priority class 0x[0-9a-f]+ left alone" -Quiet))
+}
 
 # NVAPI resolved by the exe and by a game DLL loaded later (4: no NVAPI here).
 & $exe --nvapi | Write-Host
@@ -169,8 +174,12 @@ try {
     $w2 = & $warm $base
     Check "warm-up resumes with nothing left" ($LASTEXITCODE -eq 0 -and "$w2" -match "compiled now 0, failed now 0, skipped now 0, total ok 2")
     # The app path: copy under the game's exe name, run, read the log back.
-    $w3 = & $layer warm $exe $warm
-    Check "app warm-up reads the log" ($LASTEXITCODE -eq 0 -and "$w3" -match "warm log: ok 2 failed 0")
+    $ErrorActionPreference = "Continue"  # stderr is part of $w3, shown when it fails
+    $w3 = & $layer warm $exe $warm 2>&1
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($code) { $w3 | Write-Host }
+    Check "app warm-up reads the log" ($code -eq 0 -and "$w3" -match "warm log: ok 2 failed 0")
     Check "warm copy has the game's exe name" (@(Get-ChildItem "$data\warm\*\d3d11_smoke.exe").Count -eq 1)
 } finally { Remove-Item $ini; Remove-Item Env:TESSERA_SMOKE_CAP_MB }
 
