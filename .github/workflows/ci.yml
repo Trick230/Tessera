@@ -1,0 +1,16 @@
+# Builds everything and runs the Rust and D3D11 smoke tests on each push and pull request.
+# Runner GPU is the Microsoft Basic Render Driver: VRAM checks are skipped there, Vulkan is not built.
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    uses: ./.github/workflows/dc.yml
+    with:
+      os: windows-2022   # windows-latest has no Visual Studio 17 2022 (build.ps1)
+      commands: '["powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Test"]'
