@@ -10,6 +10,10 @@
 
 </div>
 
+[![Tessera session panel](docs/assets/hero.png)](docs/assets/hero.png)
+
+<sub>The session panel after one run of the D3D11 test program at a 60 FPS cap, in a sample library of three synthetic game folders.</sub>
+
 Stutters come from shaders compiled the first time something appears, data loaded while you move through the world, running out of video memory and uneven frame pacing. Tessera does the heavy work in a small app before the game starts; while you play, only a light graphics layer runs, loaded by the game itself like any other DLL in its folder. Nothing is injected, nothing stays in the background, and nothing outside the game is changed.
 
 > [!IMPORTANT]

@@ -41,8 +41,12 @@ pub fn discover(manual: &[PathBuf]) -> Vec<GameEntry> {
 
 /// Adds explicitly selected games and the immediate game folders in each library.
 pub fn discover_with_folders(legacy: &[PathBuf], games: &[PathBuf], libraries: &[PathBuf]) -> Vec<GameEntry> {
-    let mut out = steam_games();
-    out.extend(epic_games());
+    // TESSERA_NO_STORES=1: only the added folders (scripted screenshots with a sample library).
+    let mut out = Vec::new();
+    if std::env::var_os("TESSERA_NO_STORES").is_none() {
+        out.extend(steam_games());
+        out.extend(epic_games());
+    }
     out.extend(games.iter().filter_map(|root| game_folder(root)));
     out.extend(manual_games(legacy));
     out.extend(libraries.iter().flat_map(|root| library_games(root)));
