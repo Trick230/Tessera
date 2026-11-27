@@ -32,8 +32,19 @@ cargo build --release -p tessera-app --target $target
 out=$CARGO_TARGET_DIR/$target/release
 for arch in x64 x86; do
     dir=build/$host/$arch
-    if [ ! -f "$dir/CMakeCache.txt" ]; then
-        cmake -S . -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM="$tc/ninja/ninja" \
+    fresh=
+    if [ -f "$dir/CMakeCache.txt" ]; then
+        # A tree configured in another place (repo folder moved or copied) keeps the old absolute
+        # paths and CMake refuses it: configure it again from scratch.
+        was=$(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "$dir/CMakeCache.txt")
+        src=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$dir/CMakeCache.txt")
+        if [ "$was" != "$(pwd -P)/$dir" ] || [ "$src" != "$(pwd -P)" ]; then
+            echo "$arch: build tree configured in another folder, reconfiguring"
+            fresh=--fresh
+        fi
+    fi
+    if [ ! -f "$dir/CMakeCache.txt" ] || [ -n "$fresh" ]; then
+        cmake $fresh -S . -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM="$tc/ninja/ninja" \
             -DCMAKE_TOOLCHAIN_FILE="$root/cmake/clang-cl.cmake" -DTESSERA_TOOLCHAIN="$tc" -DTESSERA_ARCH=$arch
     fi
     cmake --build "$dir"

@@ -16,8 +16,26 @@ foreach ($n in $envNames) { $savedEnv[$n] = [Environment]::GetEnvironmentVariabl
 # Configures (once) and builds a native dir (all targets, or $targets); extra arguments go to
 # the configure step.
 function Build-Native($dir, $arch, $what, $targets) {
-    if (-not (Test-Path "$dir\CMakeCache.txt")) {
-        & $cmake -S . -B $dir -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_MAKE_PROGRAM=$ninja" `
+    $cache = "$dir\CMakeCache.txt"
+    $fresh = @()
+    if (Test-Path $cache) {
+        # A tree configured in another place (repo folder moved or copied) keeps the old absolute
+        # paths and CMake refuses it: configure it again from scratch. FetchContent's sub-builds
+        # have their own cache, so they go too (they only hold the download step).
+        $kv = @{}
+        Select-String -LiteralPath $cache -Pattern '^(CMAKE_CACHEFILE_DIR|CMAKE_HOME_DIRECTORY):INTERNAL=(.*)$' |
+            ForEach-Object { $kv[$_.Matches[0].Groups[1].Value] = $_.Matches[0].Groups[2].Value }
+        $fwd = { param($p) [IO.Path]::GetFullPath($p).TrimEnd('\') -replace '\\', '/' }
+        if ($kv["CMAKE_CACHEFILE_DIR"] -ne (& $fwd (Join-Path $root $dir)) -or
+            $kv["CMAKE_HOME_DIRECTORY"] -ne (& $fwd $root)) {
+            Write-Host "$what`: build tree configured in another folder, reconfiguring"
+            Get-ChildItem "$dir\_deps" -Directory -Filter "*-subbuild" -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force
+            $fresh = @("--fresh")
+        }
+    }
+    if (-not (Test-Path $cache) -or $fresh) {
+        & $cmake @fresh -S . -B $dir -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_MAKE_PROGRAM=$ninja" `
             "-DCMAKE_TOOLCHAIN_FILE=$root\cmake\clang-cl.cmake" "-DTESSERA_TOOLCHAIN=$tc" "-DTESSERA_ARCH=$arch" @args
         if ($LASTEXITCODE) { throw "$what cmake configure failed" }
     }
