@@ -63,14 +63,15 @@ Full details, findings and what is left: [`docs/PLAN.md`](docs/PLAN.md). Advance
 
 ## Building
 
-Requirements: Windows 10/11 x64; Visual Studio 2022 or its Build Tools with the C++ workload, Windows SDK and CMake; Rust stable with the MSVC toolchain (pinned by `rust-toolchain.toml`).
+Nothing needs to be installed: the toolchain (clang-cl, Rust, CMake, Ninja, Windows SDK) is downloaded into the repository folder.
 
 ```powershell
-powershell -File build.ps1          # app + layer -> target\release\
-powershell -File build.ps1 -Test    # also runs the unit tests and the D3D11 smoke tests
+powershell -File tools/toolchain.ps1 -AcceptLicense   # once, ~2.7 GB in .toolchain\
+powershell -File build.ps1                            # app + layer -> build\windows-x64\cargo\release\
+powershell -File build.ps1 -Test                      # also runs the unit tests and the D3D11 smoke tests
 ```
 
-This produces `target\release\tessera.exe` with the layer and shader warm-up for both 64-bit and 32-bit games. Without Visual Studio, or from Linux, a self-contained toolchain can live inside the repository folder (see "Portable toolchain" in [`docs/ADVANCED.md`](docs/ADVANCED.md)). Optional parts (texture recompression, Vulkan tools) are in [`docs/ADVANCED.md`](docs/ADVANCED.md).
+This produces `tessera.exe` with the layer and shader warm-up for both 64-bit and 32-bit games. Building from Linux and the optional parts (texture recompression, Vulkan tools) are in [`docs/ADVANCED.md`](docs/ADVANCED.md).
 
 ## How it works
 

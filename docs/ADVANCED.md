@@ -9,20 +9,21 @@ Power-user and developer notes that do not belong in the [README](../README.md).
 powershell -File build.ps1            # app + D3D11 layer, shader warm-up and D3D12 recorder (x64 and x86)
 powershell -File build.ps1 -Test      # also Rust unit tests and the x64/x86 D3D11 smoke tests
 powershell -File build.ps1 -Quality   # adds tessera_texcomp.exe (BC7/BC6H on the GPU, CPU fallback, + FLIP)
-powershell -File build.ps1 -Vulkan    # adds the Vulkan layer and tessera_vulkan_replay.exe (needs the Vulkan SDK headers)
+powershell -File build.ps1 -Vulkan    # adds the Vulkan layer and tessera_vulkan_replay.exe (Vulkan-Headers fetched by CMake)
 ```
 
-### Portable toolchain
+### Toolchain
 
-Everything the build needs can live in `.toolchain/<host>/` inside the repository folder (not
+Everything the build needs lives in `.toolchain/<host>/` inside the repository folder (not
 committed), so the folder builds on another PC with nothing installed: pinned LLVM (clang-cl,
 lld-link, llvm-ml), CMake, Ninja, Rust (`RUSTUP_HOME`/`CARGO_HOME` in the folder) and the MSVC CRT
 and Windows SDK fetched by [xwin](https://github.com/Jake-Shadle/xwin). Each host gets its own
-toolchain and build folders, so one copy of the repository can move between machines.
+toolchain and build folders (`build/<host>/`), so one copy of the repository can move between
+machines. C++ Release builds use ThinLTO (CPU texture encoder: about 23% faster than MSVC `/O2`).
 
 ```powershell
 powershell -File tools/toolchain.ps1 -AcceptLicense   # Windows x64/ARM64 host, ~2.7 GB
-powershell -File build.ps1 -Portable -Test            # output in build\windows-<arch>\cargo\release\
+powershell -File build.ps1 -Test                      # output in build\windows-<arch>\cargo\release\
 ```
 
 ```sh
@@ -31,13 +32,11 @@ sh build.sh                              # Windows binaries in build/linux-<arch
 ```
 
 `-AcceptLicense` / `--accept-license` accepts the Microsoft license of the CRT and SDK files
-(they stay local, never redistributed). Visual Studio stays the reference build; the portable
-one uses clang-cl and passes the same smoke tests. `-Vulkan` needs the Vulkan SDK and is not
-available in portable builds. Linux builds only: the tests need Windows (`build.ps1 -Test` or CI);
+(they stay local, never redistributed). Linux builds only: the tests need Windows (`build.ps1 -Test` or CI);
 the Rust build scripts there also need the system C compiler (gcc or clang).
 
 Focused tests: `tests/run_smoke.ps1` (D3D11 layer), `tests/run_phase4.ps1` (prediction and I/O),
-`tests/run_quality.ps1` (mip feedback and recompression), `tests/run_vulkan_replay.ps1`.
+`tests/run_quality.ps1` (mip feedback and recompression; needs `fxc.exe` from an installed Windows SDK, or `-Fxc <path>`), `tests/run_vulkan_replay.ps1`.
 
 ## Per-game settings (`tessera.ini`)
 

@@ -2,10 +2,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(Tessera VERSION 0.1.0 LANGUAGES C CXX ASM_MASM)
 
-if(CMAKE_GENERATOR_PLATFORM AND NOT CMAKE_GENERATOR_PLATFORM MATCHES "^(Win32|x64)$")
-  message(FATAL_ERROR "Tessera supports the Win32 and x64 Visual Studio platforms")
-endif()
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Exception model is chosen per target (the layer builds without exceptions).

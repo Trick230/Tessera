@@ -9,7 +9,7 @@
 # "off" is a run without the layer. Means are per mode (off, on, on-<variant>). The "on" runs also keep the layer's log and session
 # summary (shaders, VRAM, working set, mip residency) and list what each
 # module reported. Needs an elevated shell (PresentMon uses ETW) and a fresh
-# build (build.ps1: target\release\tessera_d3d11.dll and the layer/session
+# build (build.ps1: build\<host>\cargo\release\tessera_d3d11.dll and the layer/session
 # examples).
 #   powershell -File tools\global_test.ps1 -AppId 1462040 -LaunchArgs "-dx11" `
 #       -GameDir "D:\Steam\steamapps\common\FINAL FANTASY VII REMAKE\End\Binaries\Win64" `
@@ -44,9 +44,10 @@ $Variants = @($Variants -join ";" -split ";" | Where-Object { $_.Trim() })
 # $PSScriptRoot is still empty in Windows PowerShell's parameter defaults.
 $root = Split-Path $PSScriptRoot -Parent
 if (-not $OutDir) { $OutDir = Join-Path $root "build\global" }
-$layer = Join-Path $root "target\release\examples\layer.exe"
-$sessionExe = Join-Path $root "target\release\examples\session.exe"
-$payload = Join-Path $root "target\release\tessera_d3d11.dll"
+. "$root\tools\paths.ps1"
+$layer = Join-Path $root "$cargoOut\examples\layer.exe"
+$sessionExe = Join-Path $root "$cargoOut\examples\session.exe"
+$payload = Join-Path $root "$cargoOut\tessera_d3d11.dll"
 $PresentMon = (Resolve-Path $PresentMon).Path
 $procName = [IO.Path]::GetFileNameWithoutExtension($ExeName)
 $data = Join-Path $env:LOCALAPPDATA "Tessera"

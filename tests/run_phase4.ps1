@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Run after building the d3d11_smoke target.
-param([string]$Config = "Release")
+# Run after build.ps1.
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
-$bin = Join-Path $root "build\tests\d3d11_smoke\$Config"
+. "$root\tools\paths.ps1"
+$bin = Join-Path $root "$buildRoot\x64\tests\d3d11_smoke"
 $case = Join-Path $root ("build\phase4-smoke\" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $case -Force | Out-Null
 Copy-Item -LiteralPath "$bin\d3d11_smoke.exe", "$bin\d3d11.dll" -Destination $case

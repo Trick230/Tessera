@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Layer smoke test: clean run + session check, then safe mode after two crashes.
-#   powershell -File tests/run_smoke.ps1 [-Config Release] [-X86] [-Build <dir>] [-Cargo <dir>] [-PacingOnly] [-D3D11CallsOnly]
-#   -Build: another native build dir (relative to the repo); -Config "" for single-config generators (Ninja).
-#   -Cargo: the cargo target dir (relative to the repo) that holds release\examples\layer.exe.
-param([string]$Config = "Release", [switch]$X86, [string]$Build = "", [string]$Cargo = "target", [switch]$PacingOnly, [switch]$D3D11CallsOnly)
+#   powershell -File tests/run_smoke.ps1 [-X86] [-PacingOnly] [-D3D11CallsOnly]   (after build.ps1)
+param([switch]$X86, [switch]$PacingOnly, [switch]$D3D11CallsOnly)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
-$native = if ($Build) { $Build } elseif ($X86) { "build\win32" } else { "build" }
-$exe = Join-Path $root "$native\tests\d3d11_smoke\$Config\d3d11_smoke.exe"
-$layer = Join-Path $root "$Cargo\release\examples\layer.exe"
+. "$root\tools\paths.ps1"
+$native = if ($X86) { "$buildRoot\x86" } else { "$buildRoot\x64" }
+$exe = Join-Path $root "$native\tests\d3d11_smoke\d3d11_smoke.exe"
+$layer = Join-Path $root "$cargoOut\examples\layer.exe"
 $fails = 0
 function Check($name, $ok) {
     if ($ok) { "PASS $name" } else { "FAIL $name"; $script:fails++ }
@@ -44,18 +43,18 @@ function CheckPacing {
         $proxy = Join-Path $root "build\pacing-smoke\$([guid]::NewGuid())"
         New-Item -ItemType Directory -Path $proxy -Force | Out-Null
         Copy-Item -LiteralPath $exe -Destination $proxy
-        $dxgi = Join-Path $root "$native\tests\d3d11_smoke\$Config\tessera_dxgi.dll"
+        $dxgi = Join-Path $root "$native\tests\d3d11_smoke\tessera_dxgi.dll"
         Copy-Item -LiteralPath $dxgi -Destination "$proxy\dxgi.dll"
         Set-Content "$proxy\tessera.ini" -Value "[tessera]`nfps_limit=60`nlimiter_mode=1" -Encoding ascii
         $apis = @("d3d11", "d3d12")
         # Vulkan through vulkan-1.dll, when the optional Vulkan bench is built (build.ps1 -Vulkan).
-        $vkBuild = if ($X86) { "build\vulkan-win32" } else { "build\vulkan-telemetry" }
-        $vkBench = Join-Path $root "$vkBuild\src\vulkan_telemetry\$Config\tessera_vulkan_present.exe"
+        $vkBuild = if ($X86) { "$buildRoot\vulkan-x86" } else { "$buildRoot\vulkan-x64" }
+        $vkBench = Join-Path $root "$vkBuild\src\vulkan_telemetry\tessera_vulkan_present.exe"
         if (Test-Path $vkBench) {
             $vk = Join-Path $root "build\pacing-smoke\$([guid]::NewGuid())"
             New-Item -ItemType Directory -Path $vk -Force | Out-Null
             Copy-Item -LiteralPath $vkBench -Destination $vk
-            Copy-Item -LiteralPath (Join-Path $root "$native\tests\d3d11_smoke\$Config\tessera_vulkan.dll") -Destination "$vk\vulkan-1.dll"
+            Copy-Item -LiteralPath (Join-Path $root "$native\tests\d3d11_smoke\tessera_vulkan.dll") -Destination "$vk\vulkan-1.dll"
             Set-Content "$vk\tessera.ini" -Value "[tessera]`nfps_limit=60`nlimiter_mode=1" -Encoding ascii
             $apis += "vulkan"
         } else { "SKIP vulkan limiter bench (not built)" }
@@ -171,7 +170,7 @@ try {
     $idx = Get-ChildItem "$data\shaders\d3d11_smoke.exe-*.tshi"
     Check "shader store has 2 shaders" ($idx.Count -eq 1 -and $idx[0].Length -eq 56)
     # S5: the warm-up compiles both, then a second run finds nothing left to do.
-    $warm = Join-Path $root "$native\src\warm\$Config\tessera_warm.exe"
+    $warm = Join-Path $root "$native\src\warm\tessera_warm.exe"
     $base = $idx[0].FullName -replace '\.tshi$', ''
     $w1 = & $warm $base
     Check "warm-up compiles 2 shaders" ($LASTEXITCODE -eq 0 -and "$w1" -match "compiled now 2, failed now 0")

@@ -2,7 +2,7 @@
 # Layer overhead on a real Steam game: interleaved runs without/with the layer
 # (off, on, off, on, ...), each recorded with PresentMon, then a summary of
 # frame times. Needs an elevated shell (PresentMon uses ETW) and
-# target\release\examples\layer.exe + target\release\tessera_d3d11.dll.
+# build\<host>\cargo\release\examples\layer.exe + tessera_d3d11.dll (build.ps1).
 #   powershell -File tools\measure_overhead.ps1 -AppId 1462040 -LaunchArgs "-dx11" `
 #       -GameDir "D:\Steam\...\Win64" -ExeName ff7remake_.exe -PresentMon <path>
 # Leaves the layer as it found it. Output: <OutDir>\run<N>_<off|on>.csv, measure.log, summary.txt.
@@ -20,8 +20,9 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
-$layer = Join-Path $root "target\release\examples\layer.exe"
-$payload = Join-Path $root "target\release\tessera_d3d11.dll"
+. "$root\tools\paths.ps1"
+$layer = Join-Path $root "$cargoOut\examples\layer.exe"
+$payload = Join-Path $root "$cargoOut\tessera_d3d11.dll"
 $procName = [IO.Path]::GetFileNameWithoutExtension($ExeName)
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $log = Join-Path $OutDir "measure.log"

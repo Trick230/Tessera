@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Run after building tessera_texcomp and tessera_test_feedback in build/quality.
-param([string]$Config = "Release", [string]$Fxc)
+# Run after build.ps1 -Quality.
+param([string]$Fxc)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
-$bin = Join-Path $root "build\quality\src\texcomp\$Config"
+. "$root\tools\env.ps1"
+$bin = Join-Path $root "$buildRoot\quality\src\texcomp"
 $case = Join-Path $root ("build\quality-smoke\" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $case -Force | Out-Null
 
@@ -57,10 +58,10 @@ if ($LASTEXITCODE) { throw "Test pixel shader failed to compile" }
 if ($LASTEXITCODE) { throw "Existing UAV test shader failed to compile" }
 Push-Location $root
 try {
-    & "$env:USERPROFILE\.cargo\bin\cargo.exe" build -q -p tessera-core --example instrument
+    cargo build -q -p tessera-core --example instrument
     if ($LASTEXITCODE) { throw "DXBC instrumenter build failed" }
 } finally { Pop-Location }
-$instrument = Join-Path $root "target\debug\examples\instrument.exe"
+$instrument = Join-Path $root "$buildRoot\cargo\debug\examples\instrument.exe"
 & $instrument $existing "$case\rejected.dxbc"
 if ($LASTEXITCODE -ne 2 -or (Test-Path -LiteralPath "$case\rejected.dxbc")) {
     throw "Shader with an existing UAV should leave no output file"
@@ -82,7 +83,7 @@ foreach ($mode in "EXPLICIT_LOD", "EXPLICIT_LOD_REGISTER") {
 
 # Exercise both normal layer paths in a clean local installation.
 Copy-Item -LiteralPath "$bin\tessera_test_feedback.exe" -Destination $case
-Copy-Item -LiteralPath "$root\build\src\dll\$Config\tessera_d3d11.dll" -Destination "$case\d3d11.dll"
+Copy-Item -LiteralPath "$root\$buildRoot\x64\src\dll\tessera_d3d11.dll" -Destination "$case\d3d11.dll"
 $env:TESSERA_DATA_DIR = Join-Path $case "data"
 $test = Join-Path $case "tessera_test_feedback.exe"
 $layerLog = Join-Path $env:TESSERA_DATA_DIR "logs\tessera_test_feedback.exe.log"

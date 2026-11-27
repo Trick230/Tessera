@@ -43,7 +43,7 @@ VRAM taken by other processes, duplicates and uncompressed textures.
   Vulkan recording layer + tessera_vulkan_replay [optional, recording and replay only]
 ```
 
-Stack: the layer and the GPU tools are C++20 (CMake, VS 2022). The preparation app is Rust
+Stack: the layer and the GPU tools are C++20 (CMake + Ninja, clang-cl with ThinLTO, toolchain in `.toolchain/`). The preparation app is Rust
 (`crates/core` for the logic, `crates/app` with a Slint UI). Binary formats: the C headers in
 `include/tessera` are the source of truth, mirrored in Rust.
 
@@ -340,16 +340,14 @@ Both options are off by default. Build with `powershell -NoProfile -ExecutionPol
 In the Textures tab, select Capture and play a session if testing recompression. With the game closed, select
 Prepare quality. The tab shows captured, approved and applied textures. Apply becomes available once textures
 are approved. Mip feedback becomes available once compatible shaders are prepared.
-For scripts, use `& .\target\release\tessera.exe --prepare-quality "<game executable>" | Out-Host` and
+For scripts, use `& .\build\windows-x64\cargo\release\tessera.exe --prepare-quality "<game executable>" | Out-Host` and
 `cargo run -p tessera-core --example session -- <file.tsess> --mips` to inspect the results.
 Real game impact still needs measurement.
 
 On Windows, build the optional targets and run the focused test:
 
 ```powershell
-cmake -S . -B build/quality -G "Visual Studio 17 2022" -A x64 -DTESSERA_BUILD_QUALITY=ON
-cmake --build build --config Release --target tessera_d3d11
-cmake --build build/quality --config Release --target tessera_texcomp tessera_test_feedback
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Quality
 powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_quality.ps1
 ```
 

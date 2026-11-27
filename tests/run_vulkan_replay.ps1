@@ -2,10 +2,12 @@
 # Check interruption recovery with an existing Tessera Vulkan recording.
 param(
     [Parameter(Mandatory)][string]$Recording,
-    [string]$Helper = 'build/vulkan-telemetry/src/vulkan_telemetry/Release/tessera_vulkan_replay.exe'
+    [string]$Helper = ''   # default: build.ps1 -Vulkan output
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
+. "$repo\tools\paths.ps1"
+if (-not $Helper) { $Helper = Join-Path $repo "$buildRoot\vulkan-x64\src\vulkan_telemetry\tessera_vulkan_replay.exe" }
 $recordPath = (Resolve-Path -LiteralPath $Recording).Path
 $helperPath = (Resolve-Path -LiteralPath $Helper).Path
 $run = Join-Path $repo "build/vulkan-replay-recovery/$([guid]::NewGuid())"

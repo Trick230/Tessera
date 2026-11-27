@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-find_path(TESSERA_VULKAN_HEADERS vulkan/vk_layer.h HINTS ENV VULKAN_SDK PATH_SUFFIXES Include REQUIRED)
+include(FetchContent)
+FetchContent_Declare(tessera_vulkan_headers
+  URL https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/tags/v1.4.321
+  URL_HASH SHA256=7c1874f9186d9e7d5245e279cdccaa77a66ed8f52871b428630aeb771dc7623c
+  SOURCE_SUBDIR tessera-header-only
+  DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+FetchContent_MakeAvailable(tessera_vulkan_headers)
+set(TESSERA_VULKAN_HEADERS "${tessera_vulkan_headers_SOURCE_DIR}/include")
 add_library(tessera_vulkan_telemetry SHARED layer.cpp exports.def)
 target_include_directories(tessera_vulkan_telemetry PRIVATE ${TESSERA_VULKAN_HEADERS} ${PROJECT_SOURCE_DIR}/include)
 target_compile_definitions(tessera_vulkan_telemetry PRIVATE VK_NO_PROTOTYPES)
