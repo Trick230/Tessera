@@ -65,7 +65,7 @@ Needs Windows 10 or 11 (x64) and the [Visual C++ Redistributable](https://learn.
 4. **Install layer** (optional). Settings in the **Session**, **Textures** and **Settings** tabs apply the next time the game starts.
 5. **Play as usual**, from any launcher, then close the game and open the **Session** tab.
 
-**Uninstall** puts the game folder back as it was. Direct3D 11 games get every feature; in Direct3D 12 games the layer runs the frame limiter and session recording, in Vulkan games the frame limiter. Options and command-line tools: [`docs/GUIDE.md`](docs/GUIDE.md).
+**Uninstall** puts the game folder back as it was. Direct3D 11 games get every feature; in Direct3D 12 and Vulkan games the layer runs the frame limiter, the process tweaks and session recording. Options and command-line tools: [`docs/GUIDE.md`](docs/GUIDE.md).
 
 ## How it works
 
