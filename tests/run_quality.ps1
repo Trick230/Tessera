@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Run after build.ps1 -Quality.
-param([string]$Fxc)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 . "$root\tools\env.ps1"
@@ -8,14 +7,9 @@ $bin = Join-Path $root "$buildRoot\quality\src\texcomp"
 $case = Join-Path $root ("build\quality-smoke\" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $case -Force | Out-Null
 
-if (-not $Fxc) {
-    $sdk = Join-Path ([Environment]::GetEnvironmentVariable("ProgramFiles(x86)")) "Windows Kits\10\bin"
-    $Fxc = Get-ChildItem -LiteralPath $sdk -Directory |
-        Sort-Object -Property { try { [version]$_.Name } catch { [version]"0.0" } } -Descending |
-        ForEach-Object { Join-Path $_.FullName "x64\fxc.exe" } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-    if (-not $Fxc) { throw "Could not find the Windows SDK fxc.exe" }
-}
+# Test shaders: fxc /O3 /Fo with the system d3dcompiler_47.dll.
+$hlsl = Join-Path $bin "tessera_hlsl_header.exe"
+
 
 $compressor = Join-Path $bin "tessera_texcomp.exe"
 & $compressor --selftest
@@ -52,9 +46,9 @@ $in = Join-Path $case "original.dxbc"
 $out = Join-Path $case "instrumented.dxbc"
 $existing = Join-Path $case "existing-uav.dxbc"
 $shader = Join-Path $PSScriptRoot "quality\sample.hlsl"
-& $Fxc /nologo /T ps_5_0 /E main /O3 /Fo $in $shader
+& $hlsl --object $shader main ps_5_0 $in
 if ($LASTEXITCODE) { throw "Test pixel shader failed to compile" }
-& $Fxc /nologo /T ps_5_0 /E main /O3 /D EXISTING_UAV=1 /Fo $existing $shader
+& $hlsl --object $shader main ps_5_0 $existing EXISTING_UAV
 if ($LASTEXITCODE) { throw "Existing UAV test shader failed to compile" }
 Push-Location $root
 try {
@@ -73,7 +67,7 @@ if ($LASTEXITCODE) { throw "D3D11 mip feedback test failed" }
 foreach ($mode in "EXPLICIT_LOD", "EXPLICIT_LOD_REGISTER") {
     $explicit = Join-Path $case "$mode.dxbc"
     $instrumented = Join-Path $case "$mode-instrumented.dxbc"
-    & $Fxc /nologo /T ps_5_0 /E main /O3 /D "$mode=1" /Fo $explicit $shader
+    & $hlsl --object $shader main ps_5_0 $explicit $mode
     if ($LASTEXITCODE) { throw "Explicit LOD test shader failed to compile" }
     & $instrument $explicit $instrumented
     if ($LASTEXITCODE) { throw "Explicit LOD instrumentation failed" }

@@ -36,7 +36,7 @@ sh build.sh                              # Windows binaries in build/linux-<arch
 the Rust build scripts there also need the system C compiler (gcc or clang).
 
 Focused tests: `tests/run_smoke.ps1` (D3D11 layer), `tests/run_phase4.ps1` (prediction and I/O),
-`tests/run_quality.ps1` (mip feedback and recompression; needs `fxc.exe` from an installed Windows SDK, or `-Fxc <path>`), `tests/run_vulkan_replay.ps1`.
+`tests/run_quality.ps1` (mip feedback and recompression), `tests/run_vulkan_replay.ps1`.
 
 ## Per-game settings (`tessera.ini`)
 
