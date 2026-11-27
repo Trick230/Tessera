@@ -1,6 +1,8 @@
 # Fetches the toolchain (tools/toolchain.ps1), builds everything and runs the Rust and D3D11
 # smoke tests on each push and pull request.
 # Runner GPU is the Microsoft Basic Render Driver: VRAM checks are skipped there, Vulkan is not built.
+# Cached: the toolchain (keyed on its pins) and the build trees (latest run; the checkout's fresh
+# timestamps rebuild our own sources, while Rust dependencies and the ThinLTO cache are reused).
 name: ci
 on:
   push:
@@ -11,7 +13,22 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
-    uses: ./.github/workflows/dc.yml
-    with:
-      os: windows-2022
-      commands: '["powershell -NoProfile -ExecutionPolicy Bypass -File tools/toolchain.ps1 -AcceptLicense && powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Test"]'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"   # incremental data is never reused on CI, only grows the cache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: |
+            .toolchain/windows-x64
+            !.toolchain/windows-x64/dl
+          key: toolchain-windows-x64-${{ hashFiles('tools/toolchain.ps1', 'rust-toolchain.toml') }}
+      - uses: actions/cache@v6
+        with:
+          path: build/windows-x64
+          key: build-windows-x64-${{ github.sha }}
+          restore-keys: build-windows-x64-
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/toolchain.ps1 -AcceptLicense
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Test
