@@ -8,7 +8,7 @@ Power-user and developer notes that do not belong in the [README](../README.md).
 ```powershell
 powershell -File build.ps1            # app + D3D11 layer, shader warm-up and D3D12 recorder (x64 and x86)
 powershell -File build.ps1 -Test      # also Rust unit tests and the x64/x86 D3D11 smoke tests
-powershell -File build.ps1 -Quality   # adds tessera_texcomp.exe (BC7/BC6H + FLIP)
+powershell -File build.ps1 -Quality   # adds tessera_texcomp.exe (BC7/BC6H on the GPU, CPU fallback, + FLIP)
 powershell -File build.ps1 -Vulkan    # adds the Vulkan layer and tessera_vulkan_replay.exe (needs the Vulkan SDK headers)
 ```
 

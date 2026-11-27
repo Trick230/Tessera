@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <windows.h>
+#include <d3d11.h>
 
 #include <DirectXTex.h>
 #include <DirectXPackedVector.h>
@@ -23,6 +24,7 @@ namespace {
 using namespace DirectX;
 constexpr size_t kMaxDimension = 2048;
 constexpr float kMaxMeanFlip = 0.005f, kMaxFlip = 0.025f;
+bool g_cpu_only = false;  // --cpu: skip the GPU encoder (tests, comparisons)
 
 DXGI_FORMAT target_format(DXGI_FORMAT f) {
     switch (f) {
@@ -124,14 +126,36 @@ bool compare_mip(const Image& ref, const Image& decoded, Quality& quality) {
 
 enum Result { accepted = 0, failed = 1, rejected = 2 };
 
+// The DirectCompute encoder's device: one per process, created on first use; null when there
+// is no usable GPU (or --cpu), and the CPU encoder takes over.
+ID3D11Device* gpu_device() {
+    static ID3D11Device* const device = [] {
+        ID3D11Device* d = nullptr;
+        if (g_cpu_only) return d;
+        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 3, D3D11_SDK_VERSION, &d,
+                                     nullptr, nullptr)))
+            d = nullptr;
+        return d;
+    }();
+    return device;
+}
+
 Result try_compress(const ScratchImage& input, ScratchImage& output, Quality& quality) {
     const auto& m = input.GetMetadata();
     if (!supported(m)) return rejected;
     const auto* images = input.GetImages();
     const size_t count = input.GetImageCount();
     if (!std::all_of(images, images + count, opaque_nonnegative)) return rejected;
-    HRESULT hr = Compress(images, count, m, target_format(m.format), TEX_COMPRESS_DEFAULT,
-                          TEX_THRESHOLD_DEFAULT, output);
+    const DXGI_FORMAT format = target_format(m.format);
+    HRESULT hr = E_FAIL;
+    if (auto* device = gpu_device()) {
+        hr = Compress(device, images, count, m, format, TEX_COMPRESS_DEFAULT, TEX_ALPHA_WEIGHT_DEFAULT, output);
+        if (FAILED(hr))
+            std::fprintf(stderr, "GPU compress failed (0x%08lx), using the CPU encoder\n",
+                         static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) hr = Compress(images, count, m, format, TEX_COMPRESS_DEFAULT, TEX_THRESHOLD_DEFAULT, output);
     if (FAILED(hr)) {
         std::fprintf(stderr, "Compress failed (0x%08lx)\n", static_cast<unsigned long>(hr));
         return failed;
@@ -261,10 +285,15 @@ int selftest() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) try {
+    if (argc > 1 && std::wstring(argv[1]) == L"--cpu") {
+        g_cpu_only = true;
+        --argc;
+        ++argv;
+    }
     if (argc == 2 && std::wstring(argv[1]) == L"--selftest") return selftest();
     if (argc == 4 && std::wstring(argv[1]) == L"--batch") return batch(argv[2], argv[3]);
     if (argc != 3) {
-        std::fputs("usage: tessera_texcomp <source.dds> <new-output.dds> | --batch <capture dir> <cache dir>\n",
+        std::fputs("usage: tessera_texcomp [--cpu] <source.dds> <new-output.dds> | --batch <capture dir> <cache dir>\n",
                    stderr);
         return failed;
     }

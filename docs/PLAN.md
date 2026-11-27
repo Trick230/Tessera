@@ -255,7 +255,9 @@ built side by side in D3D11, with pipeline recording for D3D12 and Vulkan added 
   and prefetch with material association, M7 co-occurrence prediction, I4–I5 split uploads throttled by a
   GPU fence.
 - Phase 5 (off by default): M6 DXBC mip feedback (offline instrumentation, one sampled draw per 60 frames),
-  M9 BC7/BC6H recompression checked with FLIP (`tessera_texcomp.exe`).
+  M9 BC7/BC6H recompression checked with FLIP (`tessera_texcomp.exe`): DirectXTex DirectCompute encoder on the
+  GPU (2048² BC7: 554 s on the CPU → 3.1–3.5 s; 1024²: 137–141 s → ~1 s, RTX 4060), CPU encoder as fallback
+  or with `--cpu`. Its shaders are built by `tessera_hlsl_header` (d3dcompiler_47; output matched fxc 10.0.26100 here).
 - Extra: R1 render target reuse, U1 Unreal cvars (+ test variants), SLOW_CREATE records,
   `tools/global_test.ps1` A/B harness.
 - P1 low-latency limiter (`limiter_mode=1`, default). Synthetic bench (`--limiter-bench`, noisy load with

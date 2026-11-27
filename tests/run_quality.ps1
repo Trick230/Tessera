@@ -19,6 +19,8 @@ if (-not $Fxc) {
 $compressor = Join-Path $bin "tessera_texcomp.exe"
 & $compressor --selftest
 if ($LASTEXITCODE) { throw "Texture compression selftest failed" }
+& $compressor --cpu --selftest
+if ($LASTEXITCODE) { throw "CPU texture compression selftest failed" }
 
 # A single-mip sRGB DDS with opaque white pixels.
 $dds = New-Object byte[] (148 + 16 * 16 * 4)
