@@ -32,3 +32,25 @@ jobs:
           restore-keys: build-windows-x64-
       - run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/toolchain.ps1 -AcceptLicense
       - run: powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Test
+  # Cross-build from Linux (tools/toolchain.sh + build.sh) so that path does not break unnoticed;
+  # no tests (they need Windows).
+  linux-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: |
+            .toolchain/linux-x64
+            !.toolchain/linux-x64/dl
+          key: toolchain-linux-x64-${{ hashFiles('tools/toolchain.sh', 'rust-toolchain.toml') }}
+      - uses: actions/cache@v6
+        with:
+          path: build/linux-x64
+          key: build-linux-x64-${{ github.sha }}
+          restore-keys: build-linux-x64-
+      - run: sh tools/toolchain.sh --accept-license
+      - run: sh build.sh
