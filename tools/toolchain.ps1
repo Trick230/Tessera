@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $root = Split-Path $PSScriptRoot -Parent
 
-$llvm = "23.1.6"; $cmakeV = "4.5.1"; $ninjaV = "1.13.2"; $xwinV = "0.10.0"; $rustupV = "1.29.3"
+$llvm = "23.1.6"; $cmakeV = "4.5.1"; $ninjaV = "1.13.2"; $xwinV = "0.10.0"; $rustupV = "1.29.3"; $xzV = "5.8.4"
 # MSVC CRT and Windows SDK versions xwin fetches (otherwise the newest in the manifest).
 $crtV = "14.44.17.14"; $sdkV = "10.0.26100"
 # PROCESSOR_ARCHITEW6432 is set when an x64 PowerShell runs emulated on ARM64.
@@ -20,8 +20,8 @@ $triple = if ($arm) { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc
 $tc = Join-Path $root ".toolchain\$hostName"
 $dl = Join-Path $tc "dl"
 
-# Pinned downloads: name -> url, SHA-256 (from the release digests). xwin has no Windows
-# ARM64 build: the x64 one runs emulated.
+# Pinned downloads: name -> url, SHA-256 (from the release digests). xwin and xz have no
+# Windows ARM64 build: the x64 ones run emulated.
 $files = @{
     llvm   = @("https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvm/clang+llvm-$llvm-$triple.tar.xz",
                $(if ($arm) { "fa5a25df6a1405fdfb9942f4d5cc73bfc3b8b31cfd43ee2fbd43bd2e3168be01" } else { "16af05919cf36958dfb4ddaa4fc4d9d4ff577f5daeb76bc112ea49cd8ced82b2" }))
@@ -31,6 +31,8 @@ $files = @{
                $(if ($arm) { "e52f0bdef9dfb1003229dbd6508a508c4073fd017247002adc66e5e806cb0391" } else { "07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65" }))
     xwin   = @("https://github.com/Jake-Shadle/xwin/releases/download/$xwinV/xwin-$xwinV-x86_64-pc-windows-msvc.tar.gz",
                "96e83665ef5c1406aabd0be603a8d08e67e604f36fda630b6807ee948a614e26")
+    xz     = @("https://github.com/tukaani-project/xz/releases/download/v$xzV/xz-$xzV-windows.zip",
+               "f31af7638391ecf286d48bc8555ce6e131691a1c52a9e44303bce57069e9de56")
     rustup = @("https://static.rust-lang.org/rustup/archive/$rustupV/$triple/rustup-init.exe",
                $(if ($arm) { "407e0d72f81d26a01f9d032b8317908cbb2917ba22765474b682b41390792ad9" } else { "38027d51d69a5d05493627a0634dbea52d6cd793c8f072d2373d3f4163eec7db" }))
 }
@@ -60,7 +62,14 @@ if (-not (Test-Path "$tc\llvm\bin\clang-cl.exe")) {
     $out = Join-Path $tc "llvm"
     New-Item -ItemType Directory -Force $out | Out-Null
     $members = "bin/clang-cl.exe", "bin/lld-link.exe", "bin/llvm-ml.exe", "bin/llvm-rc.exe", "bin/llvm-lib.exe", "lib/clang/*/include"
-    & "$env:SystemRoot\System32\tar.exe" -xf $f -C $out --strip-components 1 ($members | ForEach-Object { "$top/$_" })
+    # Windows tar.exe reads .xz only where it was built with liblzma (not on Windows Server
+    # 2022, where it waits forever on an external xz): decompress with the pinned xz instead.
+    $xzDir = Join-Path $dl "xz-bin"
+    Expand-Archive (Get-Pinned xz) $xzDir -Force
+    $names = ($members | ForEach-Object { "`"$top/$_`"" }) -join " "
+    # cmd pipes the bytes untouched (a PowerShell 5.1 pipe would re-encode them); /s strips
+    # only the outer quote pair.
+    cmd /s /c "`"`"$xzDir\bin_x86-64\xz.exe`" -dc `"$f`" | `"$env:SystemRoot\System32\tar.exe`" -xf - -C `"$out`" --strip-components 1 $names`""
     if ($LASTEXITCODE) { throw "LLVM extract failed" }
     Remove-Item -LiteralPath $f   # 900 MB, the extracted tools are what matters
 }
