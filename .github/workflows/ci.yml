@@ -12,6 +12,8 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: windows-2022
@@ -19,16 +21,17 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"   # incremental data is never reused on CI, only grows the cache
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0   # tools/ci_mtime.sh diffs against the cached build commit
-      - uses: actions/cache@v6
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
             .toolchain/windows-x64
             !.toolchain/windows-x64/dl
           key: toolchain-windows-x64-${{ hashFiles('tools/toolchain.ps1', 'rust-toolchain.toml') }}
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: build/windows-x64
           key: build-windows-x64-${{ github.sha }}
@@ -47,16 +50,17 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0   # tools/ci_mtime.sh diffs against the cached build commit
-      - uses: actions/cache@v6
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
             .toolchain/linux-x64
             !.toolchain/linux-x64/dl
           key: toolchain-linux-x64-${{ hashFiles('tools/toolchain.sh', 'rust-toolchain.toml') }}
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: build/linux-x64
           key: build-linux-x64-${{ github.sha }}
