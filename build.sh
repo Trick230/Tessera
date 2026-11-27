@@ -23,7 +23,7 @@ export RUSTUP_TOOLCHAIN=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "$root/rust
 export CARGO_TARGET_DIR="$root/build/$host/cargo"
 export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link
 export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-Lnative=$xw/crt/lib/x86_64 -Lnative=$xw/sdk/lib/um/x86_64 -Lnative=$xw/sdk/lib/ucrt/x86_64"
-inc="/X -imsvc $xw/crt/include -imsvc $xw/sdk/include/ucrt -imsvc $xw/sdk/include/um -imsvc $xw/sdk/include/shared"
+inc="/X -fms-compatibility-version=19.44 -imsvc $xw/crt/include -imsvc $xw/sdk/include/ucrt -imsvc $xw/sdk/include/um -imsvc $xw/sdk/include/shared"
 export CC_x86_64_pc_windows_msvc=clang-cl CXX_x86_64_pc_windows_msvc=clang-cl AR_x86_64_pc_windows_msvc=llvm-lib
 export CFLAGS_x86_64_pc_windows_msvc="$inc" CXXFLAGS_x86_64_pc_windows_msvc="$inc"
 

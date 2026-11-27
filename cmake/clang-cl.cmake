@@ -43,8 +43,10 @@ foreach(d crt/include sdk/include/ucrt sdk/include/um sdk/include/shared sdk/inc
   string(APPEND inc " /imsvc \"${xwin}/${d}\"")
 endforeach()
 # /X and /lldignoreenv: only these folders, never INCLUDE/LIB or a Visual Studio found on the system.
-set(CMAKE_C_FLAGS_INIT "/X${inc}")
-set(CMAKE_CXX_FLAGS_INIT "/X${inc}")
+# _MSC_VER pinned to the xwin CRT (14.44): clang-cl would otherwise take it from an installed
+# Visual Studio, or fall back to 19.33.
+set(CMAKE_C_FLAGS_INIT "/X -fms-compatibility-version=19.44${inc}")
+set(CMAKE_CXX_FLAGS_INIT "/X -fms-compatibility-version=19.44${inc}")
 set(CMAKE_ASM_MASM_FLAGS_INIT "${masm}")
 set(libs "/lldignoreenv")
 foreach(d crt/lib/${xarch} sdk/lib/um/${xarch} sdk/lib/ucrt/${xarch})

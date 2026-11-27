@@ -17,7 +17,7 @@ Remove-Item Env:LIBPATH, Env:VSINSTALLDIR, Env:VCINSTALLDIR -ErrorAction Silentl
 # rustc and cc look up Visual Studio themselves and hand its LIB/INCLUDE to the tools:
 # /lldignoreenv and /X keep lld-link and clang-cl on the xwin folders only.
 $env:CC = "clang-cl"; $env:CXX = "clang-cl"; $env:AR = "llvm-lib"
-$env:CFLAGS = (@("/X") + ($incDirs | ForEach-Object { "-imsvc", $_ })) -join " "   # cc splits on spaces
+$env:CFLAGS = (@("/X", "-fms-compatibility-version=19.44") + ($incDirs | ForEach-Object { "-imsvc", $_ })) -join " "   # cc splits on spaces
 $env:CXXFLAGS = $env:CFLAGS
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = "lld-link"
 $env:CARGO_ENCODED_RUSTFLAGS = (@("-Clink-arg=/lldignoreenv") + ($libDirs | ForEach-Object { "-Lnative=$_" })) -join [char]0x1f
