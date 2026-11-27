@@ -12,6 +12,9 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # Release: ThinLTO and unused data dropped (/Gw).
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 add_compile_options($<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/Gw>)
+# ThinLTO cache: a relink only re-optimizes the modules that changed (capped at 1 GB).
+add_link_options($<$<CONFIG:Release>:/lldltocache:${CMAKE_BINARY_DIR}/lto-cache>
+                 $<$<CONFIG:Release>:/lldltocachepolicy:cache_size_bytes=1g>)
 
 add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/W4> $<$<COMPILE_LANGUAGE:C,CXX>:/permissive->
