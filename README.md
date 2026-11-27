@@ -25,7 +25,7 @@ Quality is never traded silently. A lossy step, such as recompressing a texture,
 
 ## Getting started
 
-There are no prebuilt downloads yet; [build it](#building) first. Then:
+There are no prebuilt downloads yet; [build it](#building) first. The app needs Windows 10 or 11 (x64) and the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) for x64, which most PCs with games already have. Then:
 
 1. **Open `tessera.exe`.** Your Steam and Epic games appear in the **Library**. Add other folders in **Settings**.
 2. **Pick a game.** The app shows its graphics API, engine and anti-cheat.
