@@ -1,8 +1,9 @@
 # Fetches the toolchain (tools/toolchain.ps1), builds everything and runs the Rust and D3D11
 # smoke tests on each push and pull request.
 # Runner GPU is the Microsoft Basic Render Driver: VRAM checks are skipped there, Vulkan is not built.
-# Cached: the toolchain (keyed on its pins) and the build trees (latest run; the checkout's fresh
-# timestamps rebuild our own sources, while Rust dependencies and the ThinLTO cache are reused).
+# Cached: the toolchain (keyed on its pins) and the build trees (latest run). Each cached build
+# tree records its commit; tools/ci_mtime.sh back-dates the sources unchanged since then, so only
+# changed sources rebuild.
 name: ci
 on:
   push:
@@ -19,6 +20,8 @@ jobs:
       CARGO_INCREMENTAL: "0"   # incremental data is never reused on CI, only grows the cache
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # tools/ci_mtime.sh diffs against the cached build commit
       - uses: actions/cache@v6
         with:
           path: |
@@ -30,8 +33,12 @@ jobs:
           path: build/windows-x64
           key: build-windows-x64-${{ github.sha }}
           restore-keys: build-windows-x64-
+      - run: sh tools/ci_mtime.sh build/windows-x64
+        shell: bash
       - run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/toolchain.ps1 -AcceptLicense
       - run: powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Test
+      - run: echo "$GITHUB_SHA" > build/windows-x64/ci-sha
+        shell: bash
   # Cross-build from Linux (tools/toolchain.sh + build.sh) so that path does not break unnoticed;
   # no tests (they need Windows).
   linux-build:
@@ -41,6 +48,8 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # tools/ci_mtime.sh diffs against the cached build commit
       - uses: actions/cache@v6
         with:
           path: |
@@ -52,5 +61,8 @@ jobs:
           path: build/linux-x64
           key: build-linux-x64-${{ github.sha }}
           restore-keys: build-linux-x64-
+      - run: sh tools/ci_mtime.sh build/linux-x64
+        shell: bash
       - run: sh tools/toolchain.sh --accept-license
       - run: sh build.sh
+      - run: echo "$GITHUB_SHA" > build/linux-x64/ci-sha
