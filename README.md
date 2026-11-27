@@ -55,7 +55,7 @@ powershell -File tools/toolchain.ps1 -AcceptLicense   # once, ~2.7 GB in .toolch
 powershell -File build.ps1                            # -> build\windows-x64\cargo\release\tessera.exe
 ```
 
-Needs Windows 10 or 11 (x64) and the [Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) for x64, which most PCs with games already have. `-AcceptLicense` accepts the Microsoft license of the runtime and SDK files the toolchain downloads. Building from Linux and the optional tools: [`docs/ADVANCED.md`](docs/ADVANCED.md).
+Needs Windows 10 or 11 (x64) and the [Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) for x64, which most PCs with games already have. `-AcceptLicense` accepts the Microsoft license of the runtime and SDK files the toolchain downloads. Building from Linux and the optional tools: [`docs/GUIDE.md`](docs/GUIDE.md).
 
 ## Usage
 
@@ -65,7 +65,7 @@ Needs Windows 10 or 11 (x64) and the [Visual C++ Redistributable](https://learn.
 4. **Install layer** (optional). Settings in the **Session**, **Textures** and **Settings** tabs apply the next time the game starts.
 5. **Play as usual**, from any launcher, then close the game and open the **Session** tab.
 
-**Uninstall** puts the game folder back as it was. Direct3D 11 games get every feature; in Direct3D 12 games the layer runs the frame limiter and session recording, in Vulkan games the frame limiter. Options and command-line tools: [`docs/ADVANCED.md`](docs/ADVANCED.md).
+**Uninstall** puts the game folder back as it was. Direct3D 11 games get every feature; in Direct3D 12 games the layer runs the frame limiter and session recording, in Vulkan games the frame limiter. Options and command-line tools: [`docs/GUIDE.md`](docs/GUIDE.md).
 
 ## How it works
 

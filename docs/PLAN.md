@@ -1,7 +1,8 @@
 # Tessera — full plan
 
-Design document. It sums up every decision and idea discussed so far.
-Whenever something is measured and turns out different from what is written here, update this file.
+Design document: goal, architecture, the optimization catalogue, the roadmap with its current status and
+what is left. Usage of each option is in [GUIDE.md](GUIDE.md). Whenever something is measured and turns
+out different from what is written here, update this file.
 
 ---
 
@@ -228,141 +229,112 @@ garbage collection, game logic spikes, DRM, the CPU side of traversal.
 Test games: a VRAM-heavy D3D11 game (phases 0–5) — FF7 Remake forced to D3D11 with `-dx11` so far;
 FF7 Remake (D3D12) in phase 6.
 
-### Status (2026-11-24)
+### Status (2026-11-27)
 
-The user asked to start the optimizations before the Phase 0 gate was formally closed, so phases 0–5 were
-built side by side in D3D11, with pipeline recording for D3D12 and Vulkan added after. Everything below is on
-`master`.
+Phases 0-5 were built side by side in D3D11 (the author asked to start the optimizations before the
+phase 0 gate was formally closed), with pipeline recording for D3D12 and Vulkan added after. Everything
+below is on `master`. How to turn each preview on: [GUIDE.md](GUIDE.md).
 
 **Done (D3D11 layer, x64 and x86):**
-- Phase 0: C1, C2, C5, C6, C7, D1 — proxy with chaining, safe mode, session recording, app
-  (Rust + Slint) with discovery (Steam/Epic/game and library folders, recompiled games), API/engine/anti-cheat
+- Phase 0: C1, C2, C5, C6, C7, D1. Proxy with chaining, safe mode, session recording; app (Rust + Slint)
+  with discovery (Steam, Epic, game and library folders, recompiled games), API/engine/anti-cheat
   detection, install/uninstall. Overhead measured with `tools/measure_overhead.ps1`. 32-bit D3D11 games
   supported (separate x86 layer and warm-up).
 - Phase 1: M1 (DXGI + NVAPI budget/description hooks, also before the first device), M2 (off by default),
-  P1 limiter with cadence reset after late frames, P2 flip model (off by
-  default), P3, P5, P6, S7, basic D2, optional slow D3D11 context call records.
-- Phase 2: S1 across engines — Unreal PAK (legacy and modern indexes), IoStore (incl. encrypted blocks),
-  shader libraries up to UE 5.8, AES key detected in the executable; Unity bundles, WebGL archives, APK, SMOL-V;
-  recompiled games' embedded shaders and disk caches. Bytecode exported per API (D3D11, D3D12, Vulkan,
-  OpenGL). S5 `tessera_warm.exe` (watchdog that never kills, incremental warm-up of pending shaders, geometry
-  shaders and pixel shaders paired with compatible game vertex shaders), S6, coverage meter, NVIDIA cache
-  status and per-game cache clearing in the app.
-- Phase 3: M3/M4/M5/M10 mip residency (tiled tier 2 only, off by default), M11 working-set meter on the
-  presenting device, C3 per-module exclusion, deferred-context support, device replacement takeover,
-  opt-in feature level 11_1 request (`d3d11_prefer_11_1`).
-- Phase 4 (off by default): P4 performance-core CPU sets, M8 immutable texture dedup, I1–I3 file-range learning
-  and prefetch with material association, M7 co-occurrence prediction, I4–I5 split uploads throttled by a
-  GPU fence.
-- Phase 5 (off by default): M6 DXBC mip feedback (offline instrumentation, one sampled draw per 60 frames),
-  M9 BC7/BC6H recompression checked with FLIP (`tessera_texcomp.exe`): DirectXTex DirectCompute encoder on the
-  GPU (2048² BC7: 554 s on the CPU → 3.1–3.5 s; 1024²: 137–141 s → ~1 s, RTX 4060), CPU encoder as fallback
-  or with `--cpu`. Its shaders are built by `tessera_hlsl_header` (d3dcompiler_47; output matched fxc 10.0.26100 here).
+  P1, P2 (off by default), P3, P5, P6, S7, basic D2, optional slow D3D11 context call records.
+- Phase 2: S1 across engines (Unreal PAK, IoStore incl. encrypted blocks, shader libraries up to UE 5.8,
+  AES key from the executable; Unity bundles, WebGL archives, APK, SMOL-V; recompiled games' embedded
+  shaders and disk caches), bytecode exported per API. S5 `tessera_warm.exe` (watchdog that never kills,
+  incremental warm-up, geometry shaders, pixel shaders paired with compatible game vertex shaders), S6,
+  coverage meter, NVIDIA cache status and per-game cache clearing.
+- Phase 3 (off by default): M3/M4/M5/M10 mip residency (tiled tier 2 only), M11 working-set meter (on),
+  C3, deferred contexts, device replacement takeover, opt-in feature level 11_1 (`d3d11_prefer_11_1`).
+- Phase 4 (off by default): P4, M8 immutable dedup, I1-I3 file-range learning and prefetch with material
+  association, M7 co-occurrence prediction, I4-I5 split uploads throttled by a GPU fence.
+- Phase 5 (off by default): M6 DXBC mip feedback (offline instrumentation, one sampled draw per 60
+  frames); M9 BC7/BC6H recompression checked with FLIP (`tessera_texcomp.exe`, DirectXTex DirectCompute
+  encoder on the GPU, CPU fallback or `--cpu`; 2048² BC7 554 s on the CPU -> 3.1-3.5 s, RTX 4060). Its
+  shaders are built by `tessera_hlsl_header` (output byte-identical to fxc 10.0.26100).
 - Extra: R1 render target reuse, U1 Unreal cvars (+ test variants), SLOW_CREATE records,
   `tools/global_test.ps1` A/B harness.
-- P1 low-latency limiter (`limiter_mode=1`, default). Synthetic bench (`--limiter-bench`, noisy load with
-  stutters and a load step, 60 FPS): mean latency 16.5 → 10.8 ms against waiting before `Present`, cadence p99
-  1.4 ms, no misses, no short frames after stutters; at 120 FPS −2.3 ms. The front-edge mode is 2.3 ms lower
-  but with 4 ms cadence p99 and ~5% missed intervals.
-- D3D12 games: the same layer built as `dxgi.dll` (`tessera_dxgi.dll`, x64 and x86) hooks swap chains from
-  DXGI factories; the limiter, P5/P6 and session recording work there (same bench numbers on a D3D12 flip
-  swap chain). The app installs it for games that use D3D12 and not D3D11. This is not yet the phase 6 layer
-  (no D3D12 memory or residency work; M1 stays out of it entirely).
-- Vulkan games: the same layer built as `vulkan-1.dll` (`tessera_vulkan.dll`, x64 and x86) wraps
-  `vkQueuePresentKHR` from the export and from `vkGet*ProcAddr`; limiter, P5 and session recording only.
-  Same bench numbers as D3D11 (`tessera_vulkan_present`, in the smoke test when built). The app installs it
-  for Vulkan-only games. Open: export coverage of the dxgi/vulkan proxies on other Windows builds, a game
-  test on each API.
+
+**Frame limiter (P1, all APIs):**
+- Low-latency mode (`limiter_mode=1`, default). Synthetic bench (`--limiter-bench`, noisy load with
+  stutters and a load step, 60 FPS): mean latency 16.5 -> 10.8 ms against waiting before `Present`,
+  cadence p99 1.4 ms, no misses, no short frames after stutters; at 120 FPS -2.3 ms. Front-edge mode is
+  2.3 ms lower but with 4 ms cadence p99 and ~5% missed intervals.
+- D3D12 games: the layer built as `dxgi.dll` (`tessera_dxgi.dll`) hooks swap chains from DXGI factories;
+  limiter, P5/P6 and session recording only (not the phase 6 layer; no M1). Vulkan-only games: built as
+  `vulkan-1.dll` (`tessera_vulkan.dll`), wraps `vkQueuePresentKHR`; limiter, P5 and session recording.
+  Same bench numbers on all three APIs (mean ~10.9 ms, p99 16.4 ms, 0 misses).
+- Compared by reading Special K, LatencyFleX, DXVK, gamescope, MangoHud and the AMD Anti-Lag 2 SDK
+  (RTSS, NVIDIA, AMD and Intel limiters by their documentation). Tessera's edge today: p90 work
+  prediction, adaptive margin, no catch-up after a stutter.
 
 **Pipeline recording (towards phase 6, S2/S3):**
-- D3D12: `tessera_d3d12_capture.dll` records compute, graphics (pipeline state streams) and ray tracing state
-  objects, including Agility device factories; the app imports recordings and replays them offline.
-  Recordings (format v3) carry the game build (exe size and write time): a patched game starts a new one.
-  `AddToStateObject` records name their parent by hash. Replay keeps partial results and relaunches past a
-  driver crash, skipping the pipeline that caused it.
-- Vulkan: an optional layer (`-Vulkan`) records compute and core graphics pipelines and cache feedback;
-  `tessera_vulkan_replay` rebuilds them into a driver cache with resumable checkpoints (saved by elapsed
-  time). The layer's present hook takes no lock and saves its cache checkpoint off-thread. Added for recompiled
-  games that only ship Vulkan/D3D12 renderers. Its scope is recording and offline replay; the Vulkan frame
-  limiter is the separate `vulkan-1.dll` proxy above, and no other Vulkan optimization is planned before D3D12.
-- The app has **Record pipelines**, **Import pipeline recording** and **Play and verify cache**.
+- D3D12: `tessera_d3d12_capture.dll` records compute, graphics (pipeline state streams) and ray tracing
+  state objects, including Agility device factories; recordings (format v3) carry the game build, so a
+  patched game starts a new one. Offline replay keeps partial results and relaunches past a driver crash,
+  skipping the pipeline that caused it.
+- Vulkan: optional layer (`-Vulkan`) records compute and core graphics pipelines and cache feedback;
+  `tessera_vulkan_replay` rebuilds them into a driver cache with resumable checkpoints. Scope: recording
+  and offline replay, for recompiled games that only ship Vulkan/D3D12 renderers; no other Vulkan
+  optimization before D3D12.
+- App: **Record pipelines**, **Import pipeline recording**, **Play and verify cache**.
+
+**Build and CI:**
+- One build path: clang-cl + ThinLTO with the in-repo toolchain (`.toolchain/<host>/`: LLVM, CMake, Ninja,
+  Rust, xwin CRT/SDK); no Visual Studio. Builds on Windows and cross-builds from Linux into
+  `build/<host>/`. ThinLTO made the CPU texture encoder ~23% faster than MSVC `/O2` (1024²: 135/137 s ->
+  104/107 s). No `-march` for the layer (it runs inside other games).
+- CI on every push: `build.ps1 -Test` on Windows Server 2022 and `build.sh` on Ubuntu 24.04, toolchain and
+  build trees cached, unchanged sources back-dated so only changed ones rebuild (a docs-only commit: 2m45
+  on Windows, 36 s on Linux). The runner GPU has no VRAM: VRAM checks are skipped and Vulkan is not built.
+- `tessera.exe` links the C++ runtime dynamically (the prebuilt Skia is `/MD`; static linking fails), so
+  it needs the Visual C++ Redistributable.
 
 **Findings that shape the next steps (FF7R, D3D11, RTX 4060, NVIDIA 621.14):**
-- FF7R requests feature level 11_0, where this GPU reports tiled tier 1; 11_1 reports tier 2. Mip residency
-  also needs `IMMUTABLE` textures and FF7R creates `DEFAULT` ones, and it peaked at 6044 of 6763 MiB, so neither
-  eligibility nor memory pressure is proven there.
-- `SetEvictionPriority` crashes or hangs the driver (M2 and an earlier R1 version).
-- `ue_streaming` at a 60 cap: 47.8 / 51.5 → 59.8 / 59.8 displayed FPS, p99 26.5 / 25.4 → 23.2 / 23.1 ms.
-- Remaining stutter: streaming texture creates with initial data on 4 worker threads (100–240 ms each, driver
-  contention), plus 4K render target churn every 10–12 s (R1 cut >50 ms hitches from 8.0 to 1.5 per minute).
-- Phase 4 in FF7R: material tagging went from 0 to 3039 ranges and prefetch issued 42.6 MiB; a reduction
-  in stutter is not shown yet (the comparison had no frame over 33.3 ms in any run).
-- Phase 5 in FF7R: 98 pixel shaders instrumented, but only 5 mip samples, all before the test route;
-  the 12,262 textures created in the route were all `DEFAULT` and already BC (no dedup or recompression input).
+- FF7R requests feature level 11_0, where this GPU reports tiled tier 1 (11_1 reports tier 2); it creates
+  `DEFAULT` textures, not `IMMUTABLE`, and peaked at 6044 of 6763 MiB, so neither eligibility nor memory
+  pressure is proven there.
+- `SetEvictionPriority` crashes or hangs the driver (M2 7/7 runs, an earlier R1 version 3/4).
+- `ue_streaming` at a 60 cap: 47.8 / 51.5 -> 59.8 / 59.8 displayed FPS, p99 26.5 / 25.4 -> 23.2 / 23.1 ms.
+- Remaining stutter: streaming texture creates with initial data on 4 worker threads (100-240 ms each,
+  driver contention; serialising them in the layer would not help), plus 4K render target churn every
+  10-12 s (R1 cut >50 ms hitches from 8.0 to 1.5 per minute).
+- Phase 4: material tagging 0 -> 3039 ranges, prefetch issued 42.6 MiB; no stutter reduction shown (the
+  comparison had no frame over 33.3 ms in any run).
+- Phase 5: 98 pixel shaders instrumented but only 5 mip samples, all before the test route; the 12,262
+  textures created in the route were all `DEFAULT` and already BC (no dedup or recompression input).
 
-**What is left:**
-1. U1 A/B in FF7R (not run yet): base `ue_streaming` vs `ue_drs_off` vs `ue_rt_grow` (2 rounds), then
-   `ue_pool_vram`, `ue_shaders_on_load`, `ue_load_limits`. Promote what helps to defaults/app options.
-2. Decide whether `ue_streaming` and R1 become defaults for Unreal games (both measured as gains on FF7R).
-3. Open M1 design points: write `vram_budget_mb` only for D3D11 games; `g_other_api` is sticky (a D3D11 game
-   probing D3D12 loses M1); volk is not detected.
-4. Phase 2 exit criterion still needs a first-session play test; measure whether D3D12/Vulkan replay removes
-   in-game compilation stutters (frame times, not only cache hits).
-5. Phase 3/5 need an eligible game: tier 2 with `IMMUTABLE` textures and real memory pressure (or test
+**What is left (in order):**
+1. Limiter, next step to pick: (a) GPU completion feedback in the prediction (fence based, like
+   LatencyFleX) so the queue does not fill when GPU-bound; (b) vblank anchoring on fixed-refresh displays;
+   (c) PresentMon head-to-head against RTSS, the NVIDIA limiter, Steam and Special K. Further ideas:
+   D3D11 `Flush` before the mode-1 alignment wait, a GPU-bound synthetic bench, fractional and automatic
+   VRR caps (`fps_limit` is an integer today), sleeping on the game thread via Reflex/Anti-Lag 2/XeLL
+   markers, `MWAITX`/`TPAUSE` spin, frame generation pairing.
+2. U1 A/B in FF7R: base `ue_streaming` vs `ue_drs_off` vs `ue_rt_grow` (2 rounds), then `ue_pool_vram`,
+   `ue_shaders_on_load`, `ue_load_limits`. Then decide whether `ue_streaming` and R1 become defaults for
+   Unreal games (both measured as gains).
+3. Open M1 design points: write `vram_budget_mb` only for D3D11 games; `g_other_api` is sticky (a D3D11
+   game probing D3D12 loses M1); volk and `ID3D12DeviceFactory` are not detected.
+4. Phase 2 exit criterion: a first-session play test; measure whether D3D12/Vulkan replay removes in-game
+   compilation stutters (frame times, not only cache hits).
+5. Phases 3-5 need an eligible game: tier 2, `IMMUTABLE` textures, real memory pressure (or
    `d3d11_prefer_11_1` in FF7R). Find why active route shaders get no mip sample before adding opcodes.
-6. Phase 4: A/B on a route with reproducible traversal stutter; check prefetch arrives before demand.
-   P4 needs a hybrid CPU. Dedup for `DEFAULT` textures would need copy-on-write.
-7. Phase 6: native D3D12 layer — proxy and installer with correct device/queue/Present/Agility handling, then
-   residency, C8 back-off, DXIL feedback and prediction.
-8. Deferred with reasons: mip-by-mip eviction (needs per-mip tile layout), LZ4 of evicted mips (decode on the
-   bind would stall; needs predictive restore first), AGS (AMD), safe mode does not cover a crash in the IAT
-   patch before the first device, Vulkan dynamic rendering / pipeline libraries.
-
-### Phase 4 — preview in D3D11
-
-These settings are off by default. Use the app's Textures tab for streaming options and Settings for
-performance cores. The following keys can also be set in the game's `[tessera]` section:
-
-- **P4** `present_cpu_sets=1` selects performance cores for the presenting thread on a hybrid CPU, when the game has not already selected CPU sets.
-- **M8** `texture_dedup=1` shares matching immutable shader textures on the same device. It verifies every pixel or compressed block, excluding row padding. The preview covers single-slice BC and 8-bit RGBA/BGRA textures up to 2 MiB. The session log counts eligible textures, avoided creates, and bytes avoided.
-- **I1–I3** `stream_io=1` records file ranges from a learning session. `stream_io=2` reuses the trace for bounded startup prefetch at low I/O priority. Add `mip_prediction=1` in both sessions to associate reads with sampled materials and prefetch matching ranges during play. Material prefetch starts with a limited share of the session budget and releases the reserve gradually. Replay skips ranges fully covered by a recent read and prioritizes ranges followed by substantial demand in previous replays of the same trace. The app sets the install folder relative to the executable. A manual `stream_root` overrides it. The trace is keyed by the executable path and version, and playback checks the asset file's size and modification time.
-- **M7** `mip_prediction=1` learns which textures are bound together. With `mip_residency=1` and tiled resources Tier 2, it can restore likely partners in advance when VRAM has room. Mip prediction uses the workset bind hooks.
-- **I4–I5** `mip_streaming=1` with `mip_residency=1` reuses an exact-size spare tile pool when available. It uploads the smallest mips first, with up to 2 MiB of speculative copies per Present. Each Present can attempt one split upload or one predicted restore. A swap-chain-owned D3D11 fence measures bytes copied from staging that have yet to complete. An 8 MiB window throttles split uploads, and predicted restores wait until the tracked copies finish. First use still queues the rest before the draw. A predicted restore larger than the window can run by itself when idle. Without a working fence the fixed per-Present limit still applies.
-
-The targeted smoke test is `powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_phase4.ps1` after building the `d3d11_smoke` target. Traversal benefits in a real game and performance-core assignment on hybrid hardware still need validation.
-
-### Phase 5 — D3D11 quality preview
-
-- **M6:** `mip_feedback=1` samples up to one compatible immediate-context draw per 60 Presents, looking across several frames with a fixed attempt budget. Preparation instruments the first supported implicit or explicit-level sample per statically indexed 2D texture slot in recorded `ps_5_0` shaders, up to eight slots. The layer skips existing UAVs and draw states with an occupied output slot 7, restores the shader and bindings after the sample, and reads the buffer without waiting. The session records the texture fingerprint and requested mip.
-- **M9:** `texture_quality=1` records up to 32 eligible immutable textures within a 32 MiB capture budget. Preparation converts opaque RGBA8 or nonnegative RGBA16F to BC7 or BC6H and checks every mip with FLIP and channel bounds. `texture_quality=2` applies a prepared replacement only when the input pixels match the captured data. Texture and view descriptions keep the original format. A copy from the resource uses the exact original pixels. Textures that need that fallback retain the original allocation for subsequent copies.
-
-Both options are off by default. Build with `powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Quality`.
-In the Textures tab, select Capture and play a session if testing recompression. With the game closed, select
-Prepare quality. The tab shows captured, approved and applied textures. Apply becomes available once textures
-are approved. Mip feedback becomes available once compatible shaders are prepared.
-For scripts, use `& .\build\windows-x64\cargo\release\tessera.exe --prepare-quality "<game executable>" | Out-Host` and
-`cargo run -p tessera-core --example session -- <file.tsess> --mips` to inspect the results.
-Real game impact still needs measurement.
-
-On Windows, build the optional targets and run the focused test:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Quality
-powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_quality.ps1
-```
-
-### Phase 0 — concrete tasks
-
-1. Repository: root CMake, `src/dll`, `src/warm`, `include/tessera` (formats), `crates/` (app), `tools/`, `tests/`.
-2. `tessera.dll` as a `d3d11.dll` proxy: forward every export to the system DLL
-   (`GetSystemDirectoryW`) or to the `next=` of `tessera.ini`.
-3. Vtable patching utility (save the original, `VirtualProtect`, reentrancy guard).
-4. Logging hooks: `CreateTexture2D`, `CreateBuffer`, `CreateShaderResourceView`, `Present`.
-5. Binary session log in `%LOCALAPPDATA%\Tessera\` (resources, frame times).
-6. Safe mode: start/crash counter.
-7. Minimal app: game list from a chosen folder, API detection from imports, anti-cheat detection
-   (known files: EasyAntiCheat, BattlEye, etc.), install/uninstall with chaining.
-8. Measure: DLL overhead vs no DLL; report of where the VRAM goes.
+6. Phase 4: A/B on a route with reproducible traversal stutter; check prefetch arrives before demand. P4
+   needs a hybrid CPU. Dedup for `DEFAULT` textures would need independent identities (copy-on-write).
+7. Phase 6, native D3D12 layer: proxy and installer with correct device/queue/Present/Agility handling;
+   PSO and root signature capture and replay; then residency, C8 back-off, DXIL feedback and prediction.
+8. Smaller open items: export coverage of the dxgi/vulkan proxies on other Windows builds and a game test
+   on each API; FSR 3.1 frame generation (`amd_fidelityfx_dx12.dll`) is not detected; high-performance
+   adapter pick in `tessera_texcomp` on hybrid laptops; ARM64 hosts and moving a build tree on Linux are
+   untested.
+9. Deferred with reasons: mip-by-mip eviction (needs per-mip tile layout), LZ4 of evicted mips (decode on
+   the bind would stall; needs predictive restore first), S2 `.upipelinecache` import, AGS (AMD), safe mode
+   does not cover a crash in the IAT patch before the first device, Vulkan dynamic rendering / pipeline
+   libraries, Oodle per-thread scratch (measured, no gain).
 
 ---
 
@@ -387,5 +359,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_quality.ps1
 - **NVIDIA RTX Neural Texture Compression** (RTX Kit): Tessera coexists, does not replace.
 - **Zenardi/ff7r-pc-optimization**: FF7R Engine.ini profiles (no measurements); useful parts are
   `r.DynamicRes.OperationMode=0`, `r.Streaming.LimitPoolSizeToVRAM=1`, `r.CreateShadersOnLoad=1`.
-- Libraries: xxHash, Slint, bc7enc_rdo, NVIDIA FLIP, DXC, Catch2.
+- Libraries: Slint, DirectXTex (BC7/BC6H compute encoder), NVIDIA FLIP, Vulkan-Headers, xxHash; DXC
+  for DXIL instrumentation in phase 6.
 - Technique references (study only): DXVK, Special K, ReShade.
