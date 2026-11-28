@@ -27,6 +27,6 @@ permissions:
   contents: read
 jobs:
   run:
-    uses: Trick230/devcloud/.github/workflows/run.yml@f35df5808b59a2bef4fc632447ffeafdd348d951
-    with: {commands: "${{ inputs.commands }}", os: "${{ inputs.os }}", drive_in: "${{ inputs.drive_in }}", drive_out: "${{ inputs.drive_out }}", artifacts: "${{ inputs.artifacts }}", artifacts_in: "${{ inputs.artifacts_in }}", ref: f35df5808b59a2bef4fc632447ffeafdd348d951}
+    uses: Trick230/devcloud/.github/workflows/run.yml@e0c2c5fa45635eda8a5eb1bf1eb8d0a8eabcf7c7
+    with: {commands: "${{ inputs.commands }}", os: "${{ inputs.os }}", drive_in: "${{ inputs.drive_in }}", drive_out: "${{ inputs.drive_out }}", artifacts: "${{ inputs.artifacts }}", artifacts_in: "${{ inputs.artifacts_in }}", ref: e0c2c5fa45635eda8a5eb1bf1eb8d0a8eabcf7c7}
     secrets: {DC_ENV: "${{ secrets.DC_ENV }}"}
